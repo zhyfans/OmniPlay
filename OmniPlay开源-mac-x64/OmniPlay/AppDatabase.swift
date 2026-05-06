@@ -68,6 +68,13 @@ class AppDatabase {
                 t.add(column: "disabledAt", .double)
             }
         }
+
+        // v5: 记录最近一次退出时仍未播完的文件，用于详情页续播默认选集。
+        migrator.registerMigration("v5") { db in
+            try db.alter(table: "videoFile") { t in
+                t.add(column: "lastPlayedAt", .double)
+            }
+        }
         
         try migrator.migrate(dbQueue)
     }

@@ -297,6 +297,7 @@ struct VideoFile: Codable, FetchableRecord, PersistableRecord {
     // 🌟 记录播放进度和总时长
     var playProgress: Double
     var duration: Double = 0.0
+    var lastPlayedAt: Double?
     
     static let mediaSource = belongsTo(MediaSource.self)
 }

@@ -19,4 +19,6 @@ public sealed class VideoFile
     public double PlayProgress { get; set; }
 
     public double Duration { get; set; }
+
+    public double? LastPlayedAt { get; set; }
 }

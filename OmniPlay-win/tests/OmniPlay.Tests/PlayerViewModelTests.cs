@@ -262,6 +262,52 @@ public sealed class PlayerViewModelTests
     }
 
     [Fact]
+    public async Task DefaultSubtitleTrack_PrefersSimplifiedChineseBeforeEnglishAndTraditional()
+    {
+        var mediaPlayer = new RecordingMediaPlayer
+        {
+            SubtitleTracks =
+            [
+                new PlayerTrackInfo("sub", 3, "English", true, false, "eng"),
+                new PlayerTrackInfo("sub", 2, "繁體", false, false, "zh-Hant"),
+                new PlayerTrackInfo("sub", 1, "简体", false, false, "ZH_HANS")
+            ]
+        };
+        var viewModel = new PlayerViewModel(mediaPlayer);
+        viewModel.ConfigureDefaultTracks("auto", "chi");
+
+        await viewModel.OpenAsync("sample.mkv");
+        await Task.Delay(50);
+
+        Assert.Equal(1, viewModel.SelectedSubtitleTrack?.TrackId);
+        Assert.Equal(1, mediaPlayer.LastSelectedSubtitleTrackId);
+
+        await viewModel.StopAsync();
+    }
+
+    [Fact]
+    public async Task DefaultSubtitleTrack_FallsBackToEnglishWhenChineseMissing()
+    {
+        var mediaPlayer = new RecordingMediaPlayer
+        {
+            SubtitleTracks =
+            [
+                new PlayerTrackInfo("sub", 3, "English", true, false, "en-US")
+            ]
+        };
+        var viewModel = new PlayerViewModel(mediaPlayer);
+        viewModel.ConfigureDefaultTracks("auto", "chi");
+
+        await viewModel.OpenAsync("sample.mkv");
+        await Task.Delay(50);
+
+        Assert.Equal(3, viewModel.SelectedSubtitleTrack?.TrackId);
+        Assert.Equal(3, mediaPlayer.LastSelectedSubtitleTrackId);
+
+        await viewModel.StopAsync();
+    }
+
+    [Fact]
     public async Task LoadExternalSubtitleCommand_LoadsSubtitleAndRefreshesTracks()
     {
         var subtitlePath = Path.Combine(Path.GetTempPath(), $"omniplay-sub-{Guid.NewGuid():N}.srt");

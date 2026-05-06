@@ -31,6 +31,7 @@ public partial class PlayerViewModel : ObservableObject
     private string defaultSubtitleTrack = PlaybackPreferenceSettings.DefaultSubtitleChinese;
     private bool defaultAudioTrackApplied;
     private bool defaultSubtitleTrackApplied;
+    private bool hasUserSelectedSubtitleTrack;
 
     public PlayerViewModel(
         IMediaPlayer mediaPlayer,
@@ -324,15 +325,14 @@ public partial class PlayerViewModel : ObservableObject
         pendingStartupSeekSeconds = NormalizeStartupSeekPosition(startPositionSeconds);
         defaultAudioTrackApplied = false;
         defaultSubtitleTrackApplied = false;
+        hasUserSelectedSubtitleTrack = false;
         ResetTrackSelection();
         RefreshTimeTexts();
         StatusMessage = "正在打开视频...";
 
-        mediaPlayer.Initialize();
+        var result = await mediaPlayer.OpenAsync(request, cancellationToken);
         IsAvailable = mediaPlayer.IsAvailable;
         BackendName = mediaPlayer.BackendName;
-
-        var result = await mediaPlayer.OpenAsync(request, cancellationToken);
         StatusMessage = result.Message;
         IsPlaying = result.Succeeded;
         IsPaused = false;
@@ -468,6 +468,7 @@ public partial class PlayerViewModel : ObservableObject
         }
 
         var trackId = track is null || track.IsOffOption ? null : track.TrackId;
+        hasUserSelectedSubtitleTrack = true;
         await mediaPlayer.SelectSubtitleTrackAsync(trackId, cancellationToken);
         StatusMessage = trackId is null
             ? "已关闭字幕。"
@@ -506,6 +507,7 @@ public partial class PlayerViewModel : ObservableObject
             return;
         }
 
+        hasUserSelectedSubtitleTrack = true;
         await Task.Delay(TimeSpan.FromMilliseconds(80), cancellationToken);
         await RefreshPlaybackStateAsync(cancellationToken);
         StatusMessage = $"已加载外挂字幕：{Path.GetFileName(subtitlePath)}";
@@ -783,25 +785,25 @@ public partial class PlayerViewModel : ObservableObject
             }
         }
 
-        if (!defaultSubtitleTrackApplied && SubtitleTracks.Count > 0)
+        if (!defaultSubtitleTrackApplied && !hasUserSelectedSubtitleTrack && SubtitleTracks.Count > 0)
         {
             defaultSubtitleTrackApplied = true;
             var preferredSubtitleTrack = ResolvePreferredSubtitleTrack();
-            if (preferredSubtitleTrack is not null &&
-                preferredSubtitleTrack.TrackId != SelectedSubtitleTrack?.TrackId &&
-                !preferredSubtitleTrack.IsOffOption)
+            if (preferredSubtitleTrack is not null && !preferredSubtitleTrack.IsOffOption)
             {
-                suppressTrackSelectionChange = true;
-                try
+                if (preferredSubtitleTrack.TrackId != SelectedSubtitleTrack?.TrackId)
                 {
-                    SelectedSubtitleTrack = preferredSubtitleTrack;
+                    suppressTrackSelectionChange = true;
+                    try
+                    {
+                        SelectedSubtitleTrack = preferredSubtitleTrack;
+                    }
+                    finally
+                    {
+                        suppressTrackSelectionChange = false;
+                    }
                 }
-                finally
-                {
-                    suppressTrackSelectionChange = false;
-                }
-
-                _ = ApplySelectedSubtitleTrackAsync(preferredSubtitleTrack);
+                _ = ApplySelectedSubtitleTrackAsync(preferredSubtitleTrack, markUserSelection: false);
             }
         }
     }
@@ -820,8 +822,18 @@ public partial class PlayerViewModel : ObservableObject
 
     private PlayerTrackInfo? ResolvePreferredSubtitleTrack()
     {
-        return SubtitleTracks.FirstOrDefault(track =>
-            !track.IsOffOption && MatchesPreferredTrackLanguage(track, defaultSubtitleTrack));
+        return SubtitleTracks
+            .Select((track, index) => new
+            {
+                Track = track,
+                Index = index,
+                Score = GetSubtitlePreferenceScore(track, defaultSubtitleTrack)
+            })
+            .Where(static item => item.Score.HasValue)
+            .OrderBy(static item => item.Score!.Value)
+            .ThenBy(static item => item.Index)
+            .Select(static item => item.Track)
+            .FirstOrDefault();
     }
 
     private void ResetTrackSelection()
@@ -959,7 +971,7 @@ public partial class PlayerViewModel : ObservableObject
             return false;
         }
 
-        var language = track.Language.Trim().ToLowerInvariant();
+        var language = NormalizeTrackLanguage(track.Language);
         var displayName = track.DisplayName.Trim().ToLowerInvariant();
 
         return preferredLanguage switch
@@ -973,20 +985,86 @@ public partial class PlayerViewModel : ObservableObject
 
     private static bool IsChineseTrack(string language, string displayName)
     {
-        return MatchesAny(language, "chi", "zho", "zh", "zh-cn", "zh-hans", "zh-tw", "zh-hant", "chs", "cht", "cn") ||
+        var primaryCode = PrimaryLanguageCode(language);
+        return primaryCode is "chi" or "zho" or "zh" or "cmn" or "yue" ||
+               MatchesAny(language, "chs", "cht", "cn") ||
                ContainsAny(displayName, "中文", "国语", "普通话", "简体", "繁体", "简中", "繁中", "粤语", "chinese", "mandarin", "cantonese", "chi", "zho", "chs", "cht");
     }
 
     private static bool IsEnglishTrack(string language, string displayName)
     {
-        return MatchesAny(language, "eng", "en", "en-us", "en-gb") ||
+        var primaryCode = PrimaryLanguageCode(language);
+        return primaryCode is "eng" or "en" ||
                ContainsAny(displayName, "英语", "英文", "english", "eng");
     }
 
     private static bool IsJapaneseTrack(string language, string displayName)
     {
-        return MatchesAny(language, "jpn", "ja", "ja-jp") ||
+        var primaryCode = PrimaryLanguageCode(language);
+        return primaryCode is "jpn" or "ja" ||
                ContainsAny(displayName, "日语", "日文", "japanese", "jpn");
+    }
+
+    private static int? GetSubtitlePreferenceScore(PlayerTrackInfo track, string preferredLanguage)
+    {
+        if (track.IsOffOption)
+        {
+            return null;
+        }
+
+        var language = NormalizeTrackLanguage(track.Language);
+        var displayName = track.DisplayName.Trim().ToLowerInvariant();
+
+        if (preferredLanguage == PlaybackPreferenceSettings.SubtitleEnglish)
+        {
+            if (IsEnglishTrack(language, displayName))
+            {
+                return 0;
+            }
+
+            return IsChineseTrack(language, displayName)
+                ? 100 + ChineseScriptPreferenceScore(language, displayName)
+                : null;
+        }
+
+        if (IsChineseTrack(language, displayName))
+        {
+            return ChineseScriptPreferenceScore(language, displayName);
+        }
+
+        return IsEnglishTrack(language, displayName) ? 100 : null;
+    }
+
+    private static int ChineseScriptPreferenceScore(string language, string displayName)
+    {
+        if (language.Contains("hans", StringComparison.OrdinalIgnoreCase) ||
+            language.Contains("zh-cn", StringComparison.OrdinalIgnoreCase) ||
+            language.Contains("zh-sg", StringComparison.OrdinalIgnoreCase) ||
+            ContainsAny(displayName, "简", "simplified", "chs", "gb"))
+        {
+            return 0;
+        }
+
+        if (language.Contains("hant", StringComparison.OrdinalIgnoreCase) ||
+            language.Contains("zh-tw", StringComparison.OrdinalIgnoreCase) ||
+            language.Contains("zh-hk", StringComparison.OrdinalIgnoreCase) ||
+            language.Contains("zh-mo", StringComparison.OrdinalIgnoreCase) ||
+            ContainsAny(displayName, "繁", "traditional", "cht", "big5"))
+        {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    private static string NormalizeTrackLanguage(string? value)
+    {
+        return value?.Trim().ToLowerInvariant().Replace('_', '-') ?? string.Empty;
+    }
+
+    private static string PrimaryLanguageCode(string value)
+    {
+        return value.Split('-', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? value;
     }
 
     private static bool MatchesAny(string value, params string[] candidates)
@@ -1061,14 +1139,37 @@ public partial class PlayerViewModel : ObservableObject
     {
         try
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(180), cancellationToken);
-            await mediaPlayer.SeekAsync(startPositionSeconds, cancellationToken);
-            PostToUi(() =>
+            for (var attempt = 0; attempt < 40; attempt++)
             {
-                CurrentPositionSeconds = startPositionSeconds;
-                SeekPositionSeconds = startPositionSeconds;
-                RefreshTimeTexts();
-            });
+                await Task.Delay(TimeSpan.FromMilliseconds(attempt == 0 ? 180 : 100), cancellationToken);
+                var state = await mediaPlayer.GetStateAsync(cancellationToken);
+                var duration = state.DurationSeconds > 0 ? state.DurationSeconds : DurationSeconds;
+                if (duration <= 0 && attempt < 8)
+                {
+                    continue;
+                }
+
+                var target = duration > 0
+                    ? Math.Min(Math.Max(startPositionSeconds, 0), Math.Max(duration - 2, 0))
+                    : Math.Max(startPositionSeconds, 0);
+                if (target <= 0)
+                {
+                    return;
+                }
+
+                if (Math.Abs(state.PositionSeconds - target) <= 1.5)
+                {
+                    return;
+                }
+
+                await mediaPlayer.SeekAsync(target, cancellationToken);
+                PostToUi(() =>
+                {
+                    CurrentPositionSeconds = target;
+                    SeekPositionSeconds = target;
+                    RefreshTimeTexts();
+                });
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1090,11 +1191,18 @@ public partial class PlayerViewModel : ObservableObject
         }
     }
 
-    private async Task ApplySelectedSubtitleTrackAsync(PlayerTrackInfo? track)
+    private async Task ApplySelectedSubtitleTrackAsync(PlayerTrackInfo? track, bool markUserSelection = true)
     {
         try
         {
-            await SelectSubtitleTrackAsync(track);
+            if (markUserSelection)
+            {
+                await SelectSubtitleTrackAsync(track);
+                return;
+            }
+
+            var trackId = track?.IsOffOption == true ? null : track?.TrackId;
+            await mediaPlayer.SelectSubtitleTrackAsync(trackId);
         }
         catch (OperationCanceledException)
         {

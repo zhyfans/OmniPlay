@@ -17,7 +17,7 @@ namespace OmniPlay.Infrastructure.Tmdb;
 
 public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTester
 {
-    private const string DefaultApiKey = "";
+    private const string DefaultApiKey = "d05a3f7e939f5034054090b376de6f8c";
     private const string TmdbApiBaseUrl = "https://api.themoviedb.org/3";
     private const string TmdbImageBaseUrl = "https://image.tmdb.org/t/p/w500";
     private const int DefaultSearchQueryLimit = 4;
@@ -51,6 +51,7 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
     private readonly ISettingsService settingsService;
     private readonly SemaphoreSlim publicSourceRequestGate = new(1, 1);
     private readonly ConcurrentDictionary<int, int?> tvSeasonCountCache = new();
+    private readonly ConcurrentDictionary<int, IReadOnlyList<TmdbSeasonSummary>> tvSeasonSummaryCache = new();
     private readonly ConcurrentDictionary<string, int?> tvSeasonAirYearCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, TmdbSearchItem> localizedResultCache = new(StringComparer.Ordinal);
     private DateTimeOffset nextPublicSourceRequestUtc = DateTimeOffset.MinValue;
@@ -234,6 +235,64 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
             return null;
         }
 
+        var stillPath = await FetchMappedEpisodeStillPathAsync(
+            tmdbShowId,
+            seasonNumber,
+            episodeNumber,
+            configuration,
+            cancellationToken);
+        if (string.IsNullOrWhiteSpace(stillPath))
+        {
+            return null;
+        }
+
+        var stillUri = ResolvePosterUri(stillPath);
+        if (stillUri is null)
+        {
+            return null;
+        }
+
+        await DownloadBinaryAsync(stillUri, destinationPath, cancellationToken);
+        return destinationPath;
+    }
+
+    private async Task<string?> FetchMappedEpisodeStillPathAsync(
+        int tmdbShowId,
+        int seasonNumber,
+        int episodeNumber,
+        TmdbResolvedConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        var candidates = await ResolveEpisodeStillCandidatesAsync(
+            tmdbShowId,
+            seasonNumber,
+            episodeNumber,
+            configuration,
+            cancellationToken);
+        foreach (var candidate in candidates)
+        {
+            var stillPath = await FetchEpisodeStillPathAsync(
+                tmdbShowId,
+                candidate.Season,
+                candidate.Episode,
+                configuration,
+                cancellationToken);
+            if (!string.IsNullOrWhiteSpace(stillPath))
+            {
+                return stillPath;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<string?> FetchEpisodeStillPathAsync(
+        int tmdbShowId,
+        int seasonNumber,
+        int episodeNumber,
+        TmdbResolvedConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
         var relativePath = $"/tv/{tmdbShowId}/season/{seasonNumber}/episode/{episodeNumber}?language={Uri.EscapeDataString(configuration.Language)}";
         using var request = CreateRequest(relativePath, configuration);
         using var response = await SendTmdbApiRequestAsync(request, configuration, cancellationToken);
@@ -247,19 +306,134 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
             responseStream,
             SerializerOptions,
             cancellationToken);
-        if (string.IsNullOrWhiteSpace(payload?.StillPath))
+        if (!string.IsNullOrWhiteSpace(payload?.StillPath))
+        {
+            return payload.StillPath;
+        }
+
+        return await FetchEpisodeStillImagePathAsync(
+            tmdbShowId,
+            seasonNumber,
+            episodeNumber,
+            configuration,
+            cancellationToken);
+    }
+
+    private async Task<IReadOnlyList<(int Season, int Episode)>> ResolveEpisodeStillCandidatesAsync(
+        int tmdbShowId,
+        int requestedSeason,
+        int requestedEpisode,
+        TmdbResolvedConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        if (requestedEpisode <= 0)
+        {
+            return [(requestedSeason, requestedEpisode)];
+        }
+
+        var candidates = new List<(int Season, int Episode)> { (requestedSeason, requestedEpisode) };
+        var summaries = await FetchTvSeasonSummariesAsync(tmdbShowId, configuration, cancellationToken);
+        var regularSeasons = summaries
+            .Where(static summary => summary.SeasonNumber > 0 && summary.EpisodeCount > 0)
+            .OrderBy(static summary => summary.SeasonNumber)
+            .ThenByDescending(static summary => summary.EpisodeCount)
+            .ToList();
+
+        if (regularSeasons.Count == 1 &&
+            regularSeasons[0].SeasonNumber != requestedSeason &&
+            regularSeasons[0].EpisodeCount >= requestedEpisode)
+        {
+            AddUniqueEpisodeCandidate(candidates, regularSeasons[0].SeasonNumber, requestedEpisode);
+        }
+
+        var seasonOne = regularSeasons.FirstOrDefault(static summary => summary.SeasonNumber == 1);
+        if (seasonOne is not null && seasonOne.EpisodeCount >= requestedEpisode)
+        {
+            AddUniqueEpisodeCandidate(candidates, seasonOne.SeasonNumber, requestedEpisode);
+        }
+
+        foreach (var summary in regularSeasons
+                     .OrderByDescending(static item => item.EpisodeCount)
+                     .ThenBy(static item => item.SeasonNumber)
+                     .Where(summary => summary.EpisodeCount >= requestedEpisode))
+        {
+            AddUniqueEpisodeCandidate(candidates, summary.SeasonNumber, requestedEpisode);
+        }
+
+        return candidates;
+    }
+
+    private static void AddUniqueEpisodeCandidate(List<(int Season, int Episode)> candidates, int season, int episode)
+    {
+        if (!candidates.Any(candidate => candidate.Season == season && candidate.Episode == episode))
+        {
+            candidates.Add((season, episode));
+        }
+    }
+
+    private async Task<IReadOnlyList<TmdbSeasonSummary>> FetchTvSeasonSummariesAsync(
+        int tvId,
+        TmdbResolvedConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        if (tvSeasonSummaryCache.TryGetValue(tvId, out var cached))
+        {
+            return cached;
+        }
+
+        var path = $"/tv/{tvId}?language=en-US";
+        using var request = CreateRequest(path, configuration);
+        using var response = await SendTmdbApiRequestAsync(request, configuration, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            ThrowIfBuiltInFallbackNeeded(response.StatusCode, configuration);
+            return [];
+        }
+
+        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var payload = await JsonSerializer.DeserializeAsync<TmdbTvDetailResponse>(
+            responseStream,
+            SerializerOptions,
+            cancellationToken);
+        var summaries = payload?.Seasons?
+            .Where(static season => season.SeasonNumber.HasValue && season.EpisodeCount.HasValue && season.EpisodeCount.Value > 0)
+            .Select(static season => new TmdbSeasonSummary(season.SeasonNumber!.Value, season.EpisodeCount!.Value))
+            .ToArray() ?? [];
+        tvSeasonSummaryCache[tvId] = summaries;
+        if (payload?.NumberOfSeasons is not null)
+        {
+            tvSeasonCountCache[tvId] = payload.NumberOfSeasons;
+        }
+        return summaries;
+    }
+
+    private async Task<string?> FetchEpisodeStillImagePathAsync(
+        int tmdbShowId,
+        int seasonNumber,
+        int episodeNumber,
+        TmdbResolvedConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        var imageLanguage = string.Equals(configuration.Language, "en-US", StringComparison.OrdinalIgnoreCase)
+            ? "en,null"
+            : "zh,null,en";
+        var relativePath = $"/tv/{tmdbShowId}/season/{seasonNumber}/episode/{episodeNumber}/images?include_image_language={Uri.EscapeDataString(imageLanguage)}";
+        using var request = CreateRequest(relativePath, configuration);
+        using var response = await SendTmdbApiRequestAsync(request, configuration, cancellationToken);
+        if (!response.IsSuccessStatusCode)
         {
             return null;
         }
 
-        var stillUri = ResolvePosterUri(payload.StillPath);
-        if (stillUri is null)
-        {
-            return null;
-        }
-
-        await DownloadBinaryAsync(stillUri, destinationPath, cancellationToken);
-        return destinationPath;
+        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var payload = await JsonSerializer.DeserializeAsync<TmdbEpisodeImagesResponse>(
+            responseStream,
+            SerializerOptions,
+            cancellationToken);
+        return payload?.Stills
+            .OrderByDescending(static image => (image.VoteAverage ?? 0) + (image.VoteCount ?? 0) * 0.1)
+            .Select(static image => image.FilePath)
+            .FirstOrDefault(static path => !string.IsNullOrWhiteSpace(path));
     }
 
     private async Task<TmdbMetadataMatch?> SearchBestMatchAsync(
@@ -1502,10 +1676,42 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
         public string? StillPath { get; init; }
     }
 
+    private sealed record TmdbSeasonSummary(int SeasonNumber, int EpisodeCount);
+
+    private sealed class TmdbEpisodeImagesResponse
+    {
+        [JsonPropertyName("stills")]
+        public List<TmdbEpisodeImageItem> Stills { get; init; } = [];
+    }
+
+    private sealed class TmdbEpisodeImageItem
+    {
+        [JsonPropertyName("file_path")]
+        public string? FilePath { get; init; }
+
+        [JsonPropertyName("vote_average")]
+        public double? VoteAverage { get; init; }
+
+        [JsonPropertyName("vote_count")]
+        public int? VoteCount { get; init; }
+    }
+
     private sealed class TmdbTvDetailResponse
     {
         [JsonPropertyName("number_of_seasons")]
         public int? NumberOfSeasons { get; init; }
+
+        [JsonPropertyName("seasons")]
+        public List<TmdbSeasonSummaryItem> Seasons { get; init; } = [];
+    }
+
+    private sealed class TmdbSeasonSummaryItem
+    {
+        [JsonPropertyName("season_number")]
+        public int? SeasonNumber { get; init; }
+
+        [JsonPropertyName("episode_count")]
+        public int? EpisodeCount { get; init; }
     }
 
     private sealed class TmdbSeasonDetailResponse

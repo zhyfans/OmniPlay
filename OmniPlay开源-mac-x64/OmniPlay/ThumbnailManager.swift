@@ -19,6 +19,11 @@ class ThumbnailManager: ObservableObject {
         let sourceId: Int64
     }
 
+    private struct TMDBSeasonSummary {
+        let seasonNumber: Int
+        let episodeCount: Int
+    }
+
     private var webFetchQueue: [WebFetchTask] = []
     private var isFetching = false
     private var currentFetchTask: Task<Void, Never>? = nil
@@ -26,11 +31,20 @@ class ThumbnailManager: ObservableObject {
     private var currentFetchID: UUID? = nil
     private var failedTMDBFileIDs: Set<String>
     private let failedTMDBStoreKey = "ThumbnailTMDBFailedFileIDs"
+    private let failedTMDBMappingVersionKey = "ThumbnailTMDBMappingVersion"
+    private let currentTMDBMappingVersion = 2
+    private var tvSeasonSummaryCache: [Int: [TMDBSeasonSummary]] = [:]
+    private let tvSeasonSummaryCacheQueue = DispatchQueue(label: "nan.omniplay.thumbnail.tmdb-season-summary")
     
     private init() {
         let cachePaths = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
         thumbDirectory = cachePaths[0].appendingPathComponent("OmniPlayThumbnails")
         failedTMDBFileIDs = Set(UserDefaults.standard.stringArray(forKey: failedTMDBStoreKey) ?? [])
+        if UserDefaults.standard.integer(forKey: failedTMDBMappingVersionKey) < currentTMDBMappingVersion {
+            failedTMDBFileIDs.removeAll()
+            UserDefaults.standard.set([], forKey: failedTMDBStoreKey)
+            UserDefaults.standard.set(currentTMDBMappingVersion, forKey: failedTMDBMappingVersionKey)
+        }
         
         if !FileManager.default.fileExists(atPath: thumbDirectory.path) {
             try? FileManager.default.createDirectory(at: thumbDirectory, withIntermediateDirectories: true)
@@ -175,18 +189,15 @@ class ThumbnailManager: ObservableObject {
                   let firstResult = results.first,
                   let tvId = firstResult["id"] as? Int else { return false }
             
-            let episodeURL = URL(string: "https://api.themoviedb.org/3/tv/\(tvId)/season/\(task.season)/episode/\(task.episode)?language=zh-CN")!
-            var req2 = URLRequest(url: episodeURL)
-            if apiKey.count >= 50 {
-                req2.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            } else {
-                req2.url = URL(string: "https://api.themoviedb.org/3/tv/\(tvId)/season/\(task.season)/episode/\(task.episode)?language=zh-CN&api_key=\(apiKey)")
-            }
-            
-            let (data2, _) = try await URLSession.shared.data(for: req2)
             guard !Task.isCancelled, await sourceExists(task.sourceId) else { return false }
-            guard let json2 = try JSONSerialization.jsonObject(with: data2) as? [String: Any],
-                  let stillPath = json2["still_path"] as? String else { return false }
+            let stillPath = await fetchMappedEpisodeStillPath(
+                tvId: tvId,
+                season: task.season,
+                episode: task.episode,
+                language: "zh-CN",
+                apiKey: apiKey
+            )
+            guard let stillPath else { return false }
             
             let imageURL = URL(string: "https://image.tmdb.org/t/p/w500\(stillPath)")!
             let (imageData, _) = try await URLSession.shared.data(from: imageURL)
@@ -200,6 +211,145 @@ class ThumbnailManager: ObservableObject {
             
         } catch {
             return false
+        }
+    }
+
+    private func tmdbData(urlString: String, apiKey: String) async throws -> Data {
+        guard var components = URLComponents(string: urlString) else {
+            throw URLError(.badURL)
+        }
+        var requestURL: URL?
+        if apiKey.count >= 50 {
+            requestURL = components.url
+        } else {
+            var queryItems = components.queryItems ?? []
+            queryItems.append(URLQueryItem(name: "api_key", value: apiKey))
+            components.queryItems = queryItems
+            requestURL = components.url
+        }
+        guard let requestURL else { throw URLError(.badURL) }
+        var request = URLRequest(url: requestURL)
+        if apiKey.count >= 50 {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    private func fetchMappedEpisodeStillPath(tvId: Int, season: Int, episode: Int, language: String, apiKey: String) async -> String? {
+        let candidates = await episodeStillCoordinateCandidates(tvId: tvId, requestedSeason: season, requestedEpisode: episode, apiKey: apiKey)
+        for candidate in candidates {
+            if let stillPath = await fetchEpisodeStillPath(tvId: tvId, season: candidate.season, episode: candidate.episode, language: language, apiKey: apiKey) {
+                return stillPath
+            }
+        }
+        return nil
+    }
+
+    private func fetchEpisodeStillPath(tvId: Int, season: Int, episode: Int, language: String, apiKey: String) async -> String? {
+        let episodeURL = "https://api.themoviedb.org/3/tv/\(tvId)/season/\(season)/episode/\(episode)?language=\(language)"
+        do {
+            let data = try await tmdbData(urlString: episodeURL, apiKey: apiKey)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            if let stillPath = json["still_path"] as? String {
+                return stillPath
+            }
+            return await fetchEpisodeStillImagePath(tvId: tvId, season: season, episode: episode, language: language, apiKey: apiKey)
+        } catch {
+            return nil
+        }
+    }
+
+    private func episodeStillCoordinateCandidates(tvId: Int, requestedSeason: Int, requestedEpisode: Int, apiKey: String) async -> [(season: Int, episode: Int)] {
+        guard requestedEpisode > 0 else { return [(requestedSeason, requestedEpisode)] }
+        var candidates: [(season: Int, episode: Int)] = [(requestedSeason, requestedEpisode)]
+
+        let seasons = await fetchTVSeasonSummaries(tvId: tvId, apiKey: apiKey)
+        let regularSeasons = seasons
+            .filter { $0.seasonNumber > 0 && $0.episodeCount > 0 }
+            .sorted { lhs, rhs in
+                if lhs.seasonNumber != rhs.seasonNumber { return lhs.seasonNumber < rhs.seasonNumber }
+                return lhs.episodeCount > rhs.episodeCount
+            }
+
+        // 有些动画在 TMDB 只维护一个长 Season 1，本地资源则按 S02/S03 发布；
+        // 不改变本地显示季集，只在剧照请求层映射到可容纳该集数的 TMDB 季。
+        if regularSeasons.count == 1,
+           let onlySeason = regularSeasons.first,
+           onlySeason.seasonNumber != requestedSeason,
+           onlySeason.episodeCount >= requestedEpisode {
+            appendUniqueCandidate((onlySeason.seasonNumber, requestedEpisode), to: &candidates)
+        }
+
+        if let seasonOne = regularSeasons.first(where: { $0.seasonNumber == 1 && $0.episodeCount >= requestedEpisode }) {
+            appendUniqueCandidate((seasonOne.seasonNumber, requestedEpisode), to: &candidates)
+        }
+
+        for summary in regularSeasons.sorted(by: { lhs, rhs in
+            if lhs.episodeCount != rhs.episodeCount { return lhs.episodeCount > rhs.episodeCount }
+            return lhs.seasonNumber < rhs.seasonNumber
+        }) where summary.episodeCount >= requestedEpisode {
+            appendUniqueCandidate((summary.seasonNumber, requestedEpisode), to: &candidates)
+        }
+
+        return candidates
+    }
+
+    private func appendUniqueCandidate(_ candidate: (season: Int, episode: Int), to candidates: inout [(season: Int, episode: Int)]) {
+        guard !candidates.contains(where: { $0.season == candidate.season && $0.episode == candidate.episode }) else { return }
+        candidates.append(candidate)
+    }
+
+    private func fetchTVSeasonSummaries(tvId: Int, apiKey: String) async -> [TMDBSeasonSummary] {
+        if let cached = tvSeasonSummaryCacheQueue.sync(execute: { tvSeasonSummaryCache[tvId] }) {
+            return cached
+        }
+
+        let url = "https://api.themoviedb.org/3/tv/\(tvId)?language=en-US"
+        do {
+            let data = try await tmdbData(urlString: url, apiKey: apiKey)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let seasons = json["seasons"] as? [[String: Any]] else {
+                return []
+            }
+            let summaries = seasons.compactMap { item -> TMDBSeasonSummary? in
+                guard let seasonNumber = item["season_number"] as? Int,
+                      let episodeCount = item["episode_count"] as? Int,
+                      episodeCount > 0 else { return nil }
+                return TMDBSeasonSummary(seasonNumber: seasonNumber, episodeCount: episodeCount)
+            }
+            tvSeasonSummaryCacheQueue.sync { tvSeasonSummaryCache[tvId] = summaries }
+            return summaries
+        } catch {
+            return []
+        }
+    }
+
+    private func fetchEpisodeStillImagePath(tvId: Int, season: Int, episode: Int, language: String, apiKey: String) async -> String? {
+        let imageLanguage = language == "en-US" ? "en,null" : "zh,null,en"
+        let imagesURL = "https://api.themoviedb.org/3/tv/\(tvId)/season/\(season)/episode/\(episode)/images?include_image_language=\(imageLanguage)"
+        do {
+            let data = try await tmdbData(urlString: imagesURL, apiKey: apiKey)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let stills = json["stills"] as? [[String: Any]],
+                  !stills.isEmpty else {
+                return nil
+            }
+            return stills
+                .sorted { lhs, rhs in
+                    let lhsScore = (lhs["vote_average"] as? Double ?? 0) + Double(lhs["vote_count"] as? Int ?? 0) * 0.1
+                    let rhsScore = (rhs["vote_average"] as? Double ?? 0) + Double(rhs["vote_count"] as? Int ?? 0) * 0.1
+                    return lhsScore > rhsScore
+                }
+                .compactMap { $0["file_path"] as? String }
+                .first
+        } catch {
+            return nil
         }
     }
 

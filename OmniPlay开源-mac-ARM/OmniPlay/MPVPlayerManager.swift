@@ -5,6 +5,13 @@ import QuartzCore
 import Libmpv
 
 class MPVPlayerManager: ObservableObject {
+    struct PlaybackEngineSnapshot {
+        let playlistIndex: Int
+        let timePos: Double
+        let duration: Double
+        let filename: String?
+    }
+
     var mpv: OpaquePointer?
     private let mpvControlQueue = DispatchQueue(label: "nan.omniplay.mpv.control")
     private let controlQueueKey = DispatchSpecificKey<Bool>()
@@ -40,8 +47,13 @@ class MPVPlayerManager: ObservableObject {
     var audioTrackIds: [Int64] = []
     var subtitleIds: [Int64] = []
     private var lastTrackCount: Int64 = 0
+    private var hasAppliedDefaultSubtitleForCurrentLoad = false
+    private var hasUserSelectedSubtitleTrack = false
     private var timer: Timer?
     private var isPollingState = false
+    private var pendingInitialSeekPosition: Double?
+    private var pendingInitialSeekFilename: String?
+    private var pendingInitialSeekAttempts = 0
     var duration: Double = 0.0
     
     private func log(_ message: String) {
@@ -91,6 +103,32 @@ class MPVPlayerManager: ObservableObject {
             mpv_get_property(mpv, "time-pos", MPV_FORMAT_DOUBLE, &timePos)
             return timePos
         }
+    }
+
+    var playbackEngineSnapshot: PlaybackEngineSnapshot {
+        let readSnapshot = { [weak self] in
+            guard let self, let mpv = self.mpv else {
+                return PlaybackEngineSnapshot(playlistIndex: 0, timePos: 0, duration: 0, filename: nil)
+            }
+            var timePos: Double = 0.0
+            var dur: Double = 0.0
+            var playlistPos: Int64 = 0
+            mpv_get_property(mpv, "time-pos", MPV_FORMAT_DOUBLE, &timePos)
+            mpv_get_property(mpv, "duration", MPV_FORMAT_DOUBLE, &dur)
+            mpv_get_property(mpv, "playlist-pos", MPV_FORMAT_INT64, &playlistPos)
+            let filename = self.getMpvStringProperty("filename")
+            return PlaybackEngineSnapshot(
+                playlistIndex: max(0, Int(playlistPos)),
+                timePos: timePos,
+                duration: dur,
+                filename: filename
+            )
+        }
+
+        if DispatchQueue.getSpecific(key: controlQueueKey) == true {
+            return readSnapshot()
+        }
+        return mpvControlQueue.sync(execute: readSnapshot)
     }
     
     private func runOnControlQueue(_ block: @escaping () -> Void) {
@@ -187,7 +225,9 @@ class MPVPlayerManager: ObservableObject {
             mpv_set_option_string(mpv, "subs-fallback", "no")
         } else {
             // 简繁体中文全面兜底支持
-            let subFallback = defaultSub == "chi" ? "chi,zho,zh,zh-cn,zh-tw,eng" : "eng,chi,zho"
+            let subFallback = defaultSub == "chi"
+                ? "zh-hans,zh-cn,zh-sg,chi,zho,zh,cmn,zh-hant,zh-tw,zh-hk,zh-mo,eng,en"
+                : "eng,en,zh-hans,zh-cn,chi,zho,zh"
             mpv_set_option_string(mpv, "slang", subFallback)
         }
         
@@ -204,7 +244,7 @@ class MPVPlayerManager: ObservableObject {
         }
     }
     
-    func setDrawable(_ view: NSView) {
+    func setDrawable(_ view: NSView, force: Bool = false) {
         guard !isStopping else {
             traceLifecycle("setDrawable skipped because isStopping=true")
             return
@@ -213,7 +253,7 @@ class MPVPlayerManager: ObservableObject {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self, weak view] in
                 guard let self, let view else { return }
-                self.setDrawable(view)
+                self.setDrawable(view, force: force)
             }
             return
         }
@@ -221,8 +261,8 @@ class MPVPlayerManager: ObservableObject {
         let pointer = Unmanaged.passUnretained(layer).toOpaque()
         let wid = Int64(Int(bitPattern: pointer))
         retainedDrawableLayer = layer
-        guard lastDrawablePointer != wid else { return }
-        guard pendingDrawablePointer != wid else { return }
+        guard force || lastDrawablePointer != wid else { return }
+        guard force || pendingDrawablePointer != wid else { return }
         pendingDrawablePointer = wid
         runOnControlQueue { [weak self] in
             guard let self else { return }
@@ -258,6 +298,8 @@ class MPVPlayerManager: ObservableObject {
             }
         }
         log("loadFiles urls=\(urls.count) first=\(mpvLogArgument(for: urls[0])) start=\(startPosition) isBluRay=\(isBluRay) blurayRoot=\(blurayRootPath ?? "nil")")
+        hasAppliedDefaultSubtitleForCurrentLoad = false
+        hasUserSelectedSubtitleTrack = false
         let firstName = urls[0].lastPathComponent.lowercased()
         let isDolbyVisionLike = firstName.contains("dvhe.05")
             || firstName.contains("dovi")
@@ -274,7 +316,10 @@ class MPVPlayerManager: ObservableObject {
             mpv_set_property_string(self.mpv, "vd-lavc-o", isDolbyVisionLike ? "enable_dovi=0" : "")
             mpv_set_property_string(self.mpv, "hwdec", "videotoolbox")
             self.log("decode profile isDVLike=\(isDolbyVisionLike) hwdec=videotoolbox")
-            if startPosition > 0 { mpv_set_property_string(self.mpv, "start", "\(startPosition)") } else { mpv_set_property_string(self.mpv, "start", "0") }
+            self.pendingInitialSeekPosition = startPosition > 5.0 ? startPosition : nil
+            self.pendingInitialSeekFilename = startPosition > 5.0 ? urls[0].lastPathComponent : nil
+            self.pendingInitialSeekAttempts = 0
+            mpv_set_property_string(self.mpv, "start", "0")
             
             if isBluRay, let rootPath = blurayRootPath {
                 mpv_set_property_string(self.mpv, "bluray-device", rootPath)
@@ -311,6 +356,9 @@ class MPVPlayerManager: ObservableObject {
                 } else {
                     self.log("executeMpvCommand \(cmd.joined(separator: " "))")
                 }
+            }
+            if cmd.first == "playlist-next" {
+                mpv_set_property_string(self.mpv, "start", "0")
             }
             var cCmd: [UnsafePointer<CChar>?] = cmd.map { UnsafePointer(strdup($0)) }
             cCmd.append(nil)
@@ -387,6 +435,56 @@ class MPVPlayerManager: ObservableObject {
         }
     }
 
+    private func clearPendingInitialSeek() {
+        pendingInitialSeekPosition = nil
+        pendingInitialSeekFilename = nil
+        pendingInitialSeekAttempts = 0
+    }
+
+    private func applyPendingInitialSeekIfNeeded(timePos: Double, duration: Double, playlistPos: Int64, filename: String?) {
+        guard let target = pendingInitialSeekPosition else { return }
+        guard playlistPos <= 0 else {
+            clearPendingInitialSeek()
+            return
+        }
+        if let expected = pendingInitialSeekFilename,
+           let current = filename,
+           !current.isEmpty,
+           current != expected {
+            pendingInitialSeekAttempts += 1
+            if pendingInitialSeekAttempts > 40 {
+                clearPendingInitialSeek()
+            }
+            return
+        }
+        guard duration.isFinite && duration > 0 else {
+            pendingInitialSeekAttempts += 1
+            if pendingInitialSeekAttempts > 40 {
+                clearPendingInitialSeek()
+            }
+            return
+        }
+
+        let clampedTarget = min(max(target, 0), max(duration - 2.0, 0))
+        guard clampedTarget > 0 else {
+            clearPendingInitialSeek()
+            return
+        }
+
+        if timePos.isFinite && abs(timePos - clampedTarget) <= 1.5 {
+            clearPendingInitialSeek()
+            return
+        }
+
+        pendingInitialSeekAttempts += 1
+        guard pendingInitialSeekAttempts <= 40 else {
+            clearPendingInitialSeek()
+            return
+        }
+        log(String(format: "apply initial resume seek %.2f / %.2f attempt=%d", clampedTarget, duration, pendingInitialSeekAttempts))
+        mpv_command_string(mpv, String(format: "seek %.2f absolute", clampedTarget))
+    }
+
     func setSubtitleSize(_ size: Int) {
         DispatchQueue.main.async {
             self.currentSubtitleSize = size
@@ -426,6 +524,7 @@ class MPVPlayerManager: ObservableObject {
             mpv_get_property(mpv, "sub-delay", MPV_FORMAT_DOUBLE, &delay)
             mpv_get_property(mpv, "playlist-pos", MPV_FORMAT_INT64, &playlistPos)
             let filename = self.getMpvStringProperty("filename")
+            self.applyPendingInitialSeekIfNeeded(timePos: timePos, duration: dur, playlistPos: playlistPos, filename: filename)
 
             DispatchQueue.main.async {
                 defer { self.isPollingState = false }
@@ -462,6 +561,7 @@ class MPVPlayerManager: ObservableObject {
             var newAudioIds: [Int64] = []
             var newSubNames: [String] = ["关闭字幕"]
             var newSubIds: [Int64] = [-1]
+            var subtitleTracks: [(id: Int64, lang: String, title: String)] = []
 
             for i in 0..<trackCount {
                 guard let type = self.getMpvStringProperty("track-list/\(i)/type") else { continue }
@@ -493,9 +593,19 @@ class MPVPlayerManager: ObservableObject {
                 } else if type == "sub" {
                     if baseName.isEmpty { baseName = "字幕 \(id)" }
                     if !niceCodec.isEmpty { baseName += " (\(niceCodec))" }
+                    subtitleTracks.append((id: id, lang: rawLang, title: rawTitle))
                     newSubNames.append(baseName)
                     newSubIds.append(id)
                 }
+            }
+
+            let defaultSub = UserDefaults.standard.string(forKey: "defaultSub") ?? "chi"
+            let preferredSubtitleId = (!self.hasAppliedDefaultSubtitleForCurrentLoad && !self.hasUserSelectedSubtitleTrack)
+                ? Self.preferredSubtitleId(defaultSub: defaultSub, subtitleTracks: subtitleTracks)
+                : nil
+            if let preferredSubtitleId {
+                mpv_set_property_string(self.mpv, "sid", "\(preferredSubtitleId)")
+                self.log("auto selected subtitle id=\(preferredSubtitleId) defaultSub=\(defaultSub)")
             }
 
             DispatchQueue.main.async {
@@ -503,11 +613,151 @@ class MPVPlayerManager: ObservableObject {
                 self.audioTrackIds = newAudioIds
                 self.subtitleNames = newSubNames
                 self.subtitleIds = newSubIds
+                if let preferredSubtitleId {
+                    self.activeSubtitleId = preferredSubtitleId
+                    self.hasAppliedDefaultSubtitleForCurrentLoad = true
+                }
             }
         }
     }
     
-    private func translateLangCode(_ lang: String) -> String { guard !lang.isEmpty else { return "" }; switch lang.lowercased() { case "chi", "zho", "zh", "zh-cn", "zh-tw", "zh-hk": return "🇨🇳 中文"; case "eng", "en": return "🇺🇸 英语"; case "jpn", "ja": return "🇯🇵 日语"; case "kor", "ko": return "🇰🇷 韩语"; case "fre", "fra", "fr": return "🇫🇷 法语"; case "spa", "es": return "🇪🇸 西语"; case "ger", "deu", "de": return "🇩🇪 德语"; case "rus", "ru": return "🇷🇺 俄语"; case "ita", "it": return "🇮🇹 意语"; case "por", "pt": return "🇵🇹 葡语"; case "tha", "th": return "🇹🇭 泰语"; case "vie", "vi": return "🇻🇳 越南语"; default: return lang.uppercased() } }
+    nonisolated static func preferredSubtitleId(
+        defaultSub: String,
+        subtitleTracks: [(id: Int64, lang: String, title: String)]
+    ) -> Int64? {
+        guard defaultSub != "no" else { return nil }
+
+        var best: (id: Int64, score: Int, index: Int)?
+        for (index, track) in subtitleTracks.enumerated() {
+            guard let score = subtitlePreferenceScore(defaultSub: defaultSub, lang: track.lang, title: track.title) else {
+                continue
+            }
+            if best == nil || (score, index) < (best!.score, best!.index) {
+                best = (track.id, score, index)
+            }
+        }
+        return best?.id
+    }
+
+    nonisolated private static func subtitlePreferenceScore(defaultSub: String, lang: String, title: String) -> Int? {
+        switch defaultSub {
+        case "chi":
+            if isChineseSubtitle(lang: lang, title: title) {
+                return chineseScriptPreferenceScore(lang: lang, title: title)
+            }
+            return isEnglishSubtitle(lang: lang, title: title) ? 100 : nil
+        case "eng":
+            if isEnglishSubtitle(lang: lang, title: title) {
+                return 0
+            }
+            return isChineseSubtitle(lang: lang, title: title) ? 100 + chineseScriptPreferenceScore(lang: lang, title: title) : nil
+        default:
+            return nil
+        }
+    }
+
+    nonisolated private static func isChineseSubtitle(lang: String, title: String) -> Bool {
+        let primaryCode = normalizedLanguagePrimaryCode(lang)
+        if ["chi", "zho", "zh", "cmn", "yue"].contains(primaryCode) {
+            return true
+        }
+
+        let lowerTitle = title.lowercased()
+        if title.contains("中文") || title.contains("简体") || title.contains("繁體") || title.contains("繁体") || title.contains("中字") {
+            return true
+        }
+        if lowerTitle.contains("chinese") {
+            return true
+        }
+        let tokens = normalizedTokens(from: title)
+        return !tokens.isDisjoint(with: ["chs", "cht", "zho", "chi", "cmn"])
+    }
+
+    nonisolated private static func isEnglishSubtitle(lang: String, title: String) -> Bool {
+        let primaryCode = normalizedLanguagePrimaryCode(lang)
+        if ["eng", "en"].contains(primaryCode) {
+            return true
+        }
+        if title.contains("英语") || title.contains("英文") {
+            return true
+        }
+        let tokens = normalizedTokens(from: title)
+        return !tokens.isDisjoint(with: ["eng", "english"])
+    }
+
+    nonisolated private static func chineseScriptPreferenceScore(lang: String, title: String) -> Int {
+        let normalizedLang = lang.lowercased().replacingOccurrences(of: "_", with: "-")
+        let lowerTitle = title.lowercased()
+        let tokens = normalizedTokens(from: "\(lang) \(title)")
+
+        if normalizedLang.contains("hans")
+            || normalizedLang.contains("zh-cn")
+            || normalizedLang.contains("zh-sg")
+            || title.contains("简")
+            || lowerTitle.contains("simplified")
+            || tokens.contains("chs")
+            || tokens.contains("gb") {
+            return 0
+        }
+
+        if normalizedLang.contains("hant")
+            || normalizedLang.contains("zh-tw")
+            || normalizedLang.contains("zh-hk")
+            || normalizedLang.contains("zh-mo")
+            || title.contains("繁")
+            || lowerTitle.contains("traditional")
+            || tokens.contains("cht")
+            || tokens.contains("big5") {
+            return 2
+        }
+
+        return 1
+    }
+
+    nonisolated private static func normalizedLanguagePrimaryCode(_ value: String) -> String {
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        return normalized.split(separator: "-").first.map(String.init) ?? normalized
+    }
+
+    nonisolated private static func normalizedTokens(from value: String) -> Set<String> {
+        let lower = value.lowercased().replacingOccurrences(of: "_", with: "-")
+        return Set(lower.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+    }
+
+    nonisolated static func translatedLanguageLabel(_ lang: String) -> String {
+        let trimmed = lang.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let normalized = trimmed
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        let primaryCode = normalized.split(separator: "-").first.map(String.init) ?? normalized
+
+        if ["chi", "zho", "zh", "cmn", "yue"].contains(primaryCode) {
+            return "🇨🇳 中文"
+        }
+
+        switch primaryCode {
+        case "eng", "en": return "🇺🇸 英语"
+        case "jpn", "ja": return "🇯🇵 日语"
+        case "kor", "ko": return "🇰🇷 韩语"
+        case "fre", "fra", "fr": return "🇫🇷 法语"
+        case "spa", "es": return "🇪🇸 西语"
+        case "ger", "deu", "de": return "🇩🇪 德语"
+        case "rus", "ru": return "🇷🇺 俄语"
+        case "ita", "it": return "🇮🇹 意语"
+        case "por", "pt": return "🇵🇹 葡语"
+        case "tha", "th": return "🇹🇭 泰语"
+        case "vie", "vi": return "🇻🇳 越南语"
+        default: return trimmed.uppercased()
+        }
+    }
+
+    private func translateLangCode(_ lang: String) -> String {
+        Self.translatedLanguageLabel(lang)
+    }
     private func formatCodec(_ codec: String) -> String { let c = codec.lowercased(); if c.contains("truehd") { return "TrueHD Atmos" }; if c.contains("dts-hd") || c.contains("dtshd") { return "DTS-HD MA" }; if c.contains("dts") { return "DTS" }; if c.contains("eac3") { return "E-AC3" }; if c.contains("ac3") { return "Dolby AC3" }; if c.contains("aac") { return "AAC" }; if c.contains("flac") { return "FLAC" }; if c.contains("pgs") { return "PGS 图形字幕" }; if c.contains("srt") || c.contains("subrip") { return "SRT" }; if c.contains("ass") { return "ASS" }; return c.uppercased() }
     private func getMpvStringProperty(_ name: String) -> String? { if let cString = mpv_get_property_string(mpv, name) { let result = String(cString: cString); mpv_free(UnsafeMutableRawPointer(mutating: cString)); return result }; return nil }
     func setAudioTrack(at index: Int) {
@@ -522,6 +772,7 @@ class MPVPlayerManager: ObservableObject {
     func setSubtitleTrack(at index: Int) {
         guard index >= 0 && index < subtitleIds.count else { return }
         let id = subtitleIds[index]
+        hasUserSelectedSubtitleTrack = true
         runOnControlQueue { [weak self] in
             guard let self else { return }
             if id == -1 {
@@ -530,6 +781,11 @@ class MPVPlayerManager: ObservableObject {
                 mpv_set_property_string(self.mpv, "sid", "\(id)")
             }
         }
+    }
+
+    func addExternalSubtitle(url: URL, title: String, language: String = "chi") {
+        hasUserSelectedSubtitleTrack = true
+        executeMpvCommand(["sub-add", url.path, "select", title, language])
     }
     private func formatTime(_ time: Double) -> String { if time.isNaN || time < 0 { return "00:00" }; let t = Int(time); return t / 3600 > 0 ? String(format: "%02d:%02d:%02d", t/3600, (t%3600)/60, t%60) : String(format: "%02d:%02d", (t%3600)/60, t%60) }
     

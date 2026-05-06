@@ -20,6 +20,13 @@ private struct RecentWebDAVHistoryItem: Identifiable, Codable, Equatable {
     }
 }
 
+private struct WebDAVBrowserStarredFolder: Identifiable, Equatable {
+    let url: String
+    let name: String
+
+    var id: String { url }
+}
+
 extension MediaSource: Hashable {
     public static func == (lhs: MediaSource, rhs: MediaSource) -> Bool { return lhs.id == rhs.id }
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -71,7 +78,8 @@ struct PosterWallView: View {
     @State private var webDAVBrowserMessage: String? = nil
     @State private var webDAVBrowserMessageIsError = false
     @State private var webDAVBrowserIsLoading = false
-    @State private var webDAVBrowserMountingURL: String? = nil
+    @State private var webDAVBrowserIsBatchMounting = false
+    @State private var webDAVBrowserStarredFolders: [WebDAVBrowserStarredFolder] = []
     
     @AppStorage("keepLocalPosters") var keepLocalPosters = true
     @AppStorage("autoScanOnStartup") var autoScanOnStartup = true
@@ -81,6 +89,7 @@ struct PosterWallView: View {
     
     @AppStorage("appTheme") var appTheme = ThemeType.crystal.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.crystal.colors }
+    @Environment(\.colorScheme) private var colorScheme
     
     @ObservedObject var thumbManager = ThumbnailManager.shared
     @ObservedObject var cacheManager = OfflineCacheManager.shared
@@ -110,6 +119,18 @@ struct PosterWallView: View {
     var displayedMovies: [Movie] { var result = movies; if !searchText.isEmpty { result = result.filter { $0.title.localizedCaseInsensitiveContains(searchText) } }; result.sort { m1, m2 in let isLess: Bool; switch selectedSortOption { case .name: isLess = m1.title.localizedStandardCompare(m2.title) == .orderedAscending; case .year: isLess = (m1.releaseDate ?? "") < (m2.releaseDate ?? ""); case .rating: isLess = (m1.voteAverage ?? 0.0) < (m2.voteAverage ?? 0.0) }; return isAscending ? isLess : !isLess }; return result }
     private var discoveredWebDAVDevices: [DiscoveredDevice] {
         lanScanner.discoveredDevices.filter { $0.type == .webdavHTTP || $0.type == .webdavHTTPS }
+    }
+    private var topToolbarInactiveIconColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.78) : .secondary
+    }
+    private var topToolbarDisabledIconColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.32) : theme.textSecondary.opacity(0.5)
+    }
+    private var topToolbarStatusTextColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.86) : theme.textSecondary
+    }
+    private var webDAVBrowserStarredURLs: Set<String> {
+        Set(webDAVBrowserStarredFolders.map(\.url))
     }
 
     var body: some View {
@@ -195,9 +216,10 @@ struct PosterWallView: View {
                     if !thumbManager.progressMessage.isEmpty {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
+                                .tint(topToolbarStatusTextColor)
                             Text(thumbManager.progressMessage)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(topToolbarStatusTextColor)
                                 .lineLimit(1)
                                 .frame(maxWidth: 220, alignment: .leading)
                         }
@@ -205,19 +227,10 @@ struct PosterWallView: View {
                     
                     Spacer(minLength: 20)
                     
-                    Button(action: { withAnimation { OfflineCacheManager.shared.isCacheModeActive.toggle() } }) {
-                        Image(systemName: OfflineCacheManager.shared.isCacheModeActive ? "icloud.fill" : "icloud")
-                            .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(OfflineCacheManager.shared.isCacheModeActive ? theme.accent : .secondary)
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.plain)
-                    .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
-                    
                     Button(action: { isShowingManageSources.toggle() }) {
                         Image(systemName: "folder.badge.plus")
                             .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(topToolbarInactiveIconColor)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
@@ -228,7 +241,7 @@ struct PosterWallView: View {
                     Button(action: { triggerScanAndScrape() }) {
                         Image(systemName: "arrow.triangle.2.circlepath")
                             .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(isProcessing ? theme.textSecondary.opacity(0.5) : .secondary)
+                            .foregroundColor(isProcessing ? topToolbarDisabledIconColor : topToolbarInactiveIconColor)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
@@ -236,10 +249,19 @@ struct PosterWallView: View {
                     .disabled(isProcessing)
                     .conditionalHelp("重新扫描目录并刷新刮削结果", show: enableFastTooltip)
                     
+                    Button(action: { withAnimation { OfflineCacheManager.shared.isCacheModeActive.toggle() } }) {
+                        Image(systemName: OfflineCacheManager.shared.isCacheModeActive ? "icloud.fill" : "icloud")
+                            .font(.system(size: 21, weight: .medium))
+                            .foregroundColor(OfflineCacheManager.shared.isCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
+
                     Button(action: { showSettings = true }) {
                         Image(systemName: "gearshape")
                             .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(topToolbarInactiveIconColor)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
@@ -844,7 +866,8 @@ struct PosterWallView: View {
         webDAVBrowserMessage = nil
         webDAVBrowserMessageIsError = false
         webDAVBrowserIsLoading = false
-        webDAVBrowserMountingURL = nil
+        webDAVBrowserIsBatchMounting = false
+        webDAVBrowserStarredFolders = []
     }
 
     private func prepareWebDAVBrowserLogin(for device: DiscoveredDevice) {
@@ -861,7 +884,8 @@ struct PosterWallView: View {
         webDAVBrowserMessage = nil
         webDAVBrowserMessageIsError = false
         webDAVBrowserIsLoading = false
-        webDAVBrowserMountingURL = nil
+        webDAVBrowserIsBatchMounting = false
+        webDAVBrowserStarredFolders = []
     }
 
     private func webDAVPreScanLoginSheet() -> some View {
@@ -869,7 +893,7 @@ struct PosterWallView: View {
             Text("登录 WebDAV")
                 .font(.title3.bold())
                 .accessibilityIdentifier("webdav.sheet.title")
-            Text("保存登录信息后会先进入共享文件夹列表；在目标文件夹右侧点星标即可挂载并立即扫描刮削。")
+            Text("保存登录信息后会先进入共享文件夹列表；可给多个目标文件夹点星标，关闭列表时统一挂载并扫描刮削。")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -919,9 +943,19 @@ struct PosterWallView: View {
                 Text("选择 WebDAV 共享文件夹")
                     .font(.title3.bold())
                 Spacer()
-                if webDAVBrowserIsLoading {
+                if webDAVBrowserIsLoading || webDAVBrowserIsBatchMounting {
                     ProgressView().controlSize(.small)
                 }
+                Button {
+                    closeWebDAVFolderBrowser()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(webDAVBrowserIsLoading || webDAVBrowserIsBatchMounting)
+                .help(webDAVBrowserStarredFolders.isEmpty ? "关闭" : "关闭并挂载标星文件夹")
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -950,6 +984,13 @@ struct PosterWallView: View {
                 .disabled(webDAVBrowserCurrentURL.isEmpty || webDAVBrowserIsLoading)
             }
 
+            if !webDAVBrowserStarredFolders.isEmpty {
+                Text("已标星 \(webDAVBrowserStarredFolders.count) 个文件夹，关闭列表后会加入挂载媒体源。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if let webDAVBrowserMessage {
                 Text(webDAVBrowserMessage)
                     .font(.caption)
@@ -975,10 +1016,10 @@ struct PosterWallView: View {
 
             HStack {
                 Spacer()
-                Button("关闭") {
-                    isShowingWebDAVFolderBrowserSheet = false
-                    resetWebDAVBrowserState(clearLogin: true)
+                Button(webDAVBrowserStarredFolders.isEmpty ? "关闭" : "关闭并挂载 \(webDAVBrowserStarredFolders.count) 个文件夹") {
+                    closeWebDAVFolderBrowser()
                 }
+                .disabled(webDAVBrowserIsLoading || webDAVBrowserIsBatchMounting)
             }
         }
         .padding(20)
@@ -988,7 +1029,8 @@ struct PosterWallView: View {
     private func webDAVFolderBrowserRow(_ item: WebDAVDirectoryItem) -> some View {
         let normalizedURL = normalizedWebDAVBrowserURL(item.url.absoluteString)
         let isMounted = webDAVBrowserMountedURLs.contains(normalizedURL)
-        let isMounting = webDAVBrowserMountingURL == normalizedURL
+        let isStarred = webDAVBrowserStarredURLs.contains(normalizedURL)
+        let isBusy = webDAVBrowserIsLoading || webDAVBrowserIsBatchMounting
 
         return HStack(spacing: 10) {
             Button {
@@ -1007,21 +1049,17 @@ struct PosterWallView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(webDAVBrowserIsLoading || isMounting)
+            .disabled(isBusy)
 
             Button {
-                mountWebDAVBrowserFolder(item)
+                toggleWebDAVBrowserStar(item)
             } label: {
-                if isMounting {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: isMounted ? "star.fill" : "star")
-                        .foregroundColor(isMounted ? .yellow : .secondary)
-                }
+                Image(systemName: (isMounted || isStarred) ? "star.fill" : "star")
+                    .foregroundColor((isMounted || isStarred) ? .yellow : .secondary)
             }
             .buttonStyle(.plain)
-            .help(isMounted ? "已挂载" : "标星并挂载此文件夹")
-            .disabled(isMounted || webDAVBrowserIsLoading || isMounting)
+            .help(isMounted ? "已挂载" : (isStarred ? "取消标星" : "标星此文件夹"))
+            .disabled(isMounted || isBusy)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -1071,6 +1109,7 @@ struct PosterWallView: View {
                     webDAVBrowserPathStack = []
                     webDAVBrowserItems = items
                     webDAVBrowserMountedURLs = mountedWebDAVURLs(from: mediaSources)
+                    webDAVBrowserStarredFolders = []
                     webDAVBrowserIsLoading = false
                     webDAVBrowserMessage = items.isEmpty ? "连接成功，但当前目录没有可浏览的子文件夹。" : nil
                     webDAVBrowserMessageIsError = false
@@ -1136,54 +1175,91 @@ struct PosterWallView: View {
         }
     }
 
-    private func mountWebDAVBrowserFolder(_ item: WebDAVDirectoryItem) {
-        let baseURL = normalizedWebDAVBrowserURL(item.url.absoluteString)
+    private func toggleWebDAVBrowserStar(_ item: WebDAVDirectoryItem) {
+        let normalizedURL = normalizedWebDAVBrowserURL(item.url.absoluteString)
+        guard !webDAVBrowserMountedURLs.contains(normalizedURL) else { return }
+        if let index = webDAVBrowserStarredFolders.firstIndex(where: { $0.url == normalizedURL }) {
+            webDAVBrowserStarredFolders.remove(at: index)
+        } else {
+            let name = item.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            webDAVBrowserStarredFolders.append(
+                WebDAVBrowserStarredFolder(
+                    url: normalizedURL,
+                    name: name.isEmpty ? "WebDAV 媒体源" : name
+                )
+            )
+        }
+    }
+
+    private func closeWebDAVFolderBrowser() {
+        guard !webDAVBrowserIsLoading, !webDAVBrowserIsBatchMounting else { return }
+        guard !webDAVBrowserStarredFolders.isEmpty else {
+            isShowingWebDAVFolderBrowserSheet = false
+            resetWebDAVBrowserState(clearLogin: true)
+            return
+        }
+        mountStarredWebDAVBrowserFoldersAndClose()
+    }
+
+    private func mountStarredWebDAVBrowserFoldersAndClose() {
+        let folders = webDAVBrowserStarredFolders
+        guard !folders.isEmpty else { return }
         let authConfig = webDAVBrowserCredentialID.map { WebDAVCredentialStore.shared.authReference(for: $0) }
-        let sourceName = item.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "WebDAV 媒体源" : item.displayName
         let username = webDAVBrowserUsername
         let credentialID = webDAVBrowserCredentialID
 
-        webDAVBrowserMountingURL = baseURL
+        webDAVBrowserIsBatchMounting = true
         webDAVBrowserMessage = nil
         webDAVBrowserMessageIsError = false
 
         Task {
             do {
-                let sourceID = try await AppDatabase.shared.dbQueue.write { db -> Int64 in
-                    if let existing = try MediaSource.fetchOne(
-                        db,
-                        sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ? LIMIT 1",
-                        arguments: [MediaSourceProtocol.webdav.rawValue, baseURL]
-                    ), let existingID = existing.id {
-                        try db.execute(
-                            sql: """
-                            UPDATE mediaSource
-                            SET authConfig = COALESCE(?, authConfig),
-                                isEnabled = 1,
-                                disabledAt = NULL
-                            WHERE id = ?
-                            """,
-                            arguments: [authConfig, existingID]
-                        )
-                        return existingID
-                    }
+                let sourceIDs = try await AppDatabase.shared.dbQueue.write { db -> [Int64] in
+                    var mountedIDs: [Int64] = []
+                    for folder in folders {
+                        let baseURL = folder.url
+                        let sourceName = folder.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "WebDAV 媒体源" : folder.name
+                        if let existing = try MediaSource.fetchOne(
+                            db,
+                            sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ? LIMIT 1",
+                            arguments: [MediaSourceProtocol.webdav.rawValue, baseURL]
+                        ), let existingID = existing.id {
+                            try db.execute(
+                                sql: """
+                                UPDATE mediaSource
+                                SET authConfig = COALESCE(?, authConfig),
+                                    isEnabled = 1,
+                                    disabledAt = NULL
+                                WHERE id = ?
+                                """,
+                                arguments: [authConfig, existingID]
+                            )
+                            mountedIDs.append(existingID)
+                            continue
+                        }
 
-                    let source = MediaSource(
-                        id: nil,
-                        name: sourceName,
-                        protocolType: MediaSourceProtocol.webdav.rawValue,
-                        baseUrl: baseURL,
-                        authConfig: authConfig
-                    )
-                    try source.insert(db)
-                    return db.lastInsertedRowID
+                        let source = MediaSource(
+                            id: nil,
+                            name: sourceName,
+                            protocolType: MediaSourceProtocol.webdav.rawValue,
+                            baseUrl: baseURL,
+                            authConfig: authConfig
+                        )
+                        try source.insert(db)
+                        mountedIDs.append(db.lastInsertedRowID)
+                    }
+                    return mountedIDs
                 }
 
                 await MainActor.run {
-                    webDAVBrowserMountedURLs.insert(baseURL)
-                    webDAVBrowserMountingURL = nil
+                    for folder in folders {
+                        webDAVBrowserMountedURLs.insert(folder.url)
+                    }
+                    webDAVBrowserIsBatchMounting = false
                     if let credentialID {
-                        recordRecentWebDAVHistory(name: sourceName, baseURL: baseURL, username: username, credentialID: credentialID)
+                        for folder in folders {
+                            recordRecentWebDAVHistory(name: folder.name, baseURL: folder.url, username: username, credentialID: credentialID)
+                        }
                     }
                     isShowingWebDAVFolderBrowserSheet = false
                     loadData()
@@ -1193,13 +1269,13 @@ struct PosterWallView: View {
                         processingMessage = "扫描中，标星的 WebDAV 文件夹已加入下一轮队列..."
                     } else {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                            triggerScanAndScrape(sourceID: sourceID)
+                            triggerScanAndScrape(sourceIDs: sourceIDs)
                         }
                     }
                 }
             } catch {
                 await MainActor.run {
-                    webDAVBrowserMountingURL = nil
+                    webDAVBrowserIsBatchMounting = false
                     webDAVBrowserMessage = error.localizedDescription
                     webDAVBrowserMessageIsError = true
                 }
@@ -1221,7 +1297,8 @@ struct PosterWallView: View {
         webDAVBrowserMessage = nil
         webDAVBrowserMessageIsError = false
         webDAVBrowserIsLoading = false
-        webDAVBrowserMountingURL = nil
+        webDAVBrowserIsBatchMounting = false
+        webDAVBrowserStarredFolders = []
     }
 
     private func sanitizedWebDAVBrowserURL(_ raw: String) -> String {
@@ -1571,7 +1648,7 @@ struct PosterWallView: View {
         }
     }
 
-    private func triggerScanAndScrape(sourceID: Int64? = nil) {
+    private func triggerScanAndScrape(sourceID: Int64? = nil, sourceIDs: [Int64]? = nil) {
         guard !isProcessing else { return }
         withAnimation {
             isProcessing = true
@@ -1589,7 +1666,13 @@ struct PosterWallView: View {
                 }
                 try? libraryManager.cleanupExpiredDisabledSources()
                 let validSources = try await AppDatabase.shared.dbQueue.read { db in
-                    if let sourceID {
+                    if let sourceIDs, !sourceIDs.isEmpty {
+                        let targetIDs = Set(sourceIDs)
+                        return try MediaSource.fetchEnabledScannableSources(in: db).filter { source in
+                            guard let id = source.id else { return false }
+                            return targetIDs.contains(id)
+                        }
+                    } else if let sourceID {
                         if let source = try MediaSource.fetchEnabledScannableSource(id: sourceID, in: db) {
                             return [source]
                         }

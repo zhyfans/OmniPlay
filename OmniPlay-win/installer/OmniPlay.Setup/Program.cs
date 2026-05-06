@@ -392,14 +392,36 @@ internal static class Program
 
     private static InstallSelection? ResolveInstallSelection(SetupOptions options)
     {
+        var registeredInstallRoot = GetNormalizedRegisteredInstallRoot();
+
         if (!string.IsNullOrWhiteSpace(options.InstallDirectory))
         {
-            return new InstallSelection(
-                NormalizeInstallRoot(options.InstallDirectory),
-                options.CreateDesktopShortcut);
+            var requestedInstallRoot = NormalizeInstallRoot(options.InstallDirectory);
+            if (!string.IsNullOrWhiteSpace(registeredInstallRoot) &&
+                !IsSamePath(requestedInstallRoot, registeredInstallRoot))
+            {
+                if (options.Quiet)
+                {
+                    throw new InvalidOperationException(
+                        $"已检测到览影安装在：{registeredInstallRoot}\n静默安装不允许安装到不同目录，避免产生重复安装。请使用已安装目录，或先卸载旧版本。");
+                }
+
+                var duplicateChoice = ShowDifferentInstallDirectoryDialog(registeredInstallRoot, requestedInstallRoot);
+                if (duplicateChoice == DuplicateInstallChoice.Cancel)
+                {
+                    return null;
+                }
+
+                if (duplicateChoice == DuplicateInstallChoice.UpgradeExisting)
+                {
+                    requestedInstallRoot = registeredInstallRoot;
+                }
+            }
+
+            return new InstallSelection(requestedInstallRoot, options.CreateDesktopShortcut);
         }
 
-        var defaultInstallRoot = GetRegisteredInstallRoot() ?? GetDefaultInstallRoot();
+        var defaultInstallRoot = registeredInstallRoot ?? GetDefaultInstallRoot();
         if (options.Quiet)
         {
             return new InstallSelection(
@@ -407,7 +429,55 @@ internal static class Program
                 options.CreateDesktopShortcut);
         }
 
+        if (!string.IsNullOrWhiteSpace(registeredInstallRoot))
+        {
+            var duplicateChoice = ShowExistingInstallDialog(registeredInstallRoot);
+            if (duplicateChoice == DuplicateInstallChoice.Cancel)
+            {
+                return null;
+            }
+
+            if (duplicateChoice == DuplicateInstallChoice.UpgradeExisting)
+            {
+                return new InstallSelection(registeredInstallRoot, options.CreateDesktopShortcut);
+            }
+        }
+
         return ShowInstallDirectoryDialog(defaultInstallRoot, options.CreateDesktopShortcut);
+    }
+
+    private static DuplicateInstallChoice ShowExistingInstallDialog(string registeredInstallRoot)
+    {
+        var result = MessageBox.Show(
+            $"检测到已安装的览影：\n\n{registeredInstallRoot}\n\n选择“是”升级现有安装。\n选择“否”选择其他目录。\n选择“取消”退出安装。",
+            ProductName,
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button1);
+
+        return result switch
+        {
+            DialogResult.Yes => DuplicateInstallChoice.UpgradeExisting,
+            DialogResult.No => DuplicateInstallChoice.UseSelectedDirectory,
+            _ => DuplicateInstallChoice.Cancel
+        };
+    }
+
+    private static DuplicateInstallChoice ShowDifferentInstallDirectoryDialog(string registeredInstallRoot, string requestedInstallRoot)
+    {
+        var result = MessageBox.Show(
+            $"检测到已安装的览影：\n\n{registeredInstallRoot}\n\n当前指定的新目录为：\n\n{requestedInstallRoot}\n\n安装到新目录会保留旧版本，可能产生重复安装。\n\n选择“是”升级现有安装。\n选择“否”仍安装到新目录。\n选择“取消”退出安装。",
+            ProductName,
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button1);
+
+        return result switch
+        {
+            DialogResult.Yes => DuplicateInstallChoice.UpgradeExisting,
+            DialogResult.No => DuplicateInstallChoice.UseSelectedDirectory,
+            _ => DuplicateInstallChoice.Cancel
+        };
     }
 
     private static InstallSelection? ShowInstallDirectoryDialog(string defaultInstallRoot, bool createDesktopShortcut)
@@ -576,6 +646,26 @@ internal static class Program
         return key?.GetValue("InstallLocation") as string;
     }
 
+    private static string? GetNormalizedRegisteredInstallRoot()
+    {
+        var registeredInstallRoot = GetRegisteredInstallRoot();
+        if (string.IsNullOrWhiteSpace(registeredInstallRoot))
+        {
+            return null;
+        }
+
+        try
+        {
+            var normalized = NormalizeInstallRoot(registeredInstallRoot);
+            EnsureSafeInstallRoot(normalized);
+            return normalized;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static string GetStartMenuDirectory()
     {
         return Path.Combine(
@@ -667,6 +757,13 @@ internal static class Program
         return normalizedPath.StartsWith(normalizedParent, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsSamePath(string left, string right)
+    {
+        var normalizedLeft = Path.TrimEndingDirectorySeparator(Path.GetFullPath(left));
+        var normalizedRight = Path.TrimEndingDirectorySeparator(Path.GetFullPath(right));
+        return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string EnsureTrailingSeparator(string path)
     {
         return Path.EndsInDirectorySeparator(path) ? path : path + Path.DirectorySeparatorChar;
@@ -697,6 +794,13 @@ internal static class Program
     }
 
     private sealed record InstallSelection(string InstallRoot, bool CreateDesktopShortcut);
+
+    private enum DuplicateInstallChoice
+    {
+        UpgradeExisting,
+        UseSelectedDirectory,
+        Cancel
+    }
 
     private sealed record SetupOptions(
         bool Quiet,

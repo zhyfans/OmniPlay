@@ -71,10 +71,13 @@ struct PlayerScreen: View {
     @State private var hideUITask: Task<Void, Never>? = nil
     @State private var menuInteractionTask: Task<Void, Never>? = nil
     @State private var isMenuInteractionActive = false
+    @State private var isPointerInTopControlArea = false
     @State private var hasIssuedLoad = false
     @State private var hasPersistedBeforeExit = false
     @State private var isClosingPlayback = false
     @Environment(\.dismiss) var dismiss
+
+    private let topControlHoldHeight: CGFloat = 88
     
     private func log(_ message: String) {
         print("[PlayerScreen] \(message)")
@@ -152,7 +155,20 @@ struct PlayerScreen: View {
                         }
                         Text(currentPlaybackTitle).font(.title3).fontWeight(.bold).padding(.leading, 10)
                         Spacer()
-                    }.foregroundColor(.white).padding(20).background(LinearGradient(gradient: Gradient(colors: [.black.opacity(0.8), .clear]), startPoint: .top, endPoint: .bottom))
+                    }
+                    .foregroundColor(.white)
+                    .padding(20)
+                    .background(LinearGradient(gradient: Gradient(colors: [.black.opacity(0.8), .clear]), startPoint: .top, endPoint: .bottom))
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        isPointerInTopControlArea = hovering
+                        if hovering {
+                            hideUITask?.cancel()
+                            setCursorHidden(false)
+                        } else {
+                            resetHideTimer()
+                        }
+                    }
                     
                     Spacer()
                     
@@ -327,7 +343,27 @@ struct PlayerScreen: View {
             
         }
         .toolbar(isStandaloneWindow ? .visible : .hidden, for: .windowToolbar)
-        .onContinuousHover { _ in if !showControls { withAnimation(.easeInOut(duration: 0.3)) { showControls = true } }; resetHideTimer() }
+        .onContinuousHover(coordinateSpace: .local) { phase in
+            switch phase {
+            case .active(let location):
+                if !showControls {
+                    withAnimation(.easeInOut(duration: 0.3)) { showControls = true }
+                }
+                if location.y <= topControlHoldHeight {
+                    isPointerInTopControlArea = true
+                    hideUITask?.cancel()
+                    setCursorHidden(false)
+                } else {
+                    if isPointerInTopControlArea {
+                        isPointerInTopControlArea = false
+                    }
+                    resetHideTimer()
+                }
+            case .ended:
+                isPointerInTopControlArea = false
+                resetHideTimer()
+            }
+        }
         .onAppear {
             log("onAppear movie=\(movie.title) initialFileId=\(initialFileId ?? "nil") seedFiles=\(initialPlaylistFiles?.count ?? 0) seedSource=\(initialSourceBasePath ?? "nil") seedProtocol=\(initialSourceProtocolType ?? "nil")")
             ensureComfortableWindowSize()
@@ -370,16 +406,7 @@ struct PlayerScreen: View {
             }
             let newFile = allPlaylistFiles[newIndex]
             guard oldId != newFile.id else { return }
-            Task.detached {
-                try? await AppDatabase.shared.dbQueue.write { db in
-                    if var f = try VideoFile.fetchOne(db, key: oldId) {
-                        let progress = max(0, min(f.playProgress, f.duration))
-                        f.playProgress = progress
-                        try f.update(db)
-                    }
-                }
-                await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
-            }
+            persistFinishedPlaylistFiles(finishedPlaylistFileIds(before: newIndex, previousFileId: oldId))
             currentVideoFileId = newFile.id
         }
     }
@@ -401,7 +428,7 @@ struct PlayerScreen: View {
         if panel.runModal() == .OK, let url = panel.url {
             let subName = url.lastPathComponent
             // 发送底层挂载命令，并强制选中这根新轨道
-            playerManager.executeMpvCommand(["sub-add", url.path, "select", subName, "chi"])
+            playerManager.addExternalSubtitle(url: url, title: subName)
         }
         
         if wasPlaying { playerManager.playOrPause() } // 选完自动恢复播放
@@ -410,11 +437,13 @@ struct PlayerScreen: View {
     private func resetHideTimer() {
         hideUITask?.cancel()
         guard !isMenuInteractionActive else { return }
+        guard !isPointerInTopControlArea else { return }
         hideUITask = Task {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard !isMenuInteractionActive else { return }
+                guard !isPointerInTopControlArea else { return }
                 withAnimation(.easeInOut(duration: 0.5)) { showControls = false }
             }
         }
@@ -561,6 +590,75 @@ struct PlayerScreen: View {
         dismiss()
     }
 
+    nonisolated private static func applyFinishedPlaybackState(to file: inout VideoFile) {
+        let resolvedDuration = file.duration > 0 ? file.duration : max(file.playProgress, 100.0)
+        file.duration = resolvedDuration
+        file.playProgress = resolvedDuration
+        file.lastPlayedAt = nil
+    }
+
+    private func normalizedPlaybackFilename(_ value: String) -> String {
+        let decoded = value.removingPercentEncoding ?? value
+        return (decoded as NSString).lastPathComponent.lowercased()
+    }
+
+    private func playbackFilename(_ playbackFilename: String, matches file: VideoFile) -> Bool {
+        let normalized = normalizedPlaybackFilename(playbackFilename)
+        guard !normalized.isEmpty else { return false }
+
+        let candidates = [
+            file.fileName,
+            (file.relativePath as NSString).lastPathComponent
+        ]
+        return candidates.contains { candidate in
+            !candidate.isEmpty && normalizedPlaybackFilename(candidate) == normalized
+        }
+    }
+
+    private func resolvedPlaybackFileIndex(from snapshot: MPVPlayerManager.PlaybackEngineSnapshot) -> Int? {
+        if let filename = snapshot.filename,
+           let filenameIndex = allPlaylistFiles.firstIndex(where: { playbackFilename(filename, matches: $0) }) {
+            return filenameIndex
+        }
+        if allPlaylistFiles.indices.contains(snapshot.playlistIndex) {
+            return snapshot.playlistIndex
+        }
+        if let currentVideoFileId {
+            return allPlaylistFiles.firstIndex(where: { $0.id == currentVideoFileId })
+        }
+        return nil
+    }
+
+    private func finishedPlaylistFileIds(before currentIndex: Int, previousFileId: String?) -> [String] {
+        guard allPlaylistFiles.indices.contains(currentIndex),
+              let previousFileId,
+              let previousIndex = allPlaylistFiles.firstIndex(where: { $0.id == previousFileId }),
+              previousIndex < currentIndex else {
+            return []
+        }
+        return Array(allPlaylistFiles[previousIndex..<currentIndex].map(\.id))
+    }
+
+    private func persistFinishedPlaylistFiles(_ fileIds: [String]) {
+        var seenFileIds = Set<String>()
+        let uniqueFileIds = fileIds.filter { seenFileIds.insert($0).inserted }
+        guard !uniqueFileIds.isEmpty else { return }
+
+        Task.detached {
+            do {
+                try await AppDatabase.shared.dbQueue.write { db in
+                    for fileId in uniqueFileIds {
+                        if var file = try VideoFile.fetchOne(db, key: fileId) {
+                            Self.applyFinishedPlaybackState(to: &file)
+                            try file.update(db)
+                        }
+                    }
+                }
+                await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
+            } catch {}
+        }
+    }
+
     private func persistAndStopPlaybackIfNeeded(reason: String) {
         traceClose("persistAndStop begin reason=\(reason) hasPersisted=\(hasPersistedBeforeExit)")
         guard !hasPersistedBeforeExit else { return }
@@ -570,11 +668,17 @@ struct PlayerScreen: View {
         hideUITask = nil
         showControls = true
 
-        let progressToSave = playerManager.currentTimePos
-        let durationToSave = playerManager.duration
-        let fileIdToSave = currentVideoFileId
+        let playbackSnapshot = playerManager.playbackEngineSnapshot
+        let resolvedPlaylistIndex = resolvedPlaybackFileIndex(from: playbackSnapshot)
+        let fileIdToSave = resolvedPlaylistIndex.flatMap { allPlaylistFiles.indices.contains($0) ? allPlaylistFiles[$0].id : nil } ?? currentVideoFileId
+        let completedFileIds = resolvedPlaylistIndex.map {
+            finishedPlaylistFileIds(before: $0, previousFileId: currentVideoFileId)
+        } ?? []
+        let progressToSave = playbackSnapshot.timePos.isFinite ? playbackSnapshot.timePos : playerManager.currentTimePos
+        let snapshotDuration = playbackSnapshot.duration.isFinite ? playbackSnapshot.duration : 0.0
+        let durationToSave = snapshotDuration > 0 ? snapshotDuration : playerManager.duration
         let isTVPlaybackAtClose = isTVPlayback
-        traceClose("snapshot fileId=\(fileIdToSave ?? "nil") progress=\(progressToSave) duration=\(durationToSave) isTV=\(isTVPlaybackAtClose)")
+        traceClose("snapshot fileId=\(fileIdToSave ?? "nil") playlistIndex=\(playbackSnapshot.playlistIndex) filename=\(playbackSnapshot.filename ?? "nil") progress=\(progressToSave) duration=\(durationToSave) isTV=\(isTVPlaybackAtClose)")
         forceCursorVisible()
         traceClose("calling playerManager.stop()")
         playerManager.stop()
@@ -588,11 +692,19 @@ struct PlayerScreen: View {
                 print("[PlayerScreenClose][\(formatter.string(from: Date()))][\(thread)][q:\(queue)] progress save task begin fileId=\(fileId)")
                 do {
                     try await AppDatabase.shared.dbQueue.write { db in
+                        for completedId in completedFileIds where completedId != fileId {
+                            if var completedFile = try VideoFile.fetchOne(db, key: completedId) {
+                                Self.applyFinishedPlaybackState(to: &completedFile)
+                                try completedFile.update(db)
+                            }
+                        }
                         if var file = try VideoFile.fetchOne(db, key: fileId) {
-                            let finished = durationToSave > 0 && (progressToSave / durationToSave) >= 0.95
+                            let resolvedDuration = max(durationToSave, file.duration)
+                            let finished = resolvedDuration > 0 && (progressToSave / resolvedDuration) >= 0.95
                             let thresholded = progressToSave > 5.0 ? progressToSave : 0.0
                             file.playProgress = finished ? 0.0 : thresholded
-                            file.duration = durationToSave
+                            file.duration = resolvedDuration
+                            file.lastPlayedAt = (!finished && thresholded > 0.0) ? Date().timeIntervalSince1970 : nil
                             try file.update(db)
                         }
                     }
@@ -799,6 +911,7 @@ struct PlayerScreen: View {
                         let resolvedDuration = max(duration, file.duration)
                         file.duration = resolvedDuration
                         file.playProgress = resolvedDuration > 0 ? resolvedDuration : max(currentTime, file.playProgress)
+                        file.lastPlayedAt = nil
                         try file.update(db)
                     }
                 }

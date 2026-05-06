@@ -9,6 +9,8 @@ namespace OmniPlay.Player.Mpv;
 public sealed class MpvPlayer : IMediaPlayer
 {
     private const int UnknownTrackListCount = -1;
+    private readonly object initializationGate = new();
+    private readonly SemaphoreSlim playerGate = new(1, 1);
     private bool initialized;
     private string? detectedLibraryName;
     private IntPtr hostHandle;
@@ -27,13 +29,16 @@ public sealed class MpvPlayer : IMediaPlayer
 
     public void Initialize()
     {
-        if (initialized)
+        lock (initializationGate)
         {
-            return;
-        }
+            if (initialized)
+            {
+                return;
+            }
 
-        initialized = true;
-        IsAvailable = MpvNative.TryLoadLibrary(out detectedLibraryName);
+            initialized = true;
+            IsAvailable = MpvNative.TryLoadLibrary(out detectedLibraryName);
+        }
     }
 
     public void AttachToHost(IntPtr hostHandle)
@@ -41,41 +46,186 @@ public sealed class MpvPlayer : IMediaPlayer
         this.hostHandle = hostHandle;
     }
 
-    public Task<MediaPlayerOpenResult> OpenAsync(PlaybackOpenRequest request, CancellationToken cancellationToken = default)
+    public async Task<MediaPlayerOpenResult> OpenAsync(PlaybackOpenRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        Initialize();
 
-        var filePath = request.PlaybackPath;
+        await playerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(
+                () => OpenCore(request.PlaybackPath),
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            playerGate.Release();
+        }
+    }
+
+    public async Task<PlayerPlaybackState> GetStateAsync(CancellationToken cancellationToken = default)
+    {
+        var gateEntered = false;
+        try
+        {
+            await playerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            gateEntered = true;
+            if (playerHandle == IntPtr.Zero)
+            {
+                return PlayerPlaybackState.Empty;
+            }
+
+            return await Task.Run(ReadStateCore, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return PlayerPlaybackState.Empty;
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                playerGate.Release();
+            }
+        }
+    }
+
+    public Task SetPausedAsync(bool isPaused, CancellationToken cancellationToken = default)
+    {
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(handle, "pause", isPaused ? "yes" : "no"),
+            cancellationToken);
+    }
+
+    public Task SeekAsync(double positionSeconds, CancellationToken cancellationToken = default)
+    {
+        var seconds = Math.Max(0, positionSeconds).ToString("0.###", CultureInfo.InvariantCulture);
+        return RunPlayerActionAsync(
+            handle => MpvNative.Command(handle, "seek", seconds, "absolute"),
+            cancellationToken);
+    }
+
+    public Task SetMutedAsync(bool isMuted, CancellationToken cancellationToken = default)
+    {
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(handle, "mute", isMuted ? "yes" : "no"),
+            cancellationToken);
+    }
+
+    public Task SetVolumeAsync(double volumePercent, CancellationToken cancellationToken = default)
+    {
+        var normalized = Math.Clamp(volumePercent, 0, 100).ToString("0.###", CultureInfo.InvariantCulture);
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(handle, "volume", normalized),
+            cancellationToken);
+    }
+
+    public Task SelectAudioTrackAsync(long? trackId, CancellationToken cancellationToken = default)
+    {
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(
+                handle,
+                "aid",
+                trackId?.ToString(CultureInfo.InvariantCulture) ?? "no"),
+            cancellationToken);
+    }
+
+    public Task SelectSubtitleTrackAsync(long? trackId, CancellationToken cancellationToken = default)
+    {
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(
+                handle,
+                "sid",
+                trackId?.ToString(CultureInfo.InvariantCulture) ?? "no"),
+            cancellationToken);
+    }
+
+    public Task<bool> LoadExternalSubtitleAsync(string subtitlePath, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(subtitlePath) || !File.Exists(subtitlePath))
+        {
+            return Task.FromResult(false);
+        }
+
+        var title = Path.GetFileName(subtitlePath);
+        return RunPlayerFunctionAsync(
+            handle =>
+            {
+                var result = MpvNative.Command(handle, "sub-add", subtitlePath, "select", title);
+                if (result >= 0)
+                {
+                    InvalidateTrackCache();
+                }
+
+                return result >= 0;
+            },
+            false,
+            cancellationToken);
+    }
+
+    public Task SetSubtitleDelayAsync(double delaySeconds, CancellationToken cancellationToken = default)
+    {
+        var normalized = delaySeconds.ToString("0.###", CultureInfo.InvariantCulture);
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(
+                handle,
+                "sub-delay",
+                normalized),
+            cancellationToken);
+    }
+
+    public Task SetSubtitleFontSizeAsync(int fontSize, CancellationToken cancellationToken = default)
+    {
+        var normalized = Math.Clamp(fontSize, 8, 96).ToString(CultureInfo.InvariantCulture);
+        return RunPlayerActionAsync(
+            handle => MpvNative.SetPropertyString(handle, "sub-font-size", normalized),
+            cancellationToken);
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        await playerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await Task.Run(DestroyPlayer, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            playerGate.Release();
+        }
+    }
+
+    private MediaPlayerOpenResult OpenCore(string filePath)
+    {
+        Initialize();
 
         if (!MediaSourcePathResolver.IsPlayableLocation(filePath))
         {
-            return Task.FromResult(MediaPlayerOpenResult.Failure("文件不存在，无法开始播放。"));
+            return MediaPlayerOpenResult.Failure("文件不存在，无法开始播放。");
         }
 
         if (!IsAvailable)
         {
-            return Task.FromResult(MediaPlayerOpenResult.Failure("未找到 libmpv 原生库，请将 libmpv-2.dll 放到程序目录或 PATH 后重试。"));
+            return MediaPlayerOpenResult.Failure("未找到 libmpv 原生库，请将 libmpv-2.dll 放到程序目录或 PATH 后重试。");
         }
 
         if (hostHandle == IntPtr.Zero)
         {
-            return Task.FromResult(MediaPlayerOpenResult.Failure("播放器宿主句柄尚未准备好。"));
+            return MediaPlayerOpenResult.Failure("播放器宿主句柄尚未准备好。");
         }
 
         try
         {
-            if (playerHandle != IntPtr.Zero)
-            {
-                MpvNative.TerminateDestroy(playerHandle);
-                playerHandle = IntPtr.Zero;
-                InvalidateTrackCache();
-            }
+            DestroyPlayer();
 
             playerHandle = MpvNative.Create();
             if (playerHandle == IntPtr.Zero)
             {
-                return Task.FromResult(MediaPlayerOpenResult.Failure("libmpv 创建播放器实例失败。"));
+                return MediaPlayerOpenResult.Failure("libmpv 创建播放器实例失败。");
             }
 
             SetOption("terminal", "no");
@@ -89,193 +239,118 @@ public sealed class MpvPlayer : IMediaPlayer
             var initResult = MpvNative.Initialize(playerHandle);
             if (initResult < 0)
             {
-                return Task.FromResult(MediaPlayerOpenResult.Failure($"libmpv 初始化失败，错误码 {initResult}。"));
+                DestroyPlayer();
+                return MediaPlayerOpenResult.Failure($"libmpv 初始化失败，错误码 {initResult}。");
             }
 
             var loadResult = MpvNative.Command(playerHandle, "loadfile", filePath);
             if (loadResult < 0)
             {
-                return Task.FromResult(MediaPlayerOpenResult.Failure($"libmpv 加载文件失败，错误码 {loadResult}。"));
+                DestroyPlayer();
+                return MediaPlayerOpenResult.Failure($"libmpv 加载文件失败，错误码 {loadResult}。");
             }
 
-            return Task.FromResult(MediaPlayerOpenResult.Success($"已通过 {BackendName} 在应用内打开视频。"));
+            return MediaPlayerOpenResult.Success($"已通过 {BackendName} 在应用内打开视频。");
         }
         catch (DllNotFoundException)
         {
-            return Task.FromResult(MediaPlayerOpenResult.Failure("已复制 libmpv-2.dll，但运行时仍无法解析其依赖项。"));
+            DestroyPlayer();
+            return MediaPlayerOpenResult.Failure("已复制 libmpv-2.dll，但运行时仍无法解析其依赖项。");
         }
         catch (Exception ex)
         {
-            return Task.FromResult(MediaPlayerOpenResult.Failure($"libmpv 播放启动失败：{ex.Message}"));
+            DestroyPlayer();
+            return MediaPlayerOpenResult.Failure($"libmpv 播放启动失败：{ex.Message}");
         }
     }
 
-    public Task<PlayerPlaybackState> GetStateAsync(CancellationToken cancellationToken = default)
+    private PlayerPlaybackState ReadStateCore()
+    {
+        var duration = ParseDouble(MpvNative.GetPropertyString(playerHandle, "duration"));
+        var position = ParseDouble(MpvNative.GetPropertyString(playerHandle, "time-pos"));
+        var pause = ParseFlag(MpvNative.GetPropertyString(playerHandle, "pause"));
+        var eofReached = ParseFlag(MpvNative.GetPropertyString(playerHandle, "eof-reached"));
+        var mute = ParseFlag(MpvNative.GetPropertyString(playerHandle, "mute"));
+        var volumeText = MpvNative.GetPropertyString(playerHandle, "volume");
+        var volume = string.IsNullOrWhiteSpace(volumeText) ? 100 : ParseDouble(volumeText);
+        var selectedAudioTrackId = ParseLong(MpvNative.GetPropertyString(playerHandle, "aid"));
+        var selectedSubtitleTrackId = ParseLong(MpvNative.GetPropertyString(playerHandle, "sid"));
+        var subtitleDelay = ParseDouble(MpvNative.GetPropertyString(playerHandle, "sub-delay"));
+        var subtitleFontSize = ParseInt(MpvNative.GetPropertyString(playerHandle, "sub-font-size"));
+        var trackListCount = ParseInt(MpvNative.GetPropertyString(playerHandle, "track-list/count"));
+        var (audioTracks, subtitleTracks) = ReadCachedTracks(
+            trackListCount,
+            selectedAudioTrackId,
+            selectedSubtitleTrackId);
+
+        return new PlayerPlaybackState
+        {
+            HasMedia = duration > 0 || position > 0 || audioTracks.Count > 0 || subtitleTracks.Count > 0,
+            DurationSeconds = duration,
+            PositionSeconds = position,
+            IsPaused = pause,
+            IsPlaybackCompleted = eofReached,
+            IsMuted = mute,
+            VolumePercent = Math.Clamp(volume, 0, 100),
+            AudioTracks = audioTracks,
+            SubtitleTracks = subtitleTracks,
+            SubtitleDelaySeconds = subtitleDelay,
+            SubtitleFontSize = subtitleFontSize > 0 ? subtitleFontSize : 16
+        };
+    }
+
+    private Task RunPlayerActionAsync(Action<IntPtr> action, CancellationToken cancellationToken)
+    {
+        return RunPlayerFunctionAsync(
+            handle =>
+            {
+                action(handle);
+                return true;
+            },
+            false,
+            cancellationToken);
+    }
+
+    private async Task<T> RunPlayerFunctionAsync<T>(
+        Func<IntPtr, T> function,
+        T fallback,
+        CancellationToken cancellationToken)
+    {
+        await playerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var handle = playerHandle;
+            if (handle == IntPtr.Zero)
+            {
+                return fallback;
+            }
+
+            return await Task.Run(() => function(handle), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            playerGate.Release();
+        }
+    }
+
+    private void DestroyPlayer()
     {
         if (playerHandle == IntPtr.Zero)
         {
-            return Task.FromResult(PlayerPlaybackState.Empty);
+            InvalidateTrackCache();
+            return;
         }
 
+        var handle = playerHandle;
+        playerHandle = IntPtr.Zero;
         try
         {
-            var duration = ParseDouble(MpvNative.GetPropertyString(playerHandle, "duration"));
-            var position = ParseDouble(MpvNative.GetPropertyString(playerHandle, "time-pos"));
-            var pause = ParseFlag(MpvNative.GetPropertyString(playerHandle, "pause"));
-            var eofReached = ParseFlag(MpvNative.GetPropertyString(playerHandle, "eof-reached"));
-            var mute = ParseFlag(MpvNative.GetPropertyString(playerHandle, "mute"));
-            var volumeText = MpvNative.GetPropertyString(playerHandle, "volume");
-            var volume = string.IsNullOrWhiteSpace(volumeText) ? 100 : ParseDouble(volumeText);
-            var selectedAudioTrackId = ParseLong(MpvNative.GetPropertyString(playerHandle, "aid"));
-            var selectedSubtitleTrackId = ParseLong(MpvNative.GetPropertyString(playerHandle, "sid"));
-            var subtitleDelay = ParseDouble(MpvNative.GetPropertyString(playerHandle, "sub-delay"));
-            var subtitleFontSize = ParseInt(MpvNative.GetPropertyString(playerHandle, "sub-font-size"));
-            var trackListCount = ParseInt(MpvNative.GetPropertyString(playerHandle, "track-list/count"));
-            var (audioTracks, subtitleTracks) = ReadCachedTracks(
-                trackListCount,
-                selectedAudioTrackId,
-                selectedSubtitleTrackId);
-
-            return Task.FromResult(new PlayerPlaybackState
-            {
-                HasMedia = duration > 0 || position > 0 || audioTracks.Count > 0 || subtitleTracks.Count > 0,
-                DurationSeconds = duration,
-                PositionSeconds = position,
-                IsPaused = pause,
-                IsPlaybackCompleted = eofReached,
-                IsMuted = mute,
-                VolumePercent = Math.Clamp(volume, 0, 100),
-                AudioTracks = audioTracks,
-                SubtitleTracks = subtitleTracks,
-                SubtitleDelaySeconds = subtitleDelay,
-                SubtitleFontSize = subtitleFontSize > 0 ? subtitleFontSize : 16
-            });
+            MpvNative.TerminateDestroy(handle);
         }
-        catch
-        {
-            return Task.FromResult(PlayerPlaybackState.Empty);
-        }
-    }
-
-    public Task SetPausedAsync(bool isPaused, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.SetPropertyString(playerHandle, "pause", isPaused ? "yes" : "no");
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SeekAsync(double positionSeconds, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            var seconds = Math.Max(0, positionSeconds).ToString("0.###", CultureInfo.InvariantCulture);
-            MpvNative.Command(playerHandle, "seek", seconds, "absolute");
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SetMutedAsync(bool isMuted, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.SetPropertyString(playerHandle, "mute", isMuted ? "yes" : "no");
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SetVolumeAsync(double volumePercent, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            var normalized = Math.Clamp(volumePercent, 0, 100).ToString("0.###", CultureInfo.InvariantCulture);
-            MpvNative.SetPropertyString(playerHandle, "volume", normalized);
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SelectAudioTrackAsync(long? trackId, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.SetPropertyString(
-                playerHandle,
-                "aid",
-                trackId?.ToString(CultureInfo.InvariantCulture) ?? "no");
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SelectSubtitleTrackAsync(long? trackId, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.SetPropertyString(
-                playerHandle,
-                "sid",
-                trackId?.ToString(CultureInfo.InvariantCulture) ?? "no");
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task<bool> LoadExternalSubtitleAsync(string subtitlePath, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle == IntPtr.Zero || string.IsNullOrWhiteSpace(subtitlePath) || !File.Exists(subtitlePath))
-        {
-            return Task.FromResult(false);
-        }
-
-        var title = Path.GetFileName(subtitlePath);
-        var result = MpvNative.Command(playerHandle, "sub-add", subtitlePath, "select", title);
-        if (result >= 0)
+        finally
         {
             InvalidateTrackCache();
         }
-
-        return Task.FromResult(result >= 0);
-    }
-
-    public Task SetSubtitleDelayAsync(double delaySeconds, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.SetPropertyString(
-                playerHandle,
-                "sub-delay",
-                delaySeconds.ToString("0.###", CultureInfo.InvariantCulture));
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task SetSubtitleFontSizeAsync(int fontSize, CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            var normalized = Math.Clamp(fontSize, 8, 96).ToString(CultureInfo.InvariantCulture);
-            MpvNative.SetPropertyString(playerHandle, "sub-font-size", normalized);
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task StopAsync(CancellationToken cancellationToken = default)
-    {
-        if (playerHandle != IntPtr.Zero)
-        {
-            MpvNative.TerminateDestroy(playerHandle);
-            playerHandle = IntPtr.Zero;
-            InvalidateTrackCache();
-        }
-
-        return Task.CompletedTask;
     }
 
     private (IReadOnlyList<PlayerTrackInfo> AudioTracks, IReadOnlyList<PlayerTrackInfo> SubtitleTracks) ReadCachedTracks(

@@ -169,7 +169,6 @@ public sealed class StandalonePlayerWindowManager
             AppLog.Info(
                 $"Standalone player return-to-shell manager started. WindowVisible={window.IsVisible}, " +
                 $"WindowState={window.WindowState}, CurrentFile={currentFilePath ?? playerViewModel.CurrentFilePath}");
-            await CompleteActiveSessionAsync(cancellationToken);
 
             if (window.IsVisible)
             {
@@ -184,6 +183,7 @@ public sealed class StandalonePlayerWindowManager
             }
 
             ActivateShellWindow();
+            await CompleteActiveSessionAsync(cancellationToken);
             closeCompletionSource?.TrySetResult();
             AppLog.Info("Standalone player return-to-shell manager completed.");
         }

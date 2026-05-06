@@ -317,12 +317,13 @@
                             <Border Background="#FFFFFF" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,8">
                               <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto">
                                 <TextBlock FontSize="14" FontWeight="SemiBold" Foreground="#1A1A1A" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
-                                <Button Grid.Column="1" Classes="sourceAction" Command="{Binding $parent[UserControl].DataContext.MountNetworkFolderCommand}" CommandParameter="{Binding}" Content="★" ToolTip.Tip="挂载到媒体源" />
+                                <Button Grid.Column="1" Classes="sourceAction" Command="{Binding $parent[UserControl].DataContext.ToggleNetworkFolderStarCommand}" CommandParameter="{Binding}" Content="{Binding StarGlyph}" ToolTip.Tip="标星此文件夹" />
                               </Grid>
                             </Border>
                           </DataTemplate>
                         </ItemsControl.ItemTemplate>
                       </ItemsControl>
+                      <Button Classes="sourceAction" HorizontalAlignment="Right" Command="{Binding MountStarredNetworkFoldersCommand}" Content="{Binding MountStarredNetworkFoldersActionText}" IsVisible="{Binding HasNetworkShareFolders}" />
                     </StackPanel>
                   </Border>
 

@@ -231,6 +231,11 @@ public sealed class LibraryThumbnailEnricherTests : IDisposable
                     """));
             }
 
+            if (requestUri.Contains("/tv/70523?", StringComparison.Ordinal))
+            {
+                return Task.FromResult(CreateJsonResponse("""{ "number_of_seasons": 1, "seasons": [{ "season_number": 1, "episode_count": 12 }] }"""));
+            }
+
             if (requestUri.Contains("/tv/70523/season/1/episode/1", StringComparison.Ordinal))
             {
                 return Task.FromResult(CreateJsonResponse("""{ "still_path": "/episode-still.jpg" }"""));

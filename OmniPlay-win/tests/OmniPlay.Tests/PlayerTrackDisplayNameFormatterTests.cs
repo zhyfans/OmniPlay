@@ -35,6 +35,10 @@ public sealed class PlayerTrackDisplayNameFormatterTests
 
     [Theory]
     [InlineData("jpn", "🇯🇵 日语")]
+    [InlineData("zh-Hans", "🇨🇳 中文")]
+    [InlineData("ZH_HANT", "🇨🇳 中文")]
+    [InlineData("en-US", "🇺🇸 英语")]
+    [InlineData("ja-JP", "🇯🇵 日语")]
     [InlineData("kor", "🇰🇷 韩语")]
     [InlineData("fra", "🇫🇷 法语")]
     [InlineData("deu", "🇩🇪 德语")]

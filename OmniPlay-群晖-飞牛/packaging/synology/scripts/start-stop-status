@@ -1,0 +1,62 @@
+#!/bin/sh
+
+PACKAGE="OmniPlay"
+APP_DIR="/var/packages/${PACKAGE}/target"
+APP_ROOT="/var/packages/${PACKAGE}/home"
+PID_FILE="${APP_ROOT}/omniplay.pid"
+LOG_FILE="${APP_ROOT}/logs/server.log"
+URLS="${OMNIPLAY_URLS:-http://0.0.0.0:8096}"
+EXECUTABLE="${APP_DIR}/OmniPlay.Api"
+
+start() {
+  mkdir -p "${APP_ROOT}/data" "${APP_ROOT}/cache" "${APP_ROOT}/logs" "${APP_ROOT}/settings"
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "${PID_FILE}"
+
+  if [ ! -x "${EXECUTABLE}" ]; then
+    echo "Missing executable: ${EXECUTABLE}" >> "${LOG_FILE}"
+    exit 1
+  fi
+
+  OMNIPLAY_APP_ROOT="${APP_ROOT}" OMNIPLAY_URLS="${URLS}" nohup "${EXECUTABLE}" >> "${LOG_FILE}" 2>&1 &
+  echo $! > "${PID_FILE}"
+  sleep 1
+  if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    rm -f "${PID_FILE}"
+    exit 1
+  fi
+}
+
+stop() {
+  if [ -f "${PID_FILE}" ]; then
+    PID="$(cat "${PID_FILE}")"
+    kill "${PID}" 2>/dev/null || true
+    WAIT_COUNT=0
+    while kill -0 "${PID}" 2>/dev/null && [ "${WAIT_COUNT}" -lt 20 ]; do
+      WAIT_COUNT=$((WAIT_COUNT + 1))
+      sleep 1
+    done
+    if kill -0 "${PID}" 2>/dev/null; then
+      kill -9 "${PID}" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}"
+  fi
+}
+
+status() {
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    exit 0
+  fi
+  exit 3
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  log) tail -n 80 "${LOG_FILE}" ;;
+  *) exit 1 ;;
+esac

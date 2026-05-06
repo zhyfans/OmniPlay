@@ -9,6 +9,7 @@
     MinHeight="720"
     Background="#FFFFFF"
     Foreground="#1A1A1A"
+    CanResize="True"
     SystemDecorations="None"
     WindowStartupLocation="CenterScreen"
     Title="览影">
@@ -39,9 +40,72 @@
     <library:PosterWallView DataContext="{Binding PosterWall}" />
 
     <Grid
+        x:Name="ShellResizeLayer"
+        IsVisible="{Binding !PosterWall.IsPlayerOverlayOpen}"
+        ZIndex="20">
+      <Border
+          Height="6"
+          VerticalAlignment="Top"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="North" />
+      <Border
+          Height="6"
+          VerticalAlignment="Bottom"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="South" />
+      <Border
+          Width="6"
+          HorizontalAlignment="Left"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="West" />
+      <Border
+          Width="6"
+          HorizontalAlignment="Right"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="East" />
+      <Border
+          Width="14"
+          Height="14"
+          HorizontalAlignment="Left"
+          VerticalAlignment="Top"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="NorthWest" />
+      <Border
+          Width="14"
+          Height="14"
+          HorizontalAlignment="Right"
+          VerticalAlignment="Top"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="NorthEast" />
+      <Border
+          Width="14"
+          Height="14"
+          HorizontalAlignment="Left"
+          VerticalAlignment="Bottom"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="SouthWest" />
+      <Border
+          Width="14"
+          Height="14"
+          HorizontalAlignment="Right"
+          VerticalAlignment="Bottom"
+          Background="#01000000"
+          PointerPressed="ShellResizeBorder_OnPointerPressed"
+          Tag="SouthEast" />
+    </Grid>
+
+    <Grid
         x:Name="ShellWindowControlsLayer"
         VerticalAlignment="Top"
-        IsVisible="{Binding !PosterWall.IsPlayerOverlayOpen}">
+        IsVisible="{Binding !PosterWall.IsPlayerOverlayOpen}"
+        ZIndex="30">
       <Border
           Height="12"
           VerticalAlignment="Top"

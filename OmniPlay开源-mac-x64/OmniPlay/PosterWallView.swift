@@ -21,6 +21,13 @@ private struct RecentWebDAVHistoryItem: Identifiable, Codable, Equatable {
     }
 }
 
+private struct WebDAVBrowserStarredFolder: Identifiable, Equatable {
+    let url: String
+    let name: String
+
+    var id: String { url }
+}
+
 private enum WebDAVCredentialFlow: Sendable {
     case manual
     case discovered
@@ -89,6 +96,7 @@ struct PosterWallView: View {
     
     @AppStorage("appTheme") var appTheme = ThemeType.crystal.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.crystal.colors }
+    @Environment(\.colorScheme) private var colorScheme
     
     @ObservedObject var thumbManager = ThumbnailManager.shared
     @ObservedObject var cacheManager = OfflineCacheManager.shared
@@ -120,6 +128,8 @@ struct PosterWallView: View {
     @State private var webDAVFolderListMessage: String? = nil
     @State private var webDAVFolderListIsError: Bool = false
     @State private var webDAVIsLoadingFolders: Bool = false
+    @State private var webDAVIsBatchMountingFolders: Bool = false
+    @State private var webDAVStarredFolders: [WebDAVBrowserStarredFolder] = []
     
     // 🌟 彻底删除了所有与 network 相关的 State
     
@@ -133,6 +143,18 @@ struct PosterWallView: View {
     private var scannableProtocolValues: [String] { [MediaSourceProtocol.local.rawValue, MediaSourceProtocol.webdav.rawValue] }
     private var discoveredWebDAVDevices: [DiscoveredDevice] {
         lanScanner.discoveredDevices.filter { $0.type == .webdavHTTP || $0.type == .webdavHTTPS }
+    }
+    private var topToolbarInactiveIconColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.78) : .secondary
+    }
+    private var topToolbarDisabledIconColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.32) : theme.textSecondary.opacity(0.5)
+    }
+    private var topToolbarStatusTextColor: Color {
+        colorScheme == .dark ? theme.textPrimary.opacity(0.86) : theme.textSecondary
+    }
+    private var webDAVStarredFolderURLs: Set<String> {
+        Set(webDAVStarredFolders.map(\.url))
     }
     private var unifiedDiagnosticsText: String {
         [lastPreflightDiagnosticsText, lastScanDiagnosticsText]
@@ -226,18 +248,34 @@ struct PosterWallView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity).navigationTitle("我的觅影库")
             .toolbar {
-                ToolbarItemGroup(placement: .navigation) { if !thumbManager.progressMessage.isEmpty { HStack { ProgressView().controlSize(.small); Text(thumbManager.progressMessage).font(.caption).foregroundColor(.secondary).lineLimit(1).frame(maxWidth: 200, alignment: .leading) } } }
-                ToolbarItemGroup(placement: .primaryAction) {
-                    Button(action: { withAnimation { OfflineCacheManager.shared.isCacheModeActive.toggle() } }) {
-                        Label("缓存模式", systemImage: OfflineCacheManager.shared.isCacheModeActive ? "icloud.fill" : "icloud")
-                            .foregroundColor(OfflineCacheManager.shared.isCacheModeActive ? theme.accent : .secondary)
+                ToolbarItemGroup(placement: .navigation) {
+                    if !thumbManager.progressMessage.isEmpty {
+                        HStack {
+                            ProgressView().controlSize(.small)
+                                .tint(topToolbarStatusTextColor)
+                            Text(thumbManager.progressMessage)
+                                .font(.caption)
+                                .foregroundColor(topToolbarStatusTextColor)
+                                .lineLimit(1)
+                                .frame(maxWidth: 200, alignment: .leading)
+                        }
                     }
-                    .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
-                    
-                    if isProcessing { HStack(spacing: 8) { ProgressView().controlSize(.small); Text(processingMessage).font(.subheadline).foregroundColor(.secondary) }.padding(.trailing, 10) }
+                }
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if isProcessing {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                                .tint(topToolbarStatusTextColor)
+                            Text(processingMessage)
+                                .font(.subheadline)
+                                .foregroundColor(topToolbarStatusTextColor)
+                        }
+                        .padding(.trailing, 10)
+                    }
                     if !unifiedDiagnosticsText.isEmpty {
                         Button(action: { copyLastDiagnosticsToPasteboard() }) {
                             Label("复制诊断", systemImage: "doc.on.doc")
+                                .foregroundColor(topToolbarInactiveIconColor)
                         }
                         .accessibilityIdentifier("toolbar.copyDiagnostics")
                         .conditionalHelp("复制最近一次扫描失败或 WebDAV 预检失败的诊断信息", show: enableFastTooltip)
@@ -245,15 +283,27 @@ struct PosterWallView: View {
                     
                     Button(action: { isShowingManageSources.toggle() }) {
                         Label("媒体源管理", systemImage: "externaldrive.badge.plus")
+                            .foregroundColor(topToolbarInactiveIconColor)
                     }
                         .accessibilityIdentifier("toolbar.addSource")
                         .conditionalHelp("管理已挂载目录、添加本地文件夹或 WebDAV 媒体源", show: enableFastTooltip)
                         .popover(isPresented: $isShowingManageSources, arrowEdge: .top) { folderMenuPanel }
-                    Button(action: { triggerScanAndScrape() }) { Label("同步", systemImage: "arrow.triangle.2.circlepath") }
+                    Button(action: { triggerScanAndScrape() }) {
+                        Label("同步", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundColor(isProcessing ? topToolbarDisabledIconColor : topToolbarInactiveIconColor)
+                    }
                         .accessibilityIdentifier("toolbar.sync")
                         .disabled(isProcessing)
                         .conditionalHelp("重新扫描目录并刷新刮削结果", show: enableFastTooltip)
-                    Button(action: { showSettings = true }) { Label("设置", systemImage: "gearshape") }
+                    Button(action: { withAnimation { OfflineCacheManager.shared.isCacheModeActive.toggle() } }) {
+                        Label("缓存模式", systemImage: OfflineCacheManager.shared.isCacheModeActive ? "icloud.fill" : "icloud")
+                            .foregroundColor(OfflineCacheManager.shared.isCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
+                    }
+                    .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
+                    Button(action: { showSettings = true }) {
+                        Label("设置", systemImage: "gearshape")
+                            .foregroundColor(topToolbarInactiveIconColor)
+                    }
                         .accessibilityIdentifier("toolbar.settings")
                         .conditionalHelp("打开偏好设置", show: enableFastTooltip)
                 }
@@ -840,6 +890,8 @@ struct PosterWallView: View {
         webDAVFolderListMessage = nil
         webDAVFolderListIsError = false
         webDAVIsLoadingFolders = false
+        webDAVIsBatchMountingFolders = false
+        webDAVStarredFolders = []
         isShowingManageSources = false
         isShowingDiscoveredWebDAVLoginSheet = true
     }
@@ -899,11 +951,33 @@ struct PosterWallView: View {
 
     private func webDAVFolderPickerSheet() -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("选择 WebDAV 共享文件夹")
-                .font(.title3.bold())
-            Text("点击文件夹右侧星标后，该文件夹会作为媒体源挂载，并立即开始扫描和刮削。")
+            HStack {
+                Text("选择 WebDAV 共享文件夹")
+                    .font(.title3.bold())
+                Spacer()
+                if webDAVIsLoadingFolders || webDAVIsBatchMountingFolders {
+                    ProgressView().controlSize(.small)
+                }
+                Button {
+                    closeWebDAVFolderPicker()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(webDAVIsLoadingFolders || webDAVIsBatchMountingFolders)
+                .help(webDAVStarredFolders.isEmpty ? "关闭" : "关闭并挂载标星文件夹")
+            }
+            Text("可给多个目标文件夹点星标，关闭列表时统一挂载并扫描刮削。")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            if !webDAVStarredFolders.isEmpty {
+                Text("已标星 \(webDAVStarredFolders.count) 个文件夹，关闭列表后会加入挂载媒体源。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
 
             if let webDAVFolderListMessage {
                 Text(webDAVFolderListMessage)
@@ -934,15 +1008,18 @@ struct PosterWallView: View {
                                 }
                                 Spacer()
                                 let mounted = isWebDAVFolderMounted(folder)
+                                let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
+                                let starred = webDAVStarredFolderURLs.contains(normalizedURL)
+                                let isBusy = webDAVIsLoadingFolders || webDAVIsBatchMountingFolders
                                 Button {
-                                    mountWebDAVFolder(folder)
+                                    toggleWebDAVFolderStar(folder)
                                 } label: {
-                                    Image(systemName: mounted ? "star.fill" : "star")
-                                        .foregroundColor(mounted ? .yellow : .secondary)
+                                    Image(systemName: (mounted || starred) ? "star.fill" : "star")
+                                        .foregroundColor((mounted || starred) ? .yellow : .secondary)
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(mounted || webDAVIsLoadingFolders)
-                                .help(mounted ? "已挂载" : "挂载并扫描")
+                                .disabled(mounted || isBusy)
+                                .help(mounted ? "已挂载" : (starred ? "取消标星" : "标星此文件夹"))
                             }
                             .padding(10)
                             .background(.ultraThinMaterial)
@@ -955,9 +1032,10 @@ struct PosterWallView: View {
 
             HStack {
                 Spacer()
-                Button("关闭") {
-                    isShowingWebDAVFolderPickerSheet = false
+                Button(webDAVStarredFolders.isEmpty ? "关闭" : "关闭并挂载 \(webDAVStarredFolders.count) 个文件夹") {
+                    closeWebDAVFolderPicker()
                 }
+                .disabled(webDAVIsLoadingFolders || webDAVIsBatchMountingFolders)
             }
         }
         .padding(22)
@@ -978,6 +1056,7 @@ struct PosterWallView: View {
         webDAVBrowserPassword = webDAVPassword
         webDAVBrowserCredentialID = nil
         webDAVSharedFolders = []
+        webDAVStarredFolders = []
         webDAVValidationMessage = nil
         webDAVValidationIsError = false
         loadWebDAVFoldersFromBrowserDraft(flow: .manual)
@@ -1020,6 +1099,7 @@ struct PosterWallView: View {
                 await MainActor.run {
                     webDAVBrowserCredentialID = credentialID
                     webDAVSharedFolders = folders
+                    webDAVStarredFolders = []
                     webDAVFolderListMessage = folders.isEmpty ? "连接成功，但服务端没有返回共享文件夹。" : "连接成功，请选择要挂载的文件夹。"
                     webDAVFolderListIsError = false
                     webDAVIsLoadingFolders = false
@@ -1045,6 +1125,114 @@ struct PosterWallView: View {
         let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
         return mediaSources.contains { source in
             source.protocolKind == .webdav && source.normalizedBaseURL() == normalizedURL
+        }
+    }
+
+    private func toggleWebDAVFolderStar(_ folder: WebDAVDirectoryItem) {
+        let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
+        guard MediaSourceProtocol.webdav.isValidBaseURL(normalizedURL) else {
+            webDAVFolderListMessage = "该 WebDAV 文件夹地址无效，无法挂载。"
+            webDAVFolderListIsError = true
+            return
+        }
+        guard !isWebDAVFolderMounted(folder) else { return }
+        if let index = webDAVStarredFolders.firstIndex(where: { $0.url == normalizedURL }) {
+            webDAVStarredFolders.remove(at: index)
+        } else {
+            let name = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            webDAVStarredFolders.append(
+                WebDAVBrowserStarredFolder(
+                    url: normalizedURL,
+                    name: name.isEmpty ? "WebDAV 媒体源" : name
+                )
+            )
+        }
+    }
+
+    private func closeWebDAVFolderPicker() {
+        guard !webDAVIsLoadingFolders, !webDAVIsBatchMountingFolders else { return }
+        guard !webDAVStarredFolders.isEmpty else {
+            isShowingWebDAVFolderPickerSheet = false
+            webDAVStarredFolders = []
+            return
+        }
+        mountStarredWebDAVFoldersAndClose()
+    }
+
+    private func mountStarredWebDAVFoldersAndClose() {
+        let folders = webDAVStarredFolders
+        guard !folders.isEmpty else { return }
+        let authConfig = webDAVBrowserCredentialID.map { WebDAVCredentialStore.shared.authReference(for: $0) }
+        let username = webDAVBrowserUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        webDAVIsBatchMountingFolders = true
+        webDAVFolderListMessage = nil
+        webDAVFolderListIsError = false
+
+        Task {
+            do {
+                let mountedSourceIDs = try await AppDatabase.shared.dbQueue.write { db -> [Int64] in
+                    var sourceIDs: [Int64] = []
+                    for folder in folders {
+                        if let existing = try MediaSource.fetchOne(
+                            db,
+                            sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ? LIMIT 1",
+                            arguments: [MediaSourceProtocol.webdav.rawValue, folder.url]
+                        ) {
+                            try db.execute(
+                                sql: "UPDATE mediaSource SET name = ?, authConfig = COALESCE(?, authConfig), isEnabled = 1, disabledAt = NULL WHERE id = ?",
+                                arguments: [folder.name, authConfig, existing.id]
+                            )
+                            if let id = existing.id {
+                                sourceIDs.append(id)
+                            }
+                            continue
+                        }
+
+                        let source = MediaSource(
+                            id: nil,
+                            name: folder.name,
+                            protocolType: MediaSourceProtocol.webdav.rawValue,
+                            baseUrl: folder.url,
+                            authConfig: authConfig
+                        )
+                        try source.insert(db)
+                        sourceIDs.append(db.lastInsertedRowID)
+                    }
+                    return sourceIDs
+                }
+
+                await MainActor.run {
+                    for folder in folders {
+                        recordRecentWebDAVHistory(
+                            name: folder.name,
+                            baseURL: folder.url,
+                            username: username,
+                            credentialID: webDAVBrowserCredentialID
+                        )
+                    }
+                    webDAVIsBatchMountingFolders = false
+                    webDAVStarredFolders = []
+                    webDAVFolderListMessage = nil
+                    webDAVFolderListIsError = false
+                    loadData()
+                    isShowingWebDAVFolderPickerSheet = false
+                    if isProcessing {
+                        needsRescanAfterCurrentRun = true
+                        processingMessage = "扫描中，标星的 WebDAV 文件夹已加入下一轮队列..."
+                    } else {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            triggerScanAndScrape(sourceIDs: mountedSourceIDs)
+                        }
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    webDAVIsBatchMountingFolders = false
+                    webDAVFolderListMessage = error.localizedDescription
+                    webDAVFolderListIsError = true
+                }
+            }
         }
     }
 
@@ -1213,6 +1401,8 @@ struct PosterWallView: View {
                     JOIN mediaSource ON mediaSource.id = videoFile.sourceId
                     WHERE videoFile.playProgress > 5
                       AND (videoFile.duration = 0 OR (videoFile.playProgress / videoFile.duration) < 0.95)
+                    GROUP BY movie.id
+                    ORDER BY MAX(COALESCE(videoFile.lastPlayedAt, 0)) DESC
                     """
                     return try Movie.fetchAll(db, sql: sql)
                 }
@@ -1291,7 +1481,7 @@ struct PosterWallView: View {
         }
     }
     
-    private func triggerScanAndScrape(onlySourceID: Int64? = nil) {
+    private func triggerScanAndScrape(onlySourceID: Int64? = nil, sourceIDs: [Int64]? = nil) {
         guard !isProcessing else { return }
         withAnimation {
             isProcessing = true
@@ -1319,23 +1509,24 @@ struct PosterWallView: View {
                 let validSources = try await AppDatabase.shared.dbQueue.read { db in
                     let p1 = scanProtocols[0]
                     let p2 = scanProtocols[1]
-                    if let onlySourceID {
-                        return try MediaSource.fetchAll(
-                            db,
-                            sql: """
-                            SELECT * FROM mediaSource
-                            WHERE id = ?
-                              AND protocolType IN (?, ?)
-                            ORDER BY id ASC
-                            """,
-                            arguments: [onlySourceID, p1, p2]
-                        )
-                    }
-                    return try MediaSource.fetchAll(
+                    let allSources = try MediaSource.fetchAll(
                         db,
                         sql: "SELECT * FROM mediaSource WHERE protocolType IN (?, ?) ORDER BY id ASC",
                         arguments: [p1, p2]
                     )
+                    if let sourceIDs, !sourceIDs.isEmpty {
+                        let targetIDs = Set(sourceIDs)
+                        return allSources.filter { source in
+                            guard let id = source.id else { return false }
+                            return targetIDs.contains(id)
+                        }
+                    } else if let onlySourceID {
+                        return allSources.filter { source in
+                            guard let id = source.id else { return false }
+                            return id == onlySourceID
+                        }
+                    }
+                    return allSources
                 }
                 
                 if validSources.isEmpty {

@@ -14,6 +14,23 @@ public sealed class NetworkShareFolderItem
 
     public string? AuthConfig { get; init; }
 
+    public bool IsStarred { get; init; }
+
+    public string StarGlyph => IsStarred ? "★" : "☆";
+
+    public NetworkShareFolderItem WithStarred(bool isStarred)
+    {
+        return new NetworkShareFolderItem
+        {
+            Name = Name,
+            ProtocolType = ProtocolType,
+            BaseUrl = BaseUrl,
+            Description = Description,
+            AuthConfig = AuthConfig,
+            IsStarred = isStarred
+        };
+    }
+
     public MediaSource ToMediaSource()
     {
         return new MediaSource

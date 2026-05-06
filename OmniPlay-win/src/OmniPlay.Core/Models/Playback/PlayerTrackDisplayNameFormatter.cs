@@ -15,7 +15,7 @@ public static class PlayerTrackDisplayNameFormatter
     {
         var rawTitle = title?.Trim() ?? string.Empty;
         var rawLanguage = language?.Trim() ?? string.Empty;
-        var languageLabel = SimplifyLanguageLabel(TranslateLanguageCode(rawLanguage));
+        var languageLabel = TranslateLanguageCode(rawLanguage);
         var displayParts = new List<string>();
 
         if (!string.IsNullOrWhiteSpace(languageLabel))
@@ -68,7 +68,7 @@ public static class PlayerTrackDisplayNameFormatter
 
         return metadataParts.Count == 0
             ? baseName
-            : $"{baseName} ({string.Join("/", metadataParts)})";
+            : $"{baseName} ({string.Join(" / ", metadataParts)})";
     }
 
     private static bool IsDuplicateTrackTitle(string title, string language, string languageLabel)
@@ -179,15 +179,6 @@ public static class PlayerTrackDisplayNameFormatter
         }
     }
 
-    private static string SimplifyLanguageLabel(string value)
-    {
-        var trimmed = value.Trim();
-        var lastSpace = trimmed.LastIndexOf(' ');
-        return lastSpace >= 0 && lastSpace < trimmed.Length - 1
-            ? trimmed[(lastSpace + 1)..].Trim()
-            : trimmed;
-    }
-
     private static string NormalizeTrackLabelForComparison(string value)
     {
         return new string(value
@@ -197,14 +188,24 @@ public static class PlayerTrackDisplayNameFormatter
 
     public static string TranslateLanguageCode(string? language)
     {
-        var normalized = language?.Trim().ToLowerInvariant();
-        return normalized switch
+        var trimmed = language?.Trim() ?? string.Empty;
+        var normalized = trimmed.ToLowerInvariant().Replace('_', '-');
+        if (string.IsNullOrWhiteSpace(normalized))
         {
-            "chi" or "zho" or "zh" or "zh-cn" or "zh-hans" or "zh-sg" or "chs" or "cmn" => "🇨🇳 中文",
-            "zh-tw" or "zh-hant" or "cht" => "🇨🇳 中文",
-            "zh-hk" or "yue" => "🇨🇳 中文",
-            "eng" or "en" or "en-us" or "en-gb" => "🇺🇸 英语",
-            "jpn" or "ja" or "ja-jp" => "🇯🇵 日语",
+            return string.Empty;
+        }
+
+        var primaryCode = normalized.Split('-', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? normalized;
+        if (primaryCode is "chi" or "zho" or "zh" or "cmn" or "yue")
+        {
+            return "🇨🇳 中文";
+        }
+
+        return primaryCode switch
+        {
+            "chs" or "cht" => "🇨🇳 中文",
+            "eng" or "en" => "🇺🇸 英语",
+            "jpn" or "ja" => "🇯🇵 日语",
             "kor" or "ko" => "🇰🇷 韩语",
             "fre" or "fra" or "fr" => "🇫🇷 法语",
             "spa" or "es" => "🇪🇸 西语",
@@ -214,8 +215,7 @@ public static class PlayerTrackDisplayNameFormatter
             "por" or "pt" => "🇵🇹 葡语",
             "tha" or "th" => "🇹🇭 泰语",
             "vie" or "vi" => "🇻🇳 越南语",
-            null or "" => string.Empty,
-            _ => normalized.ToUpperInvariant()
+            _ => trimmed.ToUpperInvariant()
         };
     }
 

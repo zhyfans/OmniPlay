@@ -104,47 +104,13 @@ struct MovieDetailView: View {
                                 let isWatched = mainVideoDuration > 0 && (mainPlayProgress / mainVideoDuration) >= 0.95
                                 let currentBtnLabel = getPlayButtonLabel(fileId: file.id, progress: mainPlayProgress)
                                 
-                                HStack(spacing: 20) {
-                                    Button(action: { attemptPlayback(for: file) }) {
-                                        HStack(spacing: 8) {
-                                            Image(systemName: "play.fill").font(.title3)
-                                            Text(currentBtnLabel)
-                                                .font(.title3.bold())
-                                                .lineLimit(1)
-                                                .fixedSize(horizontal: true, vertical: false)
-                                        }
-                                            .padding(.horizontal, 28).padding(.vertical, 12)
-                                            .foregroundColor(theme.accent)
-                                            .background(Capsule().fill(theme.accent.opacity(0.1)))
-                                            .overlay(Capsule().stroke(theme.accent, lineWidth: 1.5))
-                                    }.buttonStyle(.plain)
-                                    
-                                    Button(action: { toggleWatchedStatus(for: file.id) }) {
-                                        HStack(spacing: 8) {
-                                            Image(systemName: isWatched ? "checkmark.circle.fill" : "circle").font(.title3)
-                                            Text(isWatched ? "已播" : "未播")
-                                                .font(.title3.bold())
-                                                .lineLimit(1)
-                                                .fixedSize(horizontal: true, vertical: false)
-                                        }
-                                            .padding(.horizontal, 24).padding(.vertical, 12)
-                                            .foregroundColor(theme.textPrimary)
-                                            .background(Capsule().fill(theme.surface.opacity(0.5)))
-                                            .overlay(Capsule().stroke(theme.textSecondary.opacity(0.2), lineWidth: 1))
-                                    }.buttonStyle(.plain)
-                                    
-                                    if mainVideoDuration > 0 && mainPlayProgress > 0 && !isWatched {
-                                        HStack(spacing: 12) {
-                                            GeometryReader { geo in
-                                                ZStack(alignment: .leading) {
-                                                    Rectangle().fill(theme.surface).frame(height: 4).cornerRadius(2)
-                                                    Rectangle().fill(theme.accent).frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(mainPlayProgress / mainVideoDuration))), height: 4).cornerRadius(2)
-                                                }
-                                            }.frame(width: 140, height: 4)
-                                            Text("\(formatTime(mainPlayProgress)) / \(formatTime(mainVideoDuration))").font(.caption.monospacedDigit()).foregroundColor(theme.textSecondary).lineLimit(1).fixedSize()
-                                        }.padding(.leading, 10)
-                                    }
-                                }
+                                mainPlaybackControls(
+                                    file: file,
+                                    isWatched: isWatched,
+                                    buttonLabel: currentBtnLabel,
+                                    progress: mainPlayProgress,
+                                    duration: mainVideoDuration
+                                )
                             }
                         }
                     }
@@ -281,6 +247,24 @@ struct MovieDetailView: View {
     private func seasonSortPriority(_ season: Int) -> Int {
         season == 0 ? Int.max : season
     }
+
+    private func hasUnfinishedPlaybackProgress(_ file: VideoFile) -> Bool {
+        guard file.playProgress > 5.0 else { return false }
+        guard file.duration > 0 else { return true }
+        return (file.playProgress / file.duration) < 0.95
+    }
+
+    private func isNotFullyWatched(_ file: VideoFile) -> Bool {
+        guard file.duration > 0 else { return true }
+        return (file.playProgress / file.duration) < 0.95
+    }
+
+    private func mostRecentUnfinishedEpisode(in episodes: [EpisodeItem]) -> EpisodeItem? {
+        let unfinishedEpisodes = episodes.filter { hasUnfinishedPlaybackProgress($0.file) }
+        return unfinishedEpisodes.max { lhs, rhs in
+            (lhs.file.lastPlayedAt ?? 0) < (rhs.file.lastPlayedAt ?? 0)
+        }
+    }
     
     private func loadFileDetails(preservingCurrentSelection: Bool = false) {
         let preservedSeason = preservingCurrentSelection ? selectedSeason : nil
@@ -337,8 +321,9 @@ struct MovieDetailView: View {
                     seasonSortPriority($0) < seasonSortPriority($1)
                 }
                 let sortedEpisodes = episodes
-                var nextUpEp = sortedEpisodes.first
-                for ep in sortedEpisodes { let progress = ep.file.duration > 0 ? (ep.file.playProgress / ep.file.duration) : 0; if progress < 0.95 { nextUpEp = ep; break } }
+                let resumeEp = mostRecentUnfinishedEpisode(in: sortedEpisodes)
+                let nextUnwatchedEp = sortedEpisodes.first { isNotFullyWatched($0.file) }
+                let nextUpEp = resumeEp ?? nextUnwatchedEp ?? sortedEpisodes.first
                 
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
@@ -348,14 +333,12 @@ struct MovieDetailView: View {
                             (pair.0.id, cacheManager.supportsCaching(mediaSource: pair.1))
                         }
                     )
-                    if let preservedSeason, seasons.contains(preservedSeason) {
-                        self.selectedSeason = preservedSeason
-                        if let preservedFileId, sortedEpisodes.contains(where: { $0.id == preservedFileId }) {
-                            self.currentVideoFileId = preservedFileId
-                        }
-                    } else if let preservedFileId, let preservedEpisode = sortedEpisodes.first(where: { $0.id == preservedFileId }) {
+                    if let preservedFileId, let preservedEpisode = sortedEpisodes.first(where: { $0.id == preservedFileId }) {
                         self.selectedSeason = preservedEpisode.season
                         self.currentVideoFileId = preservedEpisode.id
+                    } else if let preservedSeason, seasons.contains(preservedSeason) {
+                        self.selectedSeason = preservedSeason
+                        self.currentVideoFileId = sortedEpisodes.first(where: { $0.season == preservedSeason })?.id
                     } else if let target = nextUpEp {
                         self.selectedSeason = target.season
                         self.currentVideoFileId = target.id
@@ -372,7 +355,7 @@ struct MovieDetailView: View {
     }
     
     private func toggleWatchedStatus(for fileId: String) {
-        Task { do { try await AppDatabase.shared.dbQueue.write { db in if var file = try VideoFile.fetchOne(db, key: fileId) { let isWatched = file.duration > 0 && (file.playProgress / file.duration) >= 0.95; if isWatched { file.playProgress = 0 } else { file.playProgress = file.duration > 0 ? file.duration : 100; if file.duration == 0 { file.duration = 100 } }; try file.update(db) } }; DispatchQueue.main.async { NotificationCenter.default.post(name: .libraryUpdated, object: nil) } } catch { } }
+        Task { do { try await AppDatabase.shared.dbQueue.write { db in if var file = try VideoFile.fetchOne(db, key: fileId) { let isWatched = file.duration > 0 && (file.playProgress / file.duration) >= 0.95; if isWatched { file.playProgress = 0 } else { file.playProgress = file.duration > 0 ? file.duration : 100; if file.duration == 0 { file.duration = 100 } }; file.lastPlayedAt = nil; try file.update(db) } }; DispatchQueue.main.async { NotificationCenter.default.post(name: .libraryUpdated, object: nil) } } catch { } }
     }
     
     private func cacheSelectedSeason() {
@@ -429,6 +412,93 @@ struct MovieDetailView: View {
     }
     
     private func formatTime(_ time: Double) -> String { if time.isNaN || time < 0 { return "00:00" }; let t = Int(time); return t / 3600 > 0 ? String(format: "%02d:%02d:%02d", t/3600, (t%3600)/60, t%60) : String(format: "%02d:%02d", (t%3600)/60, t%60) }
+
+    @ViewBuilder
+    private func mainPlaybackControls(
+        file: VideoFile,
+        isWatched: Bool,
+        buttonLabel: String,
+        progress: Double,
+        duration: Double
+    ) -> some View {
+        let hasProgress = duration > 0 && progress > 0 && !isWatched
+        if hasProgress {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    mainPlaybackButtons(file: file, isWatched: isWatched, buttonLabel: buttonLabel)
+                    mainPlaybackProgress(progress: progress, duration: duration)
+                        .frame(width: 320, alignment: .leading)
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    mainPlaybackButtons(file: file, isWatched: isWatched, buttonLabel: buttonLabel)
+                    mainPlaybackProgress(progress: progress, duration: duration)
+                        .frame(maxWidth: 360, alignment: .leading)
+                }
+            }
+        } else {
+            mainPlaybackButtons(file: file, isWatched: isWatched, buttonLabel: buttonLabel)
+        }
+    }
+
+    private func mainPlaybackButtons(file: VideoFile, isWatched: Bool, buttonLabel: String) -> some View {
+        HStack(spacing: 12) {
+            Button(action: { attemptPlayback(for: file) }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "play.fill").font(.title3)
+                    Text(buttonLabel)
+                        .font(.title3.bold())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.86)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .foregroundColor(theme.accent)
+                .background(Capsule().fill(theme.accent.opacity(0.1)))
+                .overlay(Capsule().stroke(theme.accent, lineWidth: 1.5))
+            }
+            .buttonStyle(.plain)
+
+            Button(action: { toggleWatchedStatus(for: file.id) }) {
+                HStack(spacing: 8) {
+                    Image(systemName: isWatched ? "checkmark.circle.fill" : "circle").font(.title3)
+                    Text(isWatched ? "已播" : "未播")
+                        .font(.title3.bold())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.86)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .foregroundColor(theme.textPrimary)
+                .background(Capsule().fill(theme.surface.opacity(0.5)))
+                .overlay(Capsule().stroke(theme.textSecondary.opacity(0.2), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func mainPlaybackProgress(progress: Double, duration: Double) -> some View {
+        HStack(spacing: 12) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(theme.surface)
+                        .frame(height: 4)
+                        .cornerRadius(2)
+                    Rectangle()
+                        .fill(theme.accent)
+                        .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(progress / duration))), height: 4)
+                        .cornerRadius(2)
+                }
+            }
+            .frame(minWidth: 120, maxWidth: 220, minHeight: 4, maxHeight: 4)
+            Text("\(formatTime(progress)) / \(formatTime(duration))")
+                .font(.caption.monospacedDigit())
+                .foregroundColor(theme.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.86)
+        }
+    }
 
     private var effectiveMovie: Movie {
         var currentMovie = movie

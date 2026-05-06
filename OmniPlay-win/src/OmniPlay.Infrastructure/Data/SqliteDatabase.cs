@@ -74,6 +74,7 @@ public sealed class SqliteDatabase
                 episodeId INTEGER NULL,
                 playProgress REAL NOT NULL DEFAULT 0,
                 duration REAL NOT NULL DEFAULT 0,
+                lastPlayedAt REAL NULL,
                 FOREIGN KEY(sourceId) REFERENCES mediaSource(id) ON DELETE CASCADE,
                 FOREIGN KEY(movieId) REFERENCES movie(id) ON DELETE SET NULL,
                 FOREIGN KEY(episodeId) REFERENCES tvShow(id) ON DELETE SET NULL
@@ -105,6 +106,7 @@ public sealed class SqliteDatabase
 
         EnsureColumn(connection, "videoFile", "playProgress", "REAL NOT NULL DEFAULT 0");
         EnsureColumn(connection, "videoFile", "duration", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn(connection, "videoFile", "lastPlayedAt", "REAL NULL");
         EnsureColumn(connection, "videoFile", "customEpisodeTitle", "TEXT NULL");
         EnsureColumn(connection, "videoFile", "customSeasonNumber", "INTEGER NULL");
         EnsureColumn(connection, "videoFile", "customEpisodeNumber", "INTEGER NULL");

@@ -29,6 +29,8 @@ public sealed class LibraryVideoItem
 
     public double Duration { get; init; }
 
+    public double? LastPlayedAt { get; init; }
+
     public int SeasonNumber { get; init; }
 
     public int EpisodeNumber { get; init; }

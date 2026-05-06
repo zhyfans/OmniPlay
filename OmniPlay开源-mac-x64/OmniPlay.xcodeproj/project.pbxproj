@@ -228,6 +228,7 @@
 			mainGroup = 39E184312F67B7C400341D5F;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				39F4E0C92F67D64F0014AB31 /* XCLocalSwiftPackageReference "GRDB.swift-master" */,
 				3948290C2F68D49C003AA55A /* XCRemoteSwiftPackageReference "MPVKit" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -728,6 +729,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		39F4E0C92F67D64F0014AB31 /* XCLocalSwiftPackageReference "GRDB.swift-master" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "GRDB.swift-master";
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		3948290C2F68D49C003AA55A /* XCRemoteSwiftPackageReference "MPVKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -747,6 +755,7 @@
 		};
 		39F4E0C82F67D64F0014AB31 /* GRDB */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 39F4E0C92F67D64F0014AB31 /* XCLocalSwiftPackageReference "GRDB.swift-master" */;
 			productName = GRDB;
 		};
 /* End XCSwiftPackageProductDependency section */

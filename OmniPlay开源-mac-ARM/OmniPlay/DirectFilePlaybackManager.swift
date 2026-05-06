@@ -183,6 +183,7 @@ final class DirectFilePlaybackManager: ObservableObject {
                 .fetchOne(db) {
                 if existingFile.duration > 0 && (existingFile.playProgress / existingFile.duration) >= 0.95 {
                     existingFile.playProgress = 0
+                    existingFile.lastPlayedAt = nil
                 }
                 let movie = try Self.ensureMovie(for: &existingFile, fileURL: fileURL, db: db)
                 try existingFile.update(db)

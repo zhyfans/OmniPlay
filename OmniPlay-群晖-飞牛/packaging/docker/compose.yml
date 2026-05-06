@@ -1,0 +1,13 @@
+services:
+  omniplay:
+    image: omniplay-nas:dev
+    container_name: omniplay-nas
+    ports:
+      - "8096:8096"
+    environment:
+      OMNIPLAY_APP_ROOT: /var/lib/omniplay
+      OMNIPLAY_URLS: http://0.0.0.0:8096
+      ASPNETCORE_URLS: http://0.0.0.0:8096
+    volumes:
+      - ./data:/var/lib/omniplay
+      - /volume1:/media/volume1:ro

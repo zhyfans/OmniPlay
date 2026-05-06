@@ -1,0 +1,266 @@
+using OmniPlay.Core.Interfaces;
+using OmniPlay.Core.Models;
+using OmniPlay.Infrastructure.Data;
+using OmniPlay.Infrastructure.FileSystem;
+using OmniPlay.Infrastructure.Library;
+using Xunit;
+
+namespace OmniPlay.Tests;
+
+public sealed class LibraryScannerTests : IDisposable
+{
+    private readonly string root = Path.Combine(Path.GetTempPath(), "omniplay-tests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public async Task ScanAllIndexesMoviesAndTvEpisodes()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(mediaRoot, "Movies", "霸王别姬 (1993)", "Farewell.My.Concubine.1993.1080p.mkv"));
+        Touch(Path.Combine(mediaRoot, "Shows", "绝命毒师", "Season 01", "Breaking.Bad.S01E01.mkv"));
+        Touch(Path.Combine(mediaRoot, "Shows", "绝命毒师", "Season 01", "Breaking.Bad.S01E02.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        var sources = new MediaSourceRepository(database);
+        await sources.AddLocalAsync("测试媒体", mediaRoot);
+
+        var scanner = new LibraryScanner(database);
+        var summary = await scanner.ScanAllAsync();
+
+        var repository = new LibraryRepository(database);
+        var items = await repository.GetItemsAsync();
+
+        Assert.Equal(1, summary.SourceCount);
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(1, summary.NewTvShowCount);
+        Assert.Equal(3, summary.NewVideoFileCount);
+        Assert.Equal(2, items.Count);
+        Assert.Contains(items, item => item.Title == "霸王别姬" && item.ItemKind == "movie" && item.VideoFileCount == 1);
+        Assert.Contains(items, item => item.Title == "绝命毒师" && item.ItemKind == "tv" && item.VideoFileCount == 2);
+    }
+
+    [Fact]
+    public async Task ScanAllStoresProbeMetadataWhenProbeServiceReturnsSnapshot()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        var moviePath = Path.Combine(mediaRoot, "Movies", "Inception (2010)", "Inception.2010.2160p.mkv");
+        Touch(moviePath);
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        await new MediaSourceRepository(database).AddLocalAsync("测试媒体", mediaRoot);
+        var probeService = new StubMediaProbeService(
+            new MediaProbeSnapshot(
+                moviePath,
+                DurationSeconds: 8888.5,
+                Container: "matroska,webm",
+                VideoCodec: "hevc",
+                AudioCodec: "truehd",
+                SubtitleSummary: "subrip",
+                RawJson: """
+                    {
+                      "streams": [
+                        {
+                          "index": 1,
+                          "codec_type": "audio",
+                          "codec_name": "truehd",
+                          "channels": 8,
+                          "channel_layout": "7.1",
+                          "tags": { "language": "eng", "title": "English Atmos" },
+                          "disposition": { "default": 1, "forced": 0 }
+                        },
+                        {
+                          "index": 3,
+                          "codec_type": "subtitle",
+                          "codec_name": "subrip",
+                          "tags": { "language": "chi", "title": "中文" },
+                          "disposition": { "default": 0, "forced": 1 }
+                        }
+                      ]
+                    }
+                    """,
+                Streams: []));
+        var scanner = new LibraryScanner(database, probeService);
+
+        var summary = await scanner.ScanAllAsync();
+
+        var repository = new LibraryRepository(database);
+        var item = (await repository.GetItemsAsync()).Single();
+        var detail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(detail);
+        var file = detail.VideoFiles.Single();
+
+        Assert.Empty(summary.Diagnostics);
+        Assert.Equal(8888.5, file.DurationSeconds);
+        Assert.Equal("matroska,webm", file.Container);
+        Assert.Equal("hevc", file.VideoCodec);
+        Assert.Equal("truehd", file.AudioCodec);
+        Assert.Equal("subrip", file.SubtitleSummary);
+        Assert.Single(file.AudioTracks);
+        Assert.Equal(1, file.AudioTracks[0].Index);
+        Assert.Equal("eng", file.AudioTracks[0].Language);
+        Assert.Equal("English Atmos", file.AudioTracks[0].Title);
+        Assert.True(file.AudioTracks[0].IsDefault);
+        Assert.Single(file.SubtitleStreams);
+        Assert.Equal(3, file.SubtitleStreams[0].Index);
+        Assert.Equal("chi", file.SubtitleStreams[0].Language);
+        Assert.True(file.SubtitleStreams[0].IsForced);
+
+        var playable = await repository.GetPlayableVideoFileAsync(file.Id);
+        Assert.NotNull(playable);
+        Assert.Equal(8888.5, playable.DurationSeconds);
+        Assert.Equal("hevc", playable.VideoCodec);
+
+        var unchangedSummary = await scanner.ScanAllAsync();
+        Assert.Equal(0, unchangedSummary.NewVideoFileCount);
+        Assert.Equal(1, probeService.ProbeCount);
+    }
+
+    [Fact]
+    public async Task ScanSourceIndexesOnlyRequestedSourceAndStoresLastScannedAt()
+    {
+        var mediaRootA = Path.Combine(root, "media-a");
+        var mediaRootB = Path.Combine(root, "media-b");
+        Touch(Path.Combine(mediaRootA, "Movie.A.2020.mkv"));
+        Touch(Path.Combine(mediaRootB, "Movie.B.2021.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        var mediaSources = new MediaSourceRepository(database);
+        var sourceA = await mediaSources.AddLocalAsync("源 A", mediaRootA);
+        var sourceB = await mediaSources.AddLocalAsync("源 B", mediaRootB);
+        var scanner = new LibraryScanner(database);
+
+        var summary = await scanner.ScanSourceAsync(sourceA.Id, progress: null);
+        var items = await new LibraryRepository(database).GetItemsAsync();
+        var sources = await mediaSources.GetAllAsync();
+
+        Assert.Equal(1, summary.SourceCount);
+        Assert.Equal(1, summary.NewVideoFileCount);
+        Assert.Single(items);
+        Assert.Contains(items, item => item.Title == "Movie A");
+        Assert.NotNull(sources.Single(source => source.Id == sourceA.Id).LastScannedAt);
+        Assert.Null(sources.Single(source => source.Id == sourceB.Id).LastScannedAt);
+    }
+
+    [Fact]
+    public async Task ScanSourceIndexesWebDavFilesWithoutMediaProbe()
+    {
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        var mediaSources = new MediaSourceRepository(database);
+        var source = await mediaSources.AddWebDavAsync("远程媒体", "https://example.com/dav", "user", "secret");
+        var probeService = new CountingMediaProbeService();
+        var webDavEnumerator = new StubWebDavFileEnumerator(
+            new WebDavFileEntry(
+                "Inception.2010.mkv",
+                "https://example.com/dav/Movies/Inception.2010.mkv",
+                "Movies/Inception (2010)/Inception.2010.mkv",
+                1024,
+                DateTimeOffset.Parse("2026-05-03T08:00:00Z")),
+            new WebDavFileEntry(
+                "Breaking.Bad.S01E01.mkv",
+                "https://example.com/dav/Shows/Breaking.Bad/Season 01/Breaking.Bad.S01E01.mkv",
+                "Shows/绝命毒师/Season 01/Breaking.Bad.S01E01.mkv",
+                2048,
+                DateTimeOffset.Parse("2026-05-03T09:00:00Z")),
+            new WebDavFileEntry(
+                "readme.txt",
+                "https://example.com/dav/readme.txt",
+                "readme.txt",
+                12,
+                null));
+        var scanner = new LibraryScanner(database, probeService, webDavEnumerator);
+
+        var summary = await scanner.ScanSourceAsync(source.Id, progress: null);
+        var items = await new LibraryRepository(database).GetItemsAsync();
+        var sources = await mediaSources.GetAllAsync();
+
+        Assert.Equal(1, summary.SourceCount);
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(1, summary.NewTvShowCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+        Assert.Equal(0, probeService.ProbeCount);
+        Assert.Equal("https://example.com/dav", webDavEnumerator.RootUrl);
+        Assert.Equal("user", webDavEnumerator.Username);
+        Assert.Equal("secret", webDavEnumerator.Password);
+        Assert.Contains(items, item => item.Title == "Inception" && item.ItemKind == "movie");
+        Assert.Contains(items, item => item.Title == "绝命毒师" && item.ItemKind == "tv");
+        Assert.NotNull(sources.Single(item => item.Id == source.Id).LastScannedAt);
+    }
+
+    private static void Touch(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, [0, 1, 2, 3]);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private sealed class StubMediaProbeService : IMediaProbeService
+    {
+        private readonly MediaProbeSnapshot snapshot;
+
+        public StubMediaProbeService(MediaProbeSnapshot snapshot)
+        {
+            this.snapshot = snapshot;
+        }
+
+        public int ProbeCount { get; private set; }
+
+        public Task<MediaProbeSnapshot?> ProbeAsync(string filePath, CancellationToken cancellationToken)
+        {
+            ProbeCount++;
+            return Task.FromResult<MediaProbeSnapshot?>(snapshot);
+        }
+    }
+
+    private sealed class CountingMediaProbeService : IMediaProbeService
+    {
+        public int ProbeCount { get; private set; }
+
+        public Task<MediaProbeSnapshot?> ProbeAsync(string filePath, CancellationToken cancellationToken)
+        {
+            ProbeCount++;
+            return Task.FromResult<MediaProbeSnapshot?>(null);
+        }
+    }
+
+    private sealed class StubWebDavFileEnumerator : IWebDavFileEnumerator
+    {
+        private readonly IReadOnlyList<WebDavFileEntry> files;
+
+        public StubWebDavFileEnumerator(params WebDavFileEntry[] files)
+        {
+            this.files = files;
+        }
+
+        public string? RootUrl { get; private set; }
+
+        public string? Username { get; private set; }
+
+        public string? Password { get; private set; }
+
+        public Task<IReadOnlyList<WebDavFileEntry>> EnumerateFilesAsync(
+            string rootUrl,
+            string? username,
+            string? password,
+            CancellationToken cancellationToken = default)
+        {
+            RootUrl = rootUrl;
+            Username = username;
+            Password = password;
+            return Task.FromResult(files);
+        }
+    }
+}

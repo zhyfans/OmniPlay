@@ -196,6 +196,34 @@ public sealed class TmdbMetadataClientRestrictionsTests : IDisposable
         Assert.Equal(["ja-JP"], handler.EpisodeDetailLanguages);
     }
 
+    [Fact]
+    public async Task DownloadEpisodeStillAsync_MapsLocalSeasonToSingleTmdbSeason()
+    {
+        var handler = new CountingTmdbHttpMessageHandler();
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(5)
+        };
+        var settingsService = new JsonSettingsService(storagePaths);
+        await settingsService.SaveAsync(new AppSettings
+        {
+            Tmdb = new TmdbSettings
+            {
+                EnableBuiltInPublicSource = true,
+                CustomApiKey = "custom-key",
+                Language = "zh-CN"
+            }
+        });
+        var client = new TmdbMetadataClient(httpClient, storagePaths, settingsService);
+
+        var result = await client.DownloadEpisodeStillAsync(70523, 3, 8, "tv-file-mapped");
+
+        var filePath = Assert.IsType<string>(result);
+        Assert.True(File.Exists(filePath));
+        Assert.Equal(2, handler.EpisodeDetailRequestCount);
+        Assert.Contains("/3/tv/70523/season/1/episode/8", handler.EpisodeDetailPaths);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(rootPath))
@@ -216,6 +244,8 @@ public sealed class TmdbMetadataClientRestrictionsTests : IDisposable
         public List<int> SearchPages { get; } = [];
 
         public List<string> EpisodeDetailLanguages { get; } = [];
+
+        public List<string> EpisodeDetailPaths { get; } = [];
 
         public int EpisodeDetailRequestCount { get; private set; }
 
@@ -238,11 +268,27 @@ public sealed class TmdbMetadataClientRestrictionsTests : IDisposable
                 return Task.FromResult(CreateJsonResponse(BuildSearchPayload(query)));
             }
 
-            if (requestUri.Contains("/tv/70523/season/1/episode/1", StringComparison.Ordinal))
+            if (requestUri.Contains("/tv/70523?", StringComparison.Ordinal))
+            {
+                return Task.FromResult(CreateJsonResponse("""{ "number_of_seasons": 1, "seasons": [{ "season_number": 1, "episode_count": 12 }] }"""));
+            }
+
+            if (requestUri.Contains("/tv/70523/season/", StringComparison.Ordinal) &&
+                requestUri.Contains("/episode/", StringComparison.Ordinal))
             {
                 EpisodeDetailRequestCount++;
                 EpisodeDetailLanguages.Add(ReadQueryValue(request.RequestUri, "language"));
-                return Task.FromResult(CreateJsonResponse("""{ "still_path": "/episode-still.jpg" }"""));
+                EpisodeDetailPaths.Add(request.RequestUri?.AbsolutePath ?? string.Empty);
+                if (requestUri.Contains("/tv/70523/season/1/episode/1", StringComparison.Ordinal) ||
+                    requestUri.Contains("/tv/70523/season/1/episode/8", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(CreateJsonResponse("""{ "still_path": "/episode-still.jpg" }"""));
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)
+                {
+                    Content = new StringContent(requestUri, Encoding.UTF8, "text/plain")
+                });
             }
 
             if (requestUri.Contains("image.tmdb.org", StringComparison.Ordinal))

@@ -52,6 +52,32 @@ public sealed class VideoFileRepositoryTests : IDisposable
         Assert.InRange(item.ContinueWatchingProgress, 0.749, 0.751);
         Assert.NotNull(item.ContinueWatchingLabel);
         Assert.Contains("75%", item.ContinueWatchingLabel);
+        Assert.NotNull(item.LastPlayedAt);
+    }
+
+    [Fact]
+    public async Task GetContinueWatchingAsync_UsesMostRecentlyUnfinishedEpisodeProgress()
+    {
+        await SeedTvShowFileAsync(tvShowId: -1006, videoFileId: "tv-old-progress");
+        await SeedTvShowFileAsync(tvShowId: -1006, videoFileId: "tv-recent-progress");
+
+        using (var connection = database.OpenConnection())
+        {
+            await connection.ExecuteAsync(
+                """
+                UPDATE videoFile
+                SET playProgress = 1800, duration = 2000, lastPlayedAt = 100
+                WHERE id = 'tv-old-progress';
+
+                UPDATE videoFile
+                SET playProgress = 200, duration = 2000, lastPlayedAt = 200
+                WHERE id = 'tv-recent-progress';
+                """);
+        }
+
+        var item = Assert.Single(await repository.GetContinueWatchingAsync());
+        Assert.InRange(item.ContinueWatchingProgress, 0.099, 0.101);
+        Assert.Contains("10%", item.ContinueWatchingLabel);
     }
 
     [Fact]

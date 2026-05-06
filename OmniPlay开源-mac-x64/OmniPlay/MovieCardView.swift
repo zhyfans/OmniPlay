@@ -173,6 +173,7 @@ struct MovieCardView: View {
                             file.duration = duration
                             file.playProgress = duration
                         }
+                        file.lastPlayedAt = nil
                         try file.update(db)
                     }
                 }

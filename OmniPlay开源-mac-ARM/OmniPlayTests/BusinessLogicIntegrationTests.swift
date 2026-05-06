@@ -203,6 +203,27 @@ struct BusinessLogicIntegrationTests {
         #expect(colonCredential?.password == "pass123")
     }
 
+    @Test("Subtitle language labels should normalize BCP-47 language codes")
+    func subtitleLanguageLabelNormalization() {
+        #expect(MPVPlayerManager.translatedLanguageLabel("zh-Hans") == "🇨🇳 中文")
+        #expect(MPVPlayerManager.translatedLanguageLabel("ZH_HANT") == "🇨🇳 中文")
+        #expect(MPVPlayerManager.translatedLanguageLabel("en-US") == "🇺🇸 英语")
+        #expect(MPVPlayerManager.translatedLanguageLabel("ja-JP") == "🇯🇵 日语")
+    }
+
+    @Test("Subtitle auto selection should prefer Chinese tracks over English")
+    func subtitleAutoSelectionPrefersChineseTracks() {
+        let tracks: [(id: Int64, lang: String, title: String)] = [
+            (3, "eng", "English"),
+            (1, "zh-Hans", "简体"),
+            (2, "zh-Hant", "繁體")
+        ]
+
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "chi", subtitleTracks: tracks) == 1)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "eng", subtitleTracks: tracks) == 3)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "no", subtitleTracks: tracks) == nil)
+    }
+
     @Test("MediaLibraryManager DB integration: fetch filters direct + rematch cleans fake movie")
     func mediaLibraryManagerDatabaseIntegration() async throws {
         let dbURL = makeTempDBURL()
@@ -442,6 +463,7 @@ struct BusinessLogicIntegrationTests {
                 t.column("episodeId", .integer).references("tvShow", onDelete: .setNull)
                 t.column("playProgress", .double).notNull().defaults(to: 0.0)
                 t.column("duration", .double).notNull().defaults(to: 0.0)
+                t.column("lastPlayedAt", .double)
             }
         }
     }

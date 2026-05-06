@@ -152,6 +152,8 @@ public partial class PosterWallViewModel : ObservableObject
         CloseNetworkLoginCommand = new RelayCommand(CloseNetworkLogin);
         SaveNetworkLoginCommand = new AsyncRelayCommand(SaveNetworkLoginAsync, () => IsNetworkLoginPanelOpen && !IsBusy);
         MountNetworkFolderCommand = new AsyncRelayCommand<NetworkShareFolderItem?>(MountNetworkFolderAsync, folder => folder is not null && !IsBusy);
+        ToggleNetworkFolderStarCommand = new RelayCommand<NetworkShareFolderItem?>(ToggleNetworkFolderStar, folder => folder is not null && !IsBusy);
+        MountStarredNetworkFoldersCommand = new AsyncRelayCommand(MountStarredNetworkFoldersAsync, () => HasStarredNetworkShareFolders && !IsBusy);
         SelectSortOptionCommand = new RelayCommand<LibrarySortOptionItem?>(SelectSortOption);
         ToggleSortDirectionCommand = new RelayCommand(ToggleSortDirection);
         SelectSeasonCommand = new RelayCommand<int?>(SelectSeason);
@@ -281,6 +283,10 @@ public partial class PosterWallViewModel : ObservableObject
     public IAsyncRelayCommand SaveNetworkLoginCommand { get; }
 
     public IAsyncRelayCommand<NetworkShareFolderItem?> MountNetworkFolderCommand { get; }
+
+    public IRelayCommand<NetworkShareFolderItem?> ToggleNetworkFolderStarCommand { get; }
+
+    public IAsyncRelayCommand MountStarredNetworkFoldersCommand { get; }
 
     public IRelayCommand<LibrarySortOptionItem?> SelectSortOptionCommand { get; }
 
@@ -579,6 +585,14 @@ public partial class PosterWallViewModel : ObservableObject
     public bool HasDiscoveredNetworkSources => DiscoveredNetworkSources.Count > 0;
 
     public bool HasNetworkShareFolders => NetworkShareFolders.Count > 0;
+
+    public int StarredNetworkShareFolderCount => NetworkShareFolders.Count(static folder => folder.IsStarred);
+
+    public bool HasStarredNetworkShareFolders => StarredNetworkShareFolderCount > 0;
+
+    public string MountStarredNetworkFoldersActionText => HasStarredNetworkShareFolders
+        ? $"关闭并挂载 {StarredNetworkShareFolderCount} 个文件夹"
+        : "关闭";
 
     public bool IsEditingWebDavSource => EditingWebDavSourceId.HasValue;
 
@@ -2364,6 +2378,15 @@ public partial class PosterWallViewModel : ObservableObject
         return RefreshNetworkSourcesAsync(updateBusyState: true);
     }
 
+    private void NotifyNetworkShareFolderStateChanged()
+    {
+        OnPropertyChanged(nameof(HasNetworkShareFolders));
+        OnPropertyChanged(nameof(StarredNetworkShareFolderCount));
+        OnPropertyChanged(nameof(HasStarredNetworkShareFolders));
+        OnPropertyChanged(nameof(MountStarredNetworkFoldersActionText));
+        MountStarredNetworkFoldersCommand.NotifyCanExecuteChanged();
+    }
+
     private async Task RefreshNetworkSourcesAsync(bool updateBusyState)
     {
         if (networkDiscoveryInProgress)
@@ -2411,7 +2434,7 @@ public partial class PosterWallViewModel : ObservableObject
         PendingNetworkPassword = string.Empty;
         NetworkLoginTitle = $"登录 {item.ProtocolLabel}";
         ReplaceItems(NetworkShareFolders, []);
-        OnPropertyChanged(nameof(HasNetworkShareFolders));
+        NotifyNetworkShareFolderStateChanged();
         IsNetworkLoginPanelOpen = true;
         NetworkSourceStatus = $"正在准备登录：{item.Name}";
         OnCommandStateChanged();
@@ -2426,7 +2449,7 @@ public partial class PosterWallViewModel : ObservableObject
         PendingNetworkPassword = string.Empty;
         NetworkLoginTitle = "添加局域网媒体源";
         ReplaceItems(NetworkShareFolders, []);
-        OnPropertyChanged(nameof(HasNetworkShareFolders));
+        NotifyNetworkShareFolderStateChanged();
         IsNetworkLoginPanelOpen = true;
         NetworkSourceStatus = "输入 WebDAV 地址或 SMB 路径。";
         OnCommandStateChanged();
@@ -2447,7 +2470,7 @@ public partial class PosterWallViewModel : ObservableObject
         PendingNetworkUsername = string.Empty;
         PendingNetworkPassword = string.Empty;
         ReplaceItems(NetworkShareFolders, []);
-        OnPropertyChanged(nameof(HasNetworkShareFolders));
+        NotifyNetworkShareFolderStateChanged();
         if (clearStatus)
         {
             NetworkSourceStatus = string.Empty;
@@ -2484,21 +2507,21 @@ public partial class PosterWallViewModel : ObservableObject
                 PendingNetworkUsername,
                 PendingNetworkPassword);
             ReplaceItems(NetworkShareFolders, folders);
-            OnPropertyChanged(nameof(HasNetworkShareFolders));
+            NotifyNetworkShareFolderStateChanged();
             NetworkSourceStatus = folders.Count == 0
                 ? "没有读取到可挂载的共享文件夹，请检查地址、用户名或密码。"
-                : $"已读取到 {folders.Count} 个可挂载文件夹，点击星号挂载。";
+                : $"已读取到 {folders.Count} 个可挂载文件夹，可给多个目标点星标，关闭列表时统一挂载。";
         }
         catch (UnauthorizedAccessException)
         {
             ReplaceItems(NetworkShareFolders, []);
-            OnPropertyChanged(nameof(HasNetworkShareFolders));
+            NotifyNetworkShareFolderStateChanged();
             NetworkSourceStatus = "登录失败：用户名或密码无效。";
         }
         catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
         {
             ReplaceItems(NetworkShareFolders, []);
-            OnPropertyChanged(nameof(HasNetworkShareFolders));
+            NotifyNetworkShareFolderStateChanged();
             NetworkSourceStatus = $"读取共享文件夹失败：{ex.Message}";
         }
         finally
@@ -2552,6 +2575,49 @@ public partial class PosterWallViewModel : ObservableObject
             return;
         }
 
+        await MountNetworkFoldersAsync([folder]);
+    }
+
+    private void ToggleNetworkFolderStar(NetworkShareFolderItem? folder)
+    {
+        if (folder is null)
+        {
+            return;
+        }
+
+        var updated = NetworkShareFolders
+            .Select(item => string.Equals(item.BaseUrl, folder.BaseUrl, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(item.ProtocolType, folder.ProtocolType, StringComparison.OrdinalIgnoreCase)
+                ? item.WithStarred(!item.IsStarred)
+                : item)
+            .ToList();
+        ReplaceItems(NetworkShareFolders, updated);
+        NotifyNetworkShareFolderStateChanged();
+        OnCommandStateChanged();
+    }
+
+    private async Task MountStarredNetworkFoldersAsync()
+    {
+        var starredFolders = NetworkShareFolders
+            .Where(static folder => folder.IsStarred)
+            .ToList();
+        if (starredFolders.Count == 0)
+        {
+            ClearNetworkLoginPanel(clearStatus: true);
+            OnCommandStateChanged();
+            return;
+        }
+
+        await MountNetworkFoldersAsync(starredFolders);
+    }
+
+    private async Task MountNetworkFoldersAsync(IReadOnlyList<NetworkShareFolderItem> folders)
+    {
+        if (folders.Count == 0)
+        {
+            return;
+        }
+
         var automationCancellationTokenSource = BeginLibraryAutomation();
         var cancellationToken = automationCancellationTokenSource.Token;
         IsBusy = true;
@@ -2559,21 +2625,28 @@ public partial class PosterWallViewModel : ObservableObject
 
         try
         {
-            var source = folder.ToMediaSource();
-            var sourceId = await mediaSourceRepository.AddAsync(source);
+            var mountedNames = new List<string>(folders.Count);
+            foreach (var folder in folders)
+            {
+                var source = folder.ToMediaSource();
+                await mediaSourceRepository.AddAsync(source);
+                mountedNames.Add(source.Name);
+            }
+
             ClearNetworkLoginPanel(clearStatus: false);
             await ReloadLibraryAsync();
-            NetworkSourceStatus = sourceId > 0
-                ? $"已挂载媒体源：{source.Name}，正在扫描并刮削..."
-                : $"已保存媒体源：{source.Name}，正在扫描并刮削...";
+            var folderSummary = folders.Count == 1
+                ? mountedNames[0]
+                : $"{folders.Count} 个文件夹";
+            NetworkSourceStatus = $"已挂载媒体源：{folderSummary}，正在扫描并刮削...";
             StatusMessage = NetworkSourceStatus;
 
             LastScanSummary = await libraryScanner.ScanAllAsync(cancellationToken);
             await ReloadLibraryAsync();
             await RefreshLibraryArtworkAsync(isExplicitRequest: true, forceThumbnails: true, cancellationToken);
             StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
-                ? $"已挂载并扫描媒体源：{source.Name}"
-                : $"已挂载媒体源：{source.Name}。{StatusMessage}";
+                ? $"已挂载并扫描媒体源：{folderSummary}"
+                : $"已挂载媒体源：{folderSummary}。{StatusMessage}";
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -2726,6 +2799,8 @@ public partial class PosterWallViewModel : ObservableObject
         OpenManualNetworkLoginCommand.NotifyCanExecuteChanged();
         SaveNetworkLoginCommand.NotifyCanExecuteChanged();
         MountNetworkFolderCommand.NotifyCanExecuteChanged();
+        ToggleNetworkFolderStarCommand.NotifyCanExecuteChanged();
+        MountStarredNetworkFoldersCommand.NotifyCanExecuteChanged();
         ClosePlayerOverlayCommand.NotifyCanExecuteChanged();
     }
 
@@ -3290,6 +3365,7 @@ public partial class PosterWallViewModel : ObservableObject
             VoteAverage = item.VoteAverage,
             MediaKind = item.MediaKind,
             ContinueWatchingProgress = item.ContinueWatchingProgress,
+            LastPlayedAt = item.LastPlayedAt,
             ContinueWatchingLabel = item.ContinueWatchingLabel,
             IsContinuing = isContinuing,
             WatchState = watchState,
@@ -3324,12 +3400,17 @@ public partial class PosterWallViewModel : ObservableObject
         ReplaceItems(AvailableSeasons, seasons);
 
         var preferred = files.FirstOrDefault(file => file.Id == preferredDetailVideoId);
-        var nextUp = files
+        var recentUnfinished = files
+            .Where(static file => file.HasProgress && !file.IsWatched)
+            .OrderByDescending(static file => file.LastPlayedAt ?? 0)
+            .ThenByDescending(static file => file.ProgressRatio)
+            .FirstOrDefault();
+        var nextUnwatched = files
             .Where(static file => !file.IsWatched)
-            .OrderByDescending(static file => file.ProgressRatio)
-            .ThenBy(static file => file.SeasonNumber == 0 ? int.MaxValue : file.SeasonNumber)
+            .OrderBy(static file => file.SeasonNumber == 0 ? int.MaxValue : file.SeasonNumber)
             .ThenBy(static file => file.EpisodeNumber)
             .FirstOrDefault();
+        var nextUp = recentUnfinished ?? nextUnwatched;
 
         SelectedSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? seasons[0];
         selectedPlaybackNavigationSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? seasons[0];
@@ -3373,14 +3454,18 @@ public partial class PosterWallViewModel : ObservableObject
         var preferred = preferredDetailVideoId is not null
             ? files.FirstOrDefault(file => file.Id == preferredDetailVideoId)
             : null;
-        var inProgress = files
+        var recentUnfinished = files
+            .Where(static file => file.HasProgress && !file.IsWatched)
+            .OrderByDescending(static file => file.LastPlayedAt ?? 0)
+            .ThenByDescending(static file => file.ProgressRatio)
+            .FirstOrDefault();
+        var nextUnwatched = files
             .Where(static file => !file.IsWatched)
-            .OrderByDescending(static file => file.ProgressRatio)
-            .ThenBy(static file => file.SeasonNumber == 0 ? int.MaxValue : file.SeasonNumber)
+            .OrderBy(static file => file.SeasonNumber == 0 ? int.MaxValue : file.SeasonNumber)
             .ThenBy(static file => file.EpisodeNumber)
             .FirstOrDefault();
 
-        DetailPrimaryFile = preferred ?? inProgress ?? files.First();
+        DetailPrimaryFile = preferred ?? recentUnfinished ?? nextUnwatched ?? files.First();
     }
 
     private void ApplyPreferredDetailVideoSelection(LibraryVideoItem video)

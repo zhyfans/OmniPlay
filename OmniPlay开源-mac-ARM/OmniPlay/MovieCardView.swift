@@ -185,11 +185,14 @@ struct MovieCardView: View {
             MediaNameParser.episodeSortKey(for: $0.element.fileName, fallbackIndex: $0.offset) <
             MediaNameParser.episodeSortKey(for: $1.element.fileName, fallbackIndex: $1.offset)
         }.map(\.element)
-        guard let targetFile = sortedFiles.first(where: { file in
+        let unfinishedFiles = sortedFiles.filter { file in
             guard file.duration > 0 else { return false }
             let ratio = file.playProgress / file.duration
             return file.playProgress > 5.0 && ratio < 0.95
-        }) else {
+        }
+        guard let targetFile = unfinishedFiles.max(by: { lhs, rhs in
+            (lhs.lastPlayedAt ?? 0) < (rhs.lastPlayedAt ?? 0)
+        }) ?? unfinishedFiles.first else {
             return nil
         }
         let duration = targetFile.duration
@@ -239,6 +242,7 @@ struct MovieCardView: View {
                         } else {
                             file.playProgress = 0
                         }
+                        file.lastPlayedAt = nil
                         try file.update(db)
                     }
                 }

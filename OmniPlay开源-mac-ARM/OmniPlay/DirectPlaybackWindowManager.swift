@@ -144,7 +144,7 @@ final class DirectPlaybackWindowManager: NSObject, NSWindowDelegate {
             initialPlaylistFiles: request.initialPlaylistFiles
         )
         window.title = request.movie.title
-        window.contentView = NSHostingView(rootView: playerView)
+        window.contentView = NSHostingView(rootView: AnyView(playerView.id(request.id)))
     }
 
     func windowDidExitFullScreen(_ notification: Notification) {

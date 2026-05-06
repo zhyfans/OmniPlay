@@ -33,6 +33,7 @@ public sealed class VideoFileRepository : IVideoFileRepository
                        movie.posterPath AS FallbackImagePath,
                        videoFile.playProgress,
                        videoFile.duration,
+                       videoFile.lastPlayedAt,
                        videoFile.customSeasonNumber,
                        videoFile.customEpisodeNumber,
                        videoFile.customEpisodeYear,
@@ -68,6 +69,7 @@ public sealed class VideoFileRepository : IVideoFileRepository
                        tvShow.posterPath AS FallbackImagePath,
                        videoFile.playProgress,
                        videoFile.duration,
+                       videoFile.lastPlayedAt,
                        videoFile.customSeasonNumber,
                        videoFile.customEpisodeNumber,
                        videoFile.customEpisodeYear,
@@ -94,51 +96,84 @@ public sealed class VideoFileRepository : IVideoFileRepository
         var rows = await connection.QueryAsync<ContinueWatchingRow>(
             new CommandDefinition(
                 """
-                SELECT movie.id AS MovieId,
-                       NULL AS TvShowId,
-                       movie.title AS Title,
-                       movie.releaseDate AS Subtitle,
-                       movie.posterPath AS PosterPath,
-                       movie.voteAverage AS VoteAverage,
-                       '电影' AS MediaKind,
-                       MAX(
+                WITH movieProgress AS (
+                    SELECT movie.id AS MovieId,
+                           NULL AS TvShowId,
+                           movie.title AS Title,
+                           movie.releaseDate AS Subtitle,
+                           movie.posterPath AS PosterPath,
+                           movie.voteAverage AS VoteAverage,
+                           '电影' AS MediaKind,
                            CASE
                                WHEN videoFile.duration > 0 THEN MIN(videoFile.playProgress / videoFile.duration, 1.0)
                                ELSE 0
-                           END
-                       ) AS ContinueWatchingProgress
-                FROM movie
-                JOIN videoFile ON videoFile.movieId = movie.id AND videoFile.mediaType = 'movie'
-                JOIN mediaSource ON mediaSource.id = videoFile.sourceId
-                                AND mediaSource.isEnabled = 1
-                                AND mediaSource.removedAt IS NULL
-                WHERE videoFile.playProgress > @MinimumProgressSeconds
-                  AND (videoFile.duration <= 0 OR (videoFile.playProgress / videoFile.duration) < @CompletionRatio)
-                GROUP BY movie.id, movie.title, movie.releaseDate, movie.posterPath, movie.voteAverage
+                           END AS ContinueWatchingProgress,
+                           COALESCE(videoFile.lastPlayedAt, 0) AS LastPlayedAt,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY movie.id
+                               ORDER BY COALESCE(videoFile.lastPlayedAt, 0) DESC,
+                                        videoFile.playProgress DESC
+                           ) AS RowRank
+                    FROM movie
+                    JOIN videoFile ON videoFile.movieId = movie.id AND videoFile.mediaType = 'movie'
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                                    AND mediaSource.isEnabled = 1
+                                    AND mediaSource.removedAt IS NULL
+                    WHERE videoFile.playProgress > @MinimumProgressSeconds
+                      AND (videoFile.duration <= 0 OR (videoFile.playProgress / videoFile.duration) < @CompletionRatio)
+                ),
+                tvProgress AS (
+                    SELECT NULL AS MovieId,
+                           tvShow.id AS TvShowId,
+                           tvShow.title AS Title,
+                           tvShow.firstAirDate AS Subtitle,
+                           tvShow.posterPath AS PosterPath,
+                           tvShow.voteAverage AS VoteAverage,
+                           '剧集' AS MediaKind,
+                           CASE
+                               WHEN videoFile.duration > 0 THEN MIN(videoFile.playProgress / videoFile.duration, 1.0)
+                               ELSE 0
+                           END AS ContinueWatchingProgress,
+                           COALESCE(videoFile.lastPlayedAt, 0) AS LastPlayedAt,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY tvShow.id
+                               ORDER BY COALESCE(videoFile.lastPlayedAt, 0) DESC,
+                                        videoFile.playProgress DESC
+                           ) AS RowRank
+                    FROM tvShow
+                    JOIN videoFile ON videoFile.episodeId = tvShow.id AND videoFile.mediaType = 'tv'
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                                    AND mediaSource.isEnabled = 1
+                                    AND mediaSource.removedAt IS NULL
+                    WHERE videoFile.playProgress > @MinimumProgressSeconds
+                      AND (videoFile.duration <= 0 OR (videoFile.playProgress / videoFile.duration) < @CompletionRatio)
+                )
+
+                SELECT MovieId,
+                       TvShowId,
+                       Title,
+                       Subtitle,
+                       PosterPath,
+                       VoteAverage,
+                       MediaKind,
+                       ContinueWatchingProgress,
+                       LastPlayedAt
+                FROM movieProgress
+                WHERE RowRank = 1
 
                 UNION ALL
 
-                SELECT NULL AS MovieId,
-                       tvShow.id AS TvShowId,
-                       tvShow.title AS Title,
-                       tvShow.firstAirDate AS Subtitle,
-                       tvShow.posterPath AS PosterPath,
-                       tvShow.voteAverage AS VoteAverage,
-                       '剧集' AS MediaKind,
-                       MAX(
-                           CASE
-                               WHEN videoFile.duration > 0 THEN MIN(videoFile.playProgress / videoFile.duration, 1.0)
-                               ELSE 0
-                           END
-                       ) AS ContinueWatchingProgress
-                FROM tvShow
-                JOIN videoFile ON videoFile.episodeId = tvShow.id AND videoFile.mediaType = 'tv'
-                JOIN mediaSource ON mediaSource.id = videoFile.sourceId
-                                AND mediaSource.isEnabled = 1
-                                AND mediaSource.removedAt IS NULL
-                WHERE videoFile.playProgress > @MinimumProgressSeconds
-                  AND (videoFile.duration <= 0 OR (videoFile.playProgress / videoFile.duration) < @CompletionRatio)
-                GROUP BY tvShow.id, tvShow.title, tvShow.firstAirDate, tvShow.posterPath, tvShow.voteAverage
+                SELECT MovieId,
+                       TvShowId,
+                       Title,
+                       Subtitle,
+                       PosterPath,
+                       VoteAverage,
+                       MediaKind,
+                       ContinueWatchingProgress,
+                       LastPlayedAt
+                FROM tvProgress
+                WHERE RowRank = 1
                 """,
                 new
                 {
@@ -160,10 +195,12 @@ public sealed class VideoFileRepository : IVideoFileRepository
                 IsContinuing = true,
                 WatchState = PlaybackWatchState.InProgress,
                 ContinueWatchingLabel = $"\u672A\u770B\u5B8C {Math.Clamp(row.ContinueWatchingProgress * 100, 0, 100):F0}%",
+                LastPlayedAt = row.LastPlayedAt,
                 MovieId = row.MovieId,
                 TvShowId = row.TvShowId
             })
-            .OrderByDescending(static item => item.ContinueWatchingProgress)
+            .OrderByDescending(static item => item.LastPlayedAt ?? 0)
+            .ThenByDescending(static item => item.ContinueWatchingProgress)
             .ThenBy(static item => item.Title, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -251,6 +288,21 @@ public sealed class VideoFileRepository : IVideoFileRepository
                     duration = CASE
                         WHEN @DurationSeconds IS NOT NULL AND @DurationSeconds > 0 THEN @DurationSeconds
                         ELSE duration
+                    END,
+                    lastPlayedAt = CASE
+                        WHEN @PlayProgress > @MinimumProgressSeconds
+                         AND (
+                            (CASE
+                                WHEN @DurationSeconds IS NOT NULL AND @DurationSeconds > 0 THEN @DurationSeconds
+                                ELSE duration
+                             END) <= 0
+                            OR @PlayProgress / (CASE
+                                WHEN @DurationSeconds IS NOT NULL AND @DurationSeconds > 0 THEN @DurationSeconds
+                                ELSE duration
+                             END) < @CompletionRatio
+                         )
+                        THEN @LastPlayedAt
+                        ELSE NULL
                     END
                 WHERE id = @Id
                 """,
@@ -258,7 +310,10 @@ public sealed class VideoFileRepository : IVideoFileRepository
                 {
                     Id = videoFileId,
                     PlayProgress = Math.Max(playProgress, 0),
-                    DurationSeconds = durationSeconds is > 0 ? durationSeconds : null
+                    DurationSeconds = durationSeconds is > 0 ? durationSeconds : null,
+                    CompletionRatio = PlaybackProgressRules.CompletionRatio,
+                    MinimumProgressSeconds = PlaybackProgressRules.MinimumProgressSeconds,
+                    LastPlayedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                 },
                 cancellationToken: cancellationToken));
     }
@@ -327,6 +382,7 @@ public sealed class VideoFileRepository : IVideoFileRepository
             FallbackImagePath = row.FallbackImagePath,
             PlayProgress = row.PlayProgress,
             Duration = row.Duration,
+            LastPlayedAt = row.LastPlayedAt,
             SeasonNumber = seasonNumber,
             EpisodeNumber = episodeNumber,
             IsTvEpisode = episodeInfo.IsTvShow,
@@ -378,6 +434,8 @@ public sealed class VideoFileRepository : IVideoFileRepository
 
         public double Duration { get; init; }
 
+        public double? LastPlayedAt { get; init; }
+
         public int? CustomSeasonNumber { get; init; }
 
         public int? CustomEpisodeNumber { get; init; }
@@ -408,6 +466,8 @@ public sealed class VideoFileRepository : IVideoFileRepository
         public string MediaKind { get; init; } = string.Empty;
 
         public double ContinueWatchingProgress { get; init; }
+
+        public double? LastPlayedAt { get; init; }
     }
 
     private static PlaybackWatchState ResolveLibraryWatchState(LibraryPlaybackStateRow row)

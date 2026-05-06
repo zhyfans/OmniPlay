@@ -1,3 +1,4 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -8,12 +9,21 @@ namespace OmniPlay.UI.Views.Shell;
 
 public partial class MainWindow : Window
 {
+    private const double ResizeBorderThickness = 6;
+    private const double ResizeCornerSize = 14;
+
     private ShellViewModel? currentViewModel;
 
     public MainWindow()
     {
         InitializeComponent();
+        AddHandler(PointerPressedEvent, MainWindow_OnPointerPressed, RoutingStrategies.Tunnel, true);
         DataContextChanged += MainWindow_OnDataContextChanged;
+    }
+
+    private void MainWindow_OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        TryBeginShellResizeDrag(e);
     }
 
     private void MainWindow_OnDataContextChanged(object? sender, EventArgs e)
@@ -63,6 +73,11 @@ public partial class MainWindow : Window
 
     private void ShellWindowControlsBar_OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
+        if (TryBeginShellResizeDrag(e))
+        {
+            return;
+        }
+
         if (IsWithinShellWindowButton(e.Source as Control) ||
             !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
         {
@@ -71,6 +86,104 @@ public partial class MainWindow : Window
 
         BeginMoveDrag(e);
         e.Handled = true;
+    }
+
+    private void ShellResizeBorder_OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (!CanBeginShellResizeDrag(e))
+        {
+            return;
+        }
+
+        if (sender is not Control { Tag: string edgeName } ||
+            !Enum.TryParse<WindowEdge>(edgeName, out var edge))
+        {
+            return;
+        }
+
+        BeginResizeDrag(edge, e);
+        e.Handled = true;
+    }
+
+    private bool TryBeginShellResizeDrag(PointerPressedEventArgs e)
+    {
+        if (!CanBeginShellResizeDrag(e))
+        {
+            return false;
+        }
+
+        var edge = ResolveResizeEdge(e.GetPosition(this));
+        if (edge is null)
+        {
+            return false;
+        }
+
+        BeginResizeDrag(edge.Value, e);
+        e.Handled = true;
+        return true;
+    }
+
+    private bool CanBeginShellResizeDrag(PointerPressedEventArgs e)
+    {
+        return WindowState == WindowState.Normal &&
+               currentViewModel?.PosterWall.IsPlayerOverlayOpen != true &&
+               e.GetCurrentPoint(this).Properties.IsLeftButtonPressed;
+    }
+
+    private WindowEdge? ResolveResizeEdge(Point point)
+    {
+        var width = Bounds.Width;
+        var height = Bounds.Height;
+        if (width <= 0 || height <= 0)
+        {
+            return null;
+        }
+
+        var north = point.Y <= ResizeBorderThickness;
+        var south = point.Y >= height - ResizeBorderThickness;
+        var west = point.X <= ResizeBorderThickness;
+        var east = point.X >= width - ResizeBorderThickness;
+        var northCorner = point.Y <= ResizeCornerSize;
+        var southCorner = point.Y >= height - ResizeCornerSize;
+        var westCorner = point.X <= ResizeCornerSize;
+        var eastCorner = point.X >= width - ResizeCornerSize;
+
+        if (northCorner && westCorner)
+        {
+            return WindowEdge.NorthWest;
+        }
+
+        if (northCorner && eastCorner)
+        {
+            return WindowEdge.NorthEast;
+        }
+
+        if (southCorner && westCorner)
+        {
+            return WindowEdge.SouthWest;
+        }
+
+        if (southCorner && eastCorner)
+        {
+            return WindowEdge.SouthEast;
+        }
+
+        if (north)
+        {
+            return WindowEdge.North;
+        }
+
+        if (south)
+        {
+            return WindowEdge.South;
+        }
+
+        if (west)
+        {
+            return WindowEdge.West;
+        }
+
+        return east ? WindowEdge.East : null;
     }
 
     private static bool IsWithinShellWindowButton(Control? control)

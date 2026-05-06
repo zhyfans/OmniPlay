@@ -1,62 +1,150 @@
-# Xcode
-#
-# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+# ============================================================
+# OmniPlay repository ignore rules
+# Applies to:
+# - OmniPlay-win
+# - OmniPlay开源-mac-ARM
+# - OmniPlay开源-mac-x64
+# ============================================================
 
-## User settings
-xcuserdata/
+# macOS / Finder
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
 
-## Obj-C/Swift specific
-*.hmap
+# Editor / local IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-## App packaging
+# Local environment, signing material, and secrets
+.env
+.env.*
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+*.crt
+
+# Logs and local data
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+TestResults/
+Logs/
+
+# Keep SQLite fixtures that are part of the vendored GRDB test suite.
+!OmniPlay开源-mac-ARM/GRDB.swift-master/Tests/**/*.sqlite
+!OmniPlay开源-mac-x64/GRDB.swift-master/Tests/**/*.sqlite
+
+# ============================================================
+# Build and package outputs
+# ============================================================
+dist/
+**/dist/
+build/
+Build/
+**/build/
+**/Build/
+tmp/
+**/tmp/
+publish/
+**/publish/
+
+# Release/install artifacts should be attached to GitHub Releases,
+# not committed to the source repository.
+*.zip
+*.dmg
+*.pkg
+*.msix
+*.msi
+*.exe
+*.app
 *.ipa
-*.dSYM.zip
+*.xcarchive/
 *.dSYM
+*.dSYM/
+*.dSYM.zip
 
-## Playgrounds
-timeline.xctimeline
-playground.xcworkspace
-
-# Swift Package Manager
-#
-# Add this line if you want to avoid checking in source code from Swift Package Manager dependencies.
-# Packages/
-# Package.pins
-# Package.resolved
-# *.xcodeproj
-#
-# Xcode automatically generates this directory with a .xcworkspacedata file and xcuserdata
-# hence it is not needed unless you have added a package configuration file to your project
-# .swiftpm
-
+# ============================================================
+# Xcode / Swift / SwiftPM
+# ============================================================
+DerivedData/
+**/DerivedData/
+xcuserdata/
+**/xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.hmap
 .build/
+**/.build/
+.swiftpm/xcode/xcuserdata/
+**/.swiftpm/xcode/xcuserdata/
 
-# CocoaPods
-#
-# We recommend against adding the Pods directory to your .gitignore. However
-# you should judge for yourself, the pros and cons are mentioned at:
-# https://guides.cocoapods.org/using/using-cocoapods.html#should-i-check-the-pods-directory-into-source-control
-#
-# Pods/
-#
-# Add this line if you want to avoid checking in source code from the Xcode workspace
-# *.xcworkspace
+# Keep project files and local vendored source packages tracked unless
+# the project is changed to remote SwiftPM dependencies.
+# Do not ignore:
+# - *.xcodeproj/project.pbxproj
+# - GRDB.swift-master/
 
-# Carthage
-#
-# Add this line if you want to avoid checking in source code from Carthage dependencies.
-# Carthage/Checkouts
-
+# CocoaPods / Carthage, if introduced later
+Pods/
 Carthage/Build/
 
-# fastlane
-#
-# It is recommended to not store the screenshots in the git repo.
-# Instead, use fastlane to re-generate the screenshots whenever they are needed.
-# For more information about the recommended setup visit:
-# https://docs.fastlane.tools/best-practices/source-control/#source-control
-
+# fastlane generated files
 fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
-fastlane/test_output
+fastlane/test_output/
+
+# ============================================================
+# .NET / Avalonia / Windows
+# ============================================================
+[Bb]in/
+[Oo]bj/
+**/[Bb]in/
+**/[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.nupkg
+*.snupkg
+
+# Debug symbols and crash dumps
+*.pdb
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+*.dmp
+
+# Local package manager caches
+packages/
+.nuget/
+.dotnet/
+
+# Windows native runtime binaries are large local dependencies.
+# Keep them outside git, or use Git LFS / GitHub Releases if they
+# must be distributed with source.
+OmniPlay-win/native/mpv/
+OmniPlay-win/src/OmniPlay.Desktop/Native/mpv/*.dll
+
+# ============================================================
+# Third-party binary frameworks / generated vendor artifacts
+# ============================================================
+*.xcframework/
+*.framework/

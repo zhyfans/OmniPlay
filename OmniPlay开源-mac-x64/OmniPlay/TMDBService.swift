@@ -40,7 +40,7 @@ private struct TMDBTranslationsResponse: Codable {
 }
 
 enum TMDBAPIConfig {
-    static let publicApiKey = ""
+    static let publicApiKey = "d05a3f7e939f5034054090b376de6f8c"
 
     static var isPublicAPIEnabled: Bool {
         if UserDefaults.standard.object(forKey: "usePublicTMDBApi") == nil { return true }

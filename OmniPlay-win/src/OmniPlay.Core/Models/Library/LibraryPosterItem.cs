@@ -18,6 +18,8 @@ public sealed class LibraryPosterItem
 
     public double ContinueWatchingProgress { get; init; }
 
+    public double? LastPlayedAt { get; init; }
+
     public string? ContinueWatchingLabel { get; init; }
 
     public bool IsContinuing { get; init; }

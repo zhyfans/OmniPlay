@@ -1,0 +1,11 @@
+{
+  "id": "com.omniplay.nas",
+  "name": "OmniPlay",
+  "version": "0.1.0",
+  "description": "OmniPlay NAS media library and web player.",
+  "service": {
+    "port": 8096,
+    "entry": "OmniPlay.Api"
+  }
+}
+
