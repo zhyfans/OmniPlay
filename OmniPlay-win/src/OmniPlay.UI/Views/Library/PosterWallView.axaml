@@ -296,6 +296,7 @@
                   <StackPanel Spacing="10">
                     <Button Classes="sourceAction" Command="{Binding AddFolderSourceCommand}" Content="添加本地文件夹" />
                     <Button Classes="sourceAction" Command="{Binding OpenManualNetworkLoginCommand}" Content="添加 SMB/WebDAV" />
+                    <Button Classes="sourceAction" Command="{Binding OpenMediaServerPanelCommand}" Content="添加 Plex/Emby/Jellyfin" />
                   </StackPanel>
                   <Border Height="1" Background="#E5E5E5" />
 
@@ -327,9 +328,30 @@
                     </StackPanel>
                   </Border>
 
+                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16" IsVisible="{Binding IsMediaServerPanelOpen}">
+                    <StackPanel Spacing="12">
+                      <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="添加媒体服务器" />
+                        <Button Grid.Column="1" Classes="dangerAction" Command="{Binding CloseMediaServerPanelCommand}" Content="取消" />
+                      </Grid>
+                      <ComboBox Classes="popupSelect" HorizontalAlignment="Stretch" ItemsSource="{Binding MediaServerProtocolOptions}" SelectedItem="{Binding SelectedMediaServerProtocolOption, Mode=TwoWay}">
+                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+                      </ComboBox>
+                      <TextBox Classes="popupSearchBox" Watermark="显示名称（可选）" Text="{Binding PendingMediaServerName}" />
+                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerAddressWatermark}" Text="{Binding PendingMediaServerBaseUrl}" />
+                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerUserWatermark}" Text="{Binding PendingMediaServerUserId}" IsVisible="{Binding PendingMediaServerUsesUserId}" />
+                      <Button Classes="sourceAction" Command="{Binding AuthorizePlexCommand}" Content="{Binding PlexAuthorizeButtonText}" IsVisible="{Binding PendingMediaServerUsesPlex}" />
+                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerTokenWatermark}" Text="{Binding PendingMediaServerToken}" />
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Classes="sourceAction" Command="{Binding AddMediaServerSourceCommand}" Content="保存" />
+                      </StackPanel>
+                      <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding MediaServerStatus}" />
+                    </StackPanel>
+                  </Border>
+
                   <StackPanel Spacing="10">
                     <Grid ColumnDefinitions="*,Auto">
-                      <TextBlock FontSize="16" FontWeight="SemiBold" Foreground="#1A1A1A" Text="预扫描 SMB / WebDAV" />
+                      <TextBlock FontSize="16" FontWeight="SemiBold" Foreground="#1A1A1A" Text="预扫描 SMB / WebDAV / 媒体服务器" />
                       <Button Grid.Column="1" Classes="sourceAction" Command="{Binding RefreshNetworkSourcesCommand}" Content="重新扫描" />
                     </Grid>
                     <TextBlock Opacity="0.62" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding NetworkSourceStatus}" />
@@ -373,6 +395,15 @@
                       <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="&#x57FA;&#x7840;&#x8BBE;&#x7F6E;" />
                       <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoScanOnStartup}" Content="&#x542F;&#x52A8;&#x65F6;&#x81EA;&#x52A8;&#x626B;&#x63CF;&#x5E76;&#x540C;&#x6B65;&#x5E93;" />
                       <CheckBox Foreground="#323130" IsChecked="{Binding Settings.ShowMediaSourceRealPath}" Content="&#x5A92;&#x4F53;&#x6E90;&#x663E;&#x793A;&#x771F;&#x5B9E;&#x8DEF;&#x5F84;" />
+                    </StackPanel>
+                  </Border>
+
+                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="本地刮削文件" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataImport}" Content="读取本地 NFO、海报和剧照" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataExport}" Content="刮削完成后保存 NFO、海报和剧照到本地" />
+                      <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="默认关闭。开启后仅对本地文件夹源生效，支持 movie.nfo、tvshow.nfo、同名 .nfo、poster/fanart 与同名 -thumb 图片。" />
                     </StackPanel>
                   </Border>
 

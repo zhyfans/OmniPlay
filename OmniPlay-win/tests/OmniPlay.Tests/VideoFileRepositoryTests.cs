@@ -172,6 +172,69 @@ public sealed class VideoFileRepositoryTests : IDisposable
             item.PlaybackPath);
     }
 
+    [Fact]
+    public async Task GetByMovieAsync_UsesServerHlsForEmbyIsoEvenWhenMetadataPathIsLocal()
+    {
+        var localIsoPath = Path.Combine(rootPath, "mirror", "Reservoir.Dogs.1992.iso");
+        Directory.CreateDirectory(Path.GetDirectoryName(localIsoPath)!);
+        File.WriteAllText(localIsoPath, "iso");
+
+        using var connection = database.OpenConnection();
+        await connection.ExecuteAsync(
+            """
+            INSERT INTO mediaSource (id, name, protocolType, baseUrl, authConfig)
+            VALUES (3, 'Emby', 'emby', 'http://127.0.0.1:8096', @AuthConfig);
+
+            INSERT INTO movie (id, title, releaseDate, overview, posterPath, voteAverage, isLocked)
+            VALUES (-1005, '落水狗', '1992', NULL, NULL, NULL, 0);
+
+            INSERT INTO videoFile (id, sourceId, metadataPath, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
+            VALUES ('movie-file-5', 3, @MetadataPath, 'Items/abc123/Download', 'Reservoir.Dogs.1992.iso', 'movie', -1005, NULL, 0, 0);
+            """,
+            new
+            {
+                MetadataPath = localIsoPath,
+                AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("token"))
+            });
+
+        var item = Assert.Single(await repository.GetByMovieAsync(-1005));
+        Assert.Null(item.LocalIsoPlaybackPath);
+        Assert.Equal(item.PlaybackPath, item.EffectivePlaybackPath);
+        Assert.Equal(
+            "http://127.0.0.1:8096/Videos/abc123/master.m3u8?MediaSourceId=abc123&PlaySessionId=omniplayabc123&DeviceId=omniplay-windows&EnableAutoStreamCopy=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true&EnableAdaptiveBitrateStreaming=false&VideoCodec=h264%2Chevc&AudioCodec=aac%2Cac3%2Ceac3%2Cdts%2Cflac%2Ctruehd%2Cmp3%2Copus%2Cvorbis&SegmentContainer=ts&SegmentLength=6&MinSegments=1&VideoBitRate=35000000&MaxStreamingBitrate=45000000&AudioBitRate=640000&MaxWidth=1920&MaxHeight=1080&Profile=high&Level=51&RequireAvc=false&TranscodingMaxAudioChannels=6&BreakOnNonKeyFrames=false&CopyTimestamps=true&Context=Streaming&api_key=token",
+            item.PlaybackPath);
+    }
+
+    [Fact]
+    public async Task GetByMovieAsync_UpgradesExistingEmbyDiscHlsPathToHighQuality()
+    {
+        using var connection = database.OpenConnection();
+        await connection.ExecuteAsync(
+            """
+            INSERT INTO mediaSource (id, name, protocolType, baseUrl, authConfig)
+            VALUES (4, 'Jellyfin', 'jellyfin', 'http://127.0.0.1:8096', @AuthConfig);
+
+            INSERT INTO movie (id, title, releaseDate, overview, posterPath, voteAverage, isLocked)
+            VALUES (-1006, '年少日记', '2023', NULL, NULL, NULL, 0);
+
+            INSERT INTO videoFile (id, sourceId, metadataPath, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
+            VALUES ('movie-file-6', 4, NULL, 'Videos/item123/master.m3u8?mediaSourceId=source456&videoCodec=h264', '年少日记 Time Still Turns the Pages 2023 1080p Blu-ray AVC DTS-HD MA 5.1-Thor@HDSky', 'movie', -1006, NULL, 0, 0);
+            """,
+            new
+            {
+                AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("token"))
+            });
+
+        var item = Assert.Single(await repository.GetByMovieAsync(-1006));
+
+        Assert.Contains("/Videos/item123/master.m3u8?", item.PlaybackPath, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("MediaSourceId=source456", item.PlaybackPath);
+        Assert.Contains("VideoBitRate=35000000", item.PlaybackPath);
+        Assert.Contains("MaxStreamingBitrate=45000000", item.PlaybackPath);
+        Assert.Contains("EnableAdaptiveBitrateStreaming=false", item.PlaybackPath);
+        Assert.Contains("api_key=token", item.PlaybackPath);
+    }
+
     public void Dispose()
     {
         SqliteConnection.ClearAllPools();

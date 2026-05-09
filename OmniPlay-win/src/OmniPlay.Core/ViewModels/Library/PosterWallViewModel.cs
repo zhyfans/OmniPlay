@@ -10,7 +10,9 @@ using OmniPlay.Core.Settings;
 using OmniPlay.Core.ViewModels.Player;
 using OmniPlay.Core.ViewModels.Settings;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -30,6 +32,7 @@ public partial class PosterWallViewModel : ObservableObject
     private readonly IPosterImagePickerService posterImagePickerService;
     private readonly IWebDavConnectionTester webDavConnectionTester;
     private readonly INetworkShareDiscoveryService networkShareDiscoveryService;
+    private readonly IMediaServerPreflightService? mediaServerPreflightService;
     private readonly IPlaybackLauncher playbackLauncher;
     private readonly List<Movie> allMovies = [];
     private readonly List<TvShow> allTvShows = [];
@@ -70,7 +73,8 @@ public partial class PosterWallViewModel : ObservableObject
         INetworkShareDiscoveryService networkShareDiscoveryService,
         IPlaybackLauncher playbackLauncher,
         SettingsViewModel settings,
-        PlayerViewModel player)
+        PlayerViewModel player,
+        IMediaServerPreflightService? mediaServerPreflightService = null)
     {
         this.movieRepository = movieRepository;
         this.tvShowRepository = tvShowRepository;
@@ -84,6 +88,7 @@ public partial class PosterWallViewModel : ObservableObject
         this.posterImagePickerService = posterImagePickerService;
         this.webDavConnectionTester = webDavConnectionTester;
         this.networkShareDiscoveryService = networkShareDiscoveryService;
+        this.mediaServerPreflightService = mediaServerPreflightService;
         this.playbackLauncher = playbackLauncher;
 
         Settings = settings;
@@ -93,6 +98,11 @@ public partial class PosterWallViewModel : ObservableObject
         AddFolderSourceCommand = new AsyncRelayCommand(AddFolderSourceAsync, () => !IsBusy);
         AddWebDavSourceCommand = new AsyncRelayCommand(AddWebDavSourceAsync, () => !IsBusy);
         TestWebDavSourceCommand = new AsyncRelayCommand(TestWebDavSourceAsync, () => !IsBusy);
+        OpenMediaServerPanelCommand = new RelayCommand(OpenMediaServerPanel, () => !IsBusy);
+        CloseMediaServerPanelCommand = new RelayCommand(CloseMediaServerPanel, () => !IsBusy);
+        PreScanMediaServerSourceCommand = new AsyncRelayCommand(PreScanMediaServerSourceAsync, () => IsMediaServerPanelOpen && !IsBusy);
+        AuthorizePlexCommand = new AsyncRelayCommand(AuthorizePlexAsync, () => IsMediaServerPanelOpen && !IsBusy && !IsPlexAuthorizationInProgress && PendingMediaServerUsesPlex);
+        AddMediaServerSourceCommand = new AsyncRelayCommand(AddMediaServerSourceAsync, () => IsMediaServerPanelOpen && !IsBusy);
         OpenDetailCommand = new AsyncRelayCommand<LibraryPosterItem?>(OpenDetailAsync, item => item is not null);
         PlayVideoCommand = new AsyncRelayCommand<LibraryVideoItem?>(PlayVideoAsync, video => video is not null);
         PlayPrimaryCommand = new AsyncRelayCommand(PlayPrimaryAsync, () => DetailPrimaryFile is not null);
@@ -145,7 +155,9 @@ public partial class PosterWallViewModel : ObservableObject
         EditSourceCommand = new AsyncRelayCommand<MediaSource?>(EditSourceAsync, source => source is not null && !IsBusy);
         CancelWebDavEditCommand = new RelayCommand(CancelWebDavEdit, () => IsEditingWebDavSource && !IsBusy);
         RemoveSourceCommand = new AsyncRelayCommand<MediaSource?>(RemoveSourceAsync, source => source?.Id is not null);
-        ToggleSourceEnabledCommand = new AsyncRelayCommand<MediaSource?>(ToggleSourceEnabledAsync, source => source?.Id is not null && !IsBusy);
+        ToggleSourceEnabledCommand = new AsyncRelayCommand<MediaSource?>(
+            ToggleSourceEnabledAsync,
+            source => source?.Id is not null && (!IsBusy || source.IsEnabled));
         RefreshNetworkSourcesCommand = new AsyncRelayCommand(RefreshNetworkSourcesAsync, () => !networkDiscoveryInProgress);
         OpenNetworkLoginCommand = new RelayCommand<NetworkSourceDiscoveryItem?>(OpenNetworkLogin, item => item is not null && !IsBusy);
         OpenManualNetworkLoginCommand = new RelayCommand(OpenManualNetworkLogin, () => !IsBusy);
@@ -167,6 +179,7 @@ public partial class PosterWallViewModel : ObservableObject
         Settings.SettingsSaved += OnSettingsSaved;
         Player.PropertyChanged += OnPlayerPropertyChanged;
         selectedSortOptionItem = SortOptions[0];
+        selectedMediaServerProtocolOption = MediaServerProtocolOptions[0];
     }
 
     public ObservableCollection<LibraryPosterItem> LibraryItems { get; } = [];
@@ -194,6 +207,33 @@ public partial class PosterWallViewModel : ObservableObject
         new(LibrarySortOption.Rating, "\u6309\u8BC4\u5206")
     ];
 
+    public IReadOnlyList<SettingsOptionItem> MediaServerProtocolOptions { get; } =
+    [
+        new("plex", "Plex"),
+        new("emby", "Emby"),
+        new("jellyfin", "Jellyfin")
+    ];
+
+    public string PendingMediaServerAddressWatermark => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) switch
+    {
+        "plex" => "Plex 地址，例如 http://127.0.0.1:32400",
+        "emby" => "Emby 地址，例如 http://127.0.0.1:8096",
+        "jellyfin" => "Jellyfin 地址，例如 http://127.0.0.1:8096",
+        _ => "服务器地址，例如 http://127.0.0.1:8096"
+    };
+
+    public string PendingMediaServerUserWatermark => "用户名 / 用户 ID（可选）";
+
+    public string PendingMediaServerTokenWatermark => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) == "plex"
+        ? "Plex 访问令牌（X-Plex-Token）"
+        : "API Key / 访问令牌";
+
+    public bool PendingMediaServerUsesUserId => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) != "plex";
+
+    public bool PendingMediaServerUsesPlex => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) == "plex";
+
+    public string PlexAuthorizeButtonText => IsPlexAuthorizationInProgress ? "等待 Plex 授权..." : "登录 Plex";
+
     public SettingsViewModel Settings { get; }
 
     public PlayerViewModel Player { get; }
@@ -205,6 +245,16 @@ public partial class PosterWallViewModel : ObservableObject
     public IAsyncRelayCommand AddWebDavSourceCommand { get; }
 
     public IAsyncRelayCommand TestWebDavSourceCommand { get; }
+
+    public IRelayCommand OpenMediaServerPanelCommand { get; }
+
+    public IRelayCommand CloseMediaServerPanelCommand { get; }
+
+    public IAsyncRelayCommand PreScanMediaServerSourceCommand { get; }
+
+    public IAsyncRelayCommand AuthorizePlexCommand { get; }
+
+    public IAsyncRelayCommand AddMediaServerSourceCommand { get; }
 
     public IAsyncRelayCommand<LibraryPosterItem?> OpenDetailCommand { get; }
 
@@ -350,6 +400,33 @@ public partial class PosterWallViewModel : ObservableObject
 
     [ObservableProperty]
     private string networkSourceStatus = string.Empty;
+
+    [ObservableProperty]
+    private bool isMediaServerPanelOpen;
+
+    [ObservableProperty]
+    private string pendingMediaServerName = string.Empty;
+
+    [ObservableProperty]
+    private string pendingMediaServerProtocolType = "plex";
+
+    [ObservableProperty]
+    private SettingsOptionItem? selectedMediaServerProtocolOption;
+
+    [ObservableProperty]
+    private string pendingMediaServerBaseUrl = string.Empty;
+
+    [ObservableProperty]
+    private string pendingMediaServerToken = string.Empty;
+
+    [ObservableProperty]
+    private string pendingMediaServerUserId = string.Empty;
+
+    [ObservableProperty]
+    private string mediaServerStatus = string.Empty;
+
+    [ObservableProperty]
+    private bool isPlexAuthorizationInProgress;
 
     [ObservableProperty]
     private bool isSettingsPopupOpen;
@@ -658,15 +735,16 @@ public partial class PosterWallViewModel : ObservableObject
         try
         {
             StatusMessage = "\u6B63\u5728\u626B\u63CF\u5A92\u4F53\u6E90...";
-            LastScanSummary = await libraryScanner.ScanAllAsync(cancellationToken);
-            await ReloadLibraryAsync();
+            LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                isExplicitRequest: true,
+                forceThumbnails: true,
+                cancellationToken);
             var scanPrefix = $"\u626B\u63CF\u5B8C\u6210\uFF1A\u65B0\u589E {LastScanSummary.NewMovieCount} \u90E8\u7535\u5F71\u3001{LastScanSummary.NewTvShowCount} \u90E8\u5267\u96C6\uFF0C\u79FB\u9664 {LastScanSummary.RemovedVideoFileCount} \u4E2A\u89C6\u9891\u6587\u4EF6\u3002";
             if (LastScanSummary.HasDiagnostics)
             {
                 scanPrefix = $"{scanPrefix} 另有 {LastScanSummary.Diagnostics.Count} 条扫描诊断。";
             }
 
-            await RefreshLibraryArtworkAsync(isExplicitRequest: true, forceThumbnails: true, cancellationToken);
             StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
                 ? scanPrefix
                 : $"{scanPrefix} {StatusMessage}";
@@ -681,6 +759,84 @@ public partial class PosterWallViewModel : ObservableObject
             CompleteLibraryAutomation(automationCancellationTokenSource);
             OnCommandStateChanged();
         }
+    }
+
+    private async Task<LibraryScanSummary> RunLibraryScanAndArtworkAsync(
+        bool isExplicitRequest,
+        bool forceThumbnails,
+        CancellationToken cancellationToken,
+        IReadOnlyCollection<long>? sourceIds = null)
+    {
+        var targetSourceIds = sourceIds is null ? null : sourceIds.ToHashSet();
+        var sources = (await mediaSourceRepository.GetAllAsync(cancellationToken))
+            .Where(source => source is { Id: not null } &&
+                             source.IsActive &&
+                             (targetSourceIds is null || targetSourceIds.Contains(source.Id!.Value)))
+            .OrderBy(source => source.Id)
+            .ToList();
+
+        var aggregate = new LibraryScanAggregate();
+        libraryScanner.ClearDeferredUnidentifiedScanGroups();
+        if (sources.Count == 0)
+        {
+            return aggregate.ToSummary();
+        }
+
+        try
+        {
+            foreach (var source in sources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                StatusMessage = $"正在扫描媒体源：{source.Name}...";
+                var sourceSummary = await libraryScanner.ScanSourceAsync(
+                    source.Id!.Value,
+                    cancellationToken,
+                    async (item, token) =>
+                    {
+                        StatusMessage = item.IsTvShow
+                            ? $"正在刮削剧集元数据和海报：{item.Title}..."
+                            : $"正在刮削电影元数据和海报：{item.Title}...";
+                        await RefreshIndexedScanItemArtworkAsync(item, token);
+                    },
+                    deferUnidentifiedGroups: true);
+                aggregate.Add(sourceSummary);
+                LastScanSummary = aggregate.ToSummary();
+
+                await ReloadLibraryAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                StatusMessage = $"正在刮削元数据和海报：{source.Name}...";
+                await RefreshLibraryArtworkAsync(isExplicitRequest, forceThumbnails: false, cancellationToken);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var deferredSummary = await libraryScanner.CommitDeferredUnidentifiedScanGroupsAsync(cancellationToken);
+            if (deferredSummary.NewMovieCount > 0 ||
+                deferredSummary.NewTvShowCount > 0 ||
+                deferredSummary.NewVideoFileCount > 0 ||
+                deferredSummary.RemovedVideoFileCount > 0 ||
+                deferredSummary.HasDiagnostics)
+            {
+                StatusMessage = "正在显示未识别视频...";
+                aggregate.Add(deferredSummary);
+                LastScanSummary = aggregate.ToSummary();
+                await ReloadLibraryAsync();
+            }
+
+            if (forceThumbnails)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await ReloadLibraryAsync();
+                StatusMessage = "正在刮削分集剧照...";
+                await RefreshLibraryArtworkAsync(isExplicitRequest, forceThumbnails: true, cancellationToken);
+            }
+        }
+        catch
+        {
+            libraryScanner.ClearDeferredUnidentifiedScanGroups();
+            throw;
+        }
+
+        return aggregate.ToSummary();
     }
 
     public async Task AddFolderSourceAsync()
@@ -709,10 +865,36 @@ public partial class PosterWallViewModel : ObservableObject
         {
             var source = CreateLocalSource(selectedPath);
             var sourceId = await mediaSourceRepository.AddAsync(source);
-            await ReloadLibraryAsync();
-            StatusMessage = sourceId > 0
-                ? $"已添加本地媒体源：{source.Name}"
-                : "已保存本地媒体源。";
+            if (sourceId <= 0)
+            {
+                await ReloadLibraryAsync();
+                StatusMessage = "已保存本地媒体源。";
+                return;
+            }
+
+            var automationCancellationTokenSource = BeginLibraryAutomation();
+            var cancellationToken = automationCancellationTokenSource.Token;
+            try
+            {
+                StatusMessage = $"已添加本地媒体源：{source.Name}，正在扫描并刮削...";
+                await ReloadLibraryAsync();
+                LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                    isExplicitRequest: true,
+                    forceThumbnails: true,
+                    cancellationToken,
+                    new[] { sourceId });
+                StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
+                    ? $"已添加并扫描本地媒体源：{source.Name}"
+                    : $"已添加本地媒体源：{source.Name}。{StatusMessage}";
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                StatusMessage = "已停止新媒体源的扫描和刮削任务。";
+            }
+            finally
+            {
+                CompleteLibraryAutomation(automationCancellationTokenSource);
+            }
         }
         finally
         {
@@ -753,12 +935,38 @@ public partial class PosterWallViewModel : ObservableObject
             }
 
             var sourceId = await mediaSourceRepository.AddAsync(source);
-            await ReloadLibraryAsync();
             ResetWebDavForm();
             IsSourcePopupOpen = false;
-            StatusMessage = sourceId > 0
-                ? $"已添加 WebDAV 媒体源：{source.Name}"
-                : "已保存 WebDAV 媒体源。";
+            if (sourceId <= 0)
+            {
+                await ReloadLibraryAsync();
+                StatusMessage = "已保存 WebDAV 媒体源。";
+                return;
+            }
+
+            var automationCancellationTokenSource = BeginLibraryAutomation();
+            var cancellationToken = automationCancellationTokenSource.Token;
+            try
+            {
+                StatusMessage = $"已添加 WebDAV 媒体源：{source.Name}，正在扫描并刮削...";
+                await ReloadLibraryAsync();
+                LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                    isExplicitRequest: true,
+                    forceThumbnails: true,
+                    cancellationToken,
+                    new[] { sourceId });
+                StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
+                    ? $"已添加并扫描 WebDAV 媒体源：{source.Name}"
+                    : $"已添加 WebDAV 媒体源：{source.Name}。{StatusMessage}";
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                StatusMessage = "已停止新媒体源的扫描和刮削任务。";
+            }
+            finally
+            {
+                CompleteLibraryAutomation(automationCancellationTokenSource);
+            }
         }
         finally
         {
@@ -1070,8 +1278,10 @@ public partial class PosterWallViewModel : ObservableObject
         {
             await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken);
             StatusMessage = "正在后台扫描媒体源...";
-            LastScanSummary = await libraryScanner.ScanAllAsync(cancellationToken);
-            await ReloadLibraryAsync();
+            LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                isExplicitRequest: false,
+                forceThumbnails: true,
+                cancellationToken);
 
             var scanPrefix = $"后台扫描完成：新增 {LastScanSummary.NewMovieCount} 部电影、{LastScanSummary.NewTvShowCount} 部剧集，移除 {LastScanSummary.RemovedVideoFileCount} 个视频文件。";
             if (LastScanSummary.HasDiagnostics)
@@ -1079,7 +1289,6 @@ public partial class PosterWallViewModel : ObservableObject
                 scanPrefix = $"{scanPrefix} 另有 {LastScanSummary.Diagnostics.Count} 条扫描诊断。";
             }
 
-            await RefreshLibraryArtworkAsync(isExplicitRequest: false, forceThumbnails: true, cancellationToken);
             StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
                 ? scanPrefix
                 : $"{scanPrefix} {StatusMessage}";
@@ -1863,7 +2072,15 @@ public partial class PosterWallViewModel : ObservableObject
 
     private static string FormatSourceFileDisplayName(LibraryVideoItem file)
     {
+        if (MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(file.RelativePath))
+        {
+            return TryResolveDecodedDisplayPath(file.FileName)
+                   ?? TryResolveDecodedDisplayPath(file.MetadataPath)
+                   ?? file.FileName;
+        }
+
         return TryResolveDecodedDisplayPath(file.RelativePath)
+               ?? TryResolveDecodedDisplayPath(file.MetadataPath)
                ?? TryResolveDecodedDisplayPath(file.AbsolutePath)
                ?? TryResolveDecodedDisplayPath(file.PlaybackPath)
                ?? TryResolveDecodedDisplayPath(file.FileName)
@@ -2399,12 +2616,12 @@ public partial class PosterWallViewModel : ObservableObject
 
         try
         {
-            NetworkSourceStatus = "正在预扫描 WebDAV 和 SMB...";
+            NetworkSourceStatus = "正在预扫描 WebDAV、SMB、Plex、Emby 和 Jellyfin...";
             var sources = await networkShareDiscoveryService.DiscoverAsync();
             ReplaceItems(DiscoveredNetworkSources, sources);
             OnPropertyChanged(nameof(HasDiscoveredNetworkSources));
             NetworkSourceStatus = sources.Count == 0
-                ? "未发现 SMB 或 WebDAV。"
+                ? "未发现 SMB、WebDAV 或媒体服务器。"
                 : $"已预扫描到 {sources.Count} 个网络入口。";
         }
         catch
@@ -2427,6 +2644,12 @@ public partial class PosterWallViewModel : ObservableObject
             return;
         }
 
+        if (item.ProtocolKind is MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin)
+        {
+            OpenDiscoveredMediaServer(item);
+            return;
+        }
+
         PendingNetworkProtocolType = item.ProtocolType;
         PendingNetworkBaseUrl = item.BaseUrl;
         PendingNetworkDisplayName = item.Name;
@@ -2440,8 +2663,27 @@ public partial class PosterWallViewModel : ObservableObject
         OnCommandStateChanged();
     }
 
+    private void OpenDiscoveredMediaServer(NetworkSourceDiscoveryItem item)
+    {
+        IsNetworkLoginPanelOpen = false;
+        IsMediaServerPanelOpen = true;
+        var option = MediaServerProtocolOptions.FirstOrDefault(option =>
+            string.Equals(option.Value, item.ProtocolType, StringComparison.OrdinalIgnoreCase)) ?? MediaServerProtocolOptions[0];
+        SelectedMediaServerProtocolOption = option;
+        PendingMediaServerProtocolType = option.Value;
+        PendingMediaServerName = item.Name;
+        PendingMediaServerBaseUrl = item.BaseUrl;
+        PendingMediaServerToken = string.Empty;
+        PendingMediaServerUserId = string.Empty;
+        MediaServerStatus = GetMediaServerConnectionHint(item.ProtocolType);
+        NetworkSourceStatus = $"已选择 {item.ProtocolLabel}：{item.BaseUrl}";
+        NotifyMediaServerProtocolDependentProperties();
+        OnCommandStateChanged();
+    }
+
     private void OpenManualNetworkLogin()
     {
+        IsMediaServerPanelOpen = false;
         PendingNetworkProtocolType = "webdav";
         PendingNetworkBaseUrl = string.Empty;
         PendingNetworkDisplayName = string.Empty;
@@ -2453,6 +2695,151 @@ public partial class PosterWallViewModel : ObservableObject
         IsNetworkLoginPanelOpen = true;
         NetworkSourceStatus = "输入 WebDAV 地址或 SMB 路径。";
         OnCommandStateChanged();
+    }
+
+    private void OpenMediaServerPanel()
+    {
+        IsNetworkLoginPanelOpen = false;
+        IsMediaServerPanelOpen = true;
+        if (SelectedMediaServerProtocolOption is null)
+        {
+            SelectedMediaServerProtocolOption = MediaServerProtocolOptions[0];
+        }
+
+        PendingMediaServerProtocolType = SelectedMediaServerProtocolOption.Value;
+        ApplyMediaServerProtocolDefaults(PendingMediaServerProtocolType);
+        MediaServerStatus = GetMediaServerConnectionHint(PendingMediaServerProtocolType);
+        OnCommandStateChanged();
+    }
+
+    private void CloseMediaServerPanel()
+    {
+        ResetMediaServerForm(clearStatus: true);
+        OnCommandStateChanged();
+    }
+
+    private async Task AddMediaServerSourceAsync()
+    {
+        var source = BuildPendingMediaServerSource();
+        if (source is null)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        OnCommandStateChanged();
+
+        try
+        {
+            MediaServerStatus = $"正在预扫描 {source.ProtocolLabel} 共享文件夹...";
+            StatusMessage = MediaServerStatus;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            IReadOnlyList<NetworkShareFolderItem> folders = mediaServerPreflightService is null
+                ? []
+                : await mediaServerPreflightService.ListLibrariesAsync(source, timeout.Token);
+
+            ReplaceItems(NetworkShareFolders, folders);
+            NotifyNetworkShareFolderStateChanged();
+            PendingNetworkProtocolType = source.ProtocolType;
+            PendingNetworkBaseUrl = source.BaseUrl;
+            PendingNetworkDisplayName = source.Name;
+            PendingNetworkUsername = string.Empty;
+            PendingNetworkPassword = string.Empty;
+            NetworkLoginTitle = $"选择 {source.ProtocolLabel} 共享文件夹";
+            IsMediaServerPanelOpen = false;
+            IsNetworkLoginPanelOpen = true;
+            MediaServerStatus = folders.Count == 0
+                ? "连接成功，但当前服务器没有可挂载的媒体库。"
+                : $"预扫描成功：读取到 {folders.Count} 个媒体库，可给多个目标点星标，关闭列表时统一挂载。";
+            NetworkSourceStatus = MediaServerStatus;
+            StatusMessage = MediaServerStatus;
+        }
+        catch (OperationCanceledException)
+        {
+            MediaServerStatus = "媒体服务器预扫描超时。";
+            StatusMessage = MediaServerStatus;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+        {
+            MediaServerStatus = $"媒体服务器预扫描失败：{ex.Message}";
+            StatusMessage = MediaServerStatus;
+        }
+        finally
+        {
+            IsBusy = false;
+            OnCommandStateChanged();
+        }
+    }
+
+    private async Task AuthorizePlexAsync()
+    {
+        if (!PendingMediaServerUsesPlex || IsPlexAuthorizationInProgress)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(PendingMediaServerBaseUrl))
+        {
+            PendingMediaServerBaseUrl = DefaultMediaServerBaseUrl("plex");
+        }
+
+        IsPlexAuthorizationInProgress = true;
+        MediaServerStatus = "正在创建 Plex 授权请求...";
+        OnCommandStateChanged();
+
+        try
+        {
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(130));
+            var session = await PlexPinAuthClient.CreateAsync(cancellation.Token);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = session.AuthorizationUrl,
+                UseShellExecute = true
+            });
+            MediaServerStatus = $"已打开 Plex Link 页面，请确认 PIN：{session.Code}";
+            var token = await PlexPinAuthClient.WaitForTokenAsync(session, cancellation.Token);
+            PendingMediaServerToken = token;
+            MediaServerStatus = "Plex 授权成功，已自动填入访问令牌。";
+        }
+        catch (OperationCanceledException)
+        {
+            MediaServerStatus = "Plex 授权超时，请重新点击登录。";
+        }
+        catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidOperationException)
+        {
+            MediaServerStatus = $"Plex 授权失败：{ex.Message}";
+        }
+        finally
+        {
+            IsPlexAuthorizationInProgress = false;
+            OnCommandStateChanged();
+        }
+    }
+
+    private async Task PreScanMediaServerSourceAsync()
+    {
+        var source = BuildPendingMediaServerSource();
+        if (source is null)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        OnCommandStateChanged();
+
+        try
+        {
+            MediaServerStatus = $"正在预扫描 {source.ProtocolLabel} 媒体列表...";
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            var result = await RunMediaServerPreflightAsync(source, timeout.Token);
+            MediaServerStatus = result.Message;
+            StatusMessage = result.Message;
+        }
+        finally
+        {
+            IsBusy = false;
+            OnCommandStateChanged();
+        }
     }
 
     private void CloseNetworkLogin()
@@ -2474,6 +2861,21 @@ public partial class PosterWallViewModel : ObservableObject
         if (clearStatus)
         {
             NetworkSourceStatus = string.Empty;
+        }
+    }
+
+    private void ResetMediaServerForm(bool clearStatus)
+    {
+        IsMediaServerPanelOpen = false;
+        PendingMediaServerName = string.Empty;
+        PendingMediaServerProtocolType = "plex";
+        SelectedMediaServerProtocolOption = MediaServerProtocolOptions[0];
+        PendingMediaServerBaseUrl = DefaultMediaServerBaseUrl("plex");
+        PendingMediaServerToken = string.Empty;
+        PendingMediaServerUserId = string.Empty;
+        if (clearStatus)
+        {
+            MediaServerStatus = string.Empty;
         }
     }
 
@@ -2587,7 +2989,9 @@ public partial class PosterWallViewModel : ObservableObject
 
         var updated = NetworkShareFolders
             .Select(item => string.Equals(item.BaseUrl, folder.BaseUrl, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(item.ProtocolType, folder.ProtocolType, StringComparison.OrdinalIgnoreCase)
+                            string.Equals(item.ProtocolType, folder.ProtocolType, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(item.AuthConfig ?? string.Empty, folder.AuthConfig ?? string.Empty, StringComparison.Ordinal) &&
+                            string.Equals(item.Name, folder.Name, StringComparison.OrdinalIgnoreCase)
                 ? item.WithStarred(!item.IsStarred)
                 : item)
             .ToList();
@@ -2626,10 +3030,15 @@ public partial class PosterWallViewModel : ObservableObject
         try
         {
             var mountedNames = new List<string>(folders.Count);
+            var mountedSourceIds = new List<long>(folders.Count);
             foreach (var folder in folders)
             {
                 var source = folder.ToMediaSource();
-                await mediaSourceRepository.AddAsync(source);
+                var sourceId = await mediaSourceRepository.AddAsync(source);
+                if (sourceId > 0)
+                {
+                    mountedSourceIds.Add(sourceId);
+                }
                 mountedNames.Add(source.Name);
             }
 
@@ -2641,9 +3050,11 @@ public partial class PosterWallViewModel : ObservableObject
             NetworkSourceStatus = $"已挂载媒体源：{folderSummary}，正在扫描并刮削...";
             StatusMessage = NetworkSourceStatus;
 
-            LastScanSummary = await libraryScanner.ScanAllAsync(cancellationToken);
-            await ReloadLibraryAsync();
-            await RefreshLibraryArtworkAsync(isExplicitRequest: true, forceThumbnails: true, cancellationToken);
+            LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                isExplicitRequest: true,
+                forceThumbnails: true,
+                cancellationToken,
+                mountedSourceIds);
             StatusMessage = string.IsNullOrWhiteSpace(StatusMessage)
                 ? $"已挂载并扫描媒体源：{folderSummary}"
                 : $"已挂载媒体源：{folderSummary}。{StatusMessage}";
@@ -2766,6 +3177,11 @@ public partial class PosterWallViewModel : ObservableObject
         AddFolderSourceCommand.NotifyCanExecuteChanged();
         AddWebDavSourceCommand.NotifyCanExecuteChanged();
         TestWebDavSourceCommand.NotifyCanExecuteChanged();
+        OpenMediaServerPanelCommand.NotifyCanExecuteChanged();
+        CloseMediaServerPanelCommand.NotifyCanExecuteChanged();
+        PreScanMediaServerSourceCommand.NotifyCanExecuteChanged();
+        AuthorizePlexCommand.NotifyCanExecuteChanged();
+        AddMediaServerSourceCommand.NotifyCanExecuteChanged();
         OpenDetailCommand.NotifyCanExecuteChanged();
         PlayVideoCommand.NotifyCanExecuteChanged();
         PlayPrimaryCommand.NotifyCanExecuteChanged();
@@ -2817,12 +3233,18 @@ public partial class PosterWallViewModel : ObservableObject
     {
         forceRefreshQueued = false;
         var cancellationTokenSource = libraryAutomationCancellationTokenSource;
-        if (cancellationTokenSource is null || cancellationTokenSource.IsCancellationRequested)
+        if (cancellationTokenSource is null)
         {
             return;
         }
 
-        cancellationTokenSource.Cancel();
+        if (!cancellationTokenSource.IsCancellationRequested)
+        {
+            cancellationTokenSource.Cancel();
+        }
+
+        libraryAutomationCancellationTokenSource = null;
+        IsLibraryScanInProgress = false;
     }
 
     private void CompleteLibraryAutomation(CancellationTokenSource cancellationTokenSource)
@@ -2867,6 +3289,262 @@ public partial class PosterWallViewModel : ObservableObject
         }
 
         return source;
+    }
+
+    private MediaSource? BuildPendingMediaServerSource()
+    {
+        var protocolType = NormalizeMediaServerProtocolType(PendingMediaServerProtocolType);
+        var protocolKind = ResolveMediaServerProtocolKind(protocolType);
+        var normalizedUrl = MediaSourceNormalizer.NormalizeBaseUrl(protocolKind, PendingMediaServerBaseUrl.Trim());
+        if (string.IsNullOrWhiteSpace(normalizedUrl))
+        {
+            MediaServerStatus = "请输入 Plex、Emby 或 Jellyfin 服务器地址。";
+            return null;
+        }
+
+        var source = new MediaSource
+        {
+            Name = PendingMediaServerName.Trim(),
+            ProtocolType = protocolType,
+            BaseUrl = normalizedUrl,
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig(
+                PendingMediaServerToken,
+                protocolKind == MediaSourceProtocol.Plex ? string.Empty : PendingMediaServerUserId.Trim()))
+        };
+
+        if (!source.IsValidConfiguration())
+        {
+            MediaServerStatus = "媒体服务器地址无效，请输入以 http:// 或 https:// 开头的地址。";
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(PendingMediaServerToken))
+        {
+            MediaServerStatus = protocolKind == MediaSourceProtocol.Plex
+                ? "Plex 需要访问令牌（X-Plex-Token）才能读取媒体库。"
+                : $"{source.ProtocolLabel} 需要 API Key 或访问令牌才能读取媒体列表和生成播放地址。";
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(source.Name))
+        {
+            source.Name = ResolveMediaServerSourceName(source.ProtocolLabel, source.BaseUrl);
+        }
+
+        return source;
+    }
+
+    private Task<MediaServerPreflightResult> RunMediaServerPreflightAsync(MediaSource source, CancellationToken cancellationToken)
+    {
+        return mediaServerPreflightService is null
+            ? Task.FromResult(new MediaServerPreflightResult(false, "当前版本未启用媒体服务器预扫描。"))
+            : mediaServerPreflightService.PreScanAsync(source, cancellationToken);
+    }
+
+    private static string NormalizeMediaServerProtocolType(string protocolType)
+    {
+        return protocolType.Trim().ToLowerInvariant() switch
+        {
+            "emby" => "emby",
+            "jellyfin" => "jellyfin",
+            _ => "plex"
+        };
+    }
+
+    private static MediaSourceProtocol ResolveMediaServerProtocolKind(string protocolType)
+    {
+        return NormalizeMediaServerProtocolType(protocolType) switch
+        {
+            "emby" => MediaSourceProtocol.Emby,
+            "jellyfin" => MediaSourceProtocol.Jellyfin,
+            _ => MediaSourceProtocol.Plex
+        };
+    }
+
+    private static string DefaultMediaServerBaseUrl(string protocolType)
+    {
+        return NormalizeMediaServerProtocolType(protocolType) switch
+        {
+            "emby" or "jellyfin" => "http://127.0.0.1:8096",
+            _ => "http://127.0.0.1:32400"
+        };
+    }
+
+    private static bool IsKnownMediaServerDefaultBaseUrl(string value)
+    {
+        var trimmed = value.Trim();
+        return string.Equals(trimmed, "http://127.0.0.1:32400", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(trimmed, "http://localhost:32400", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(trimmed, "http://127.0.0.1:8096", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(trimmed, "http://localhost:8096", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetMediaServerConnectionHint(string protocolType)
+    {
+        return NormalizeMediaServerProtocolType(protocolType) switch
+        {
+            "plex" => "Plex 默认地址为 http://127.0.0.1:32400，点击“登录 Plex”会自动获取访问令牌。",
+            "emby" => "Emby 默认地址为 http://127.0.0.1:8096，请填写 API Key 或访问令牌。",
+            "jellyfin" => "Jellyfin 默认地址为 http://127.0.0.1:8096，请填写 API Key 或访问令牌。",
+            _ => "保存后会先预扫描媒体库列表；可给多个库点星标，关闭列表时统一挂载并扫描刮削。"
+        };
+    }
+
+    private void ApplyMediaServerProtocolDefaults(string protocolType)
+    {
+        var currentBaseUrl = PendingMediaServerBaseUrl.Trim();
+        if (string.IsNullOrWhiteSpace(currentBaseUrl) || IsKnownMediaServerDefaultBaseUrl(currentBaseUrl))
+        {
+            PendingMediaServerBaseUrl = DefaultMediaServerBaseUrl(protocolType);
+        }
+
+        if (NormalizeMediaServerProtocolType(protocolType) == "plex")
+        {
+            PendingMediaServerUserId = string.Empty;
+        }
+
+        NotifyMediaServerProtocolDependentProperties();
+    }
+
+    private void NotifyMediaServerProtocolDependentProperties()
+    {
+        OnPropertyChanged(nameof(PendingMediaServerAddressWatermark));
+        OnPropertyChanged(nameof(PendingMediaServerTokenWatermark));
+        OnPropertyChanged(nameof(PendingMediaServerUserWatermark));
+        OnPropertyChanged(nameof(PendingMediaServerUsesUserId));
+        OnPropertyChanged(nameof(PendingMediaServerUsesPlex));
+        OnPropertyChanged(nameof(PlexAuthorizeButtonText));
+        AuthorizePlexCommand.NotifyCanExecuteChanged();
+    }
+
+    private sealed record PlexPinSession(string Id, string Code, string AuthorizationUrl);
+
+    private static class PlexPinAuthClient
+    {
+        private static readonly HttpClient Client = new()
+        {
+            Timeout = TimeSpan.FromSeconds(12)
+        };
+
+        public static async Task<PlexPinSession> CreateAsync(CancellationToken cancellationToken)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://plex.tv/api/v2/pins");
+            ApplyHeaders(request);
+
+            using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var root = document.RootElement;
+            var id = ReadJsonString(root, "id");
+            var code = ReadJsonString(root, "code");
+            if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(code))
+            {
+                throw new InvalidOperationException("Plex 授权响应无效。");
+            }
+
+            return new PlexPinSession(id, code, BuildAuthorizationUrl(code));
+        }
+
+        public static async Task<string> WaitForTokenAsync(PlexPinSession session, CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                var token = await TryReadTokenAsync(session, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(token))
+                {
+                    return token;
+                }
+            }
+
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        private static async Task<string?> TryReadTokenAsync(PlexPinSession session, CancellationToken cancellationToken)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                $"https://plex.tv/api/v2/pins/{Uri.EscapeDataString(session.Id)}");
+            ApplyHeaders(request);
+
+            using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            return ReadJsonString(document.RootElement, "authToken");
+        }
+
+        private static void ApplyHeaders(HttpRequestMessage request)
+        {
+            request.Headers.Accept.ParseAdd("application/json");
+            request.Headers.TryAddWithoutValidation("X-Plex-Product", "OmniPlay");
+            request.Headers.TryAddWithoutValidation("X-Plex-Version", "1.0");
+            request.Headers.TryAddWithoutValidation("X-Plex-Client-Identifier", ClientIdentifier);
+            request.Headers.TryAddWithoutValidation("X-Plex-Device-Name", Environment.MachineName);
+            request.Headers.TryAddWithoutValidation("X-Plex-Platform", "Windows");
+        }
+
+        private static string BuildAuthorizationUrl(string code)
+        {
+            return $"https://plex.tv/link/?pin={Uri.EscapeDataString(code)}";
+        }
+
+        private static string ClientIdentifier
+        {
+            get
+            {
+                var directory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "OmniPlay");
+                var path = Path.Combine(directory, "plex-client-id.txt");
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        var existing = File.ReadAllText(path).Trim();
+                        if (!string.IsNullOrWhiteSpace(existing))
+                        {
+                            return existing;
+                        }
+                    }
+
+                    Directory.CreateDirectory(directory);
+                    var created = $"omniplay-windows-{Guid.NewGuid():N}";
+                    File.WriteAllText(path, created);
+                    return created;
+                }
+                catch
+                {
+                    return "omniplay-windows";
+                }
+            }
+        }
+
+        private static string? ReadJsonString(JsonElement element, string propertyName)
+        {
+            if (!element.TryGetProperty(propertyName, out var property))
+            {
+                return null;
+            }
+
+            return property.ValueKind switch
+            {
+                JsonValueKind.String => property.GetString(),
+                JsonValueKind.Number => property.GetRawText(),
+                _ => null
+            };
+        }
+    }
+
+    private static string ResolveMediaServerSourceName(string protocolLabel, string baseUrl)
+    {
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            return protocolLabel;
+        }
+
+        return $"{protocolLabel} · {uri.Host}";
     }
 
     private static MediaSource CreateLocalSource(string selectedPath, long? sourceId = null)
@@ -2963,9 +3641,11 @@ public partial class PosterWallViewModel : ObservableObject
             var cancellationToken = automationCancellationTokenSource.Token;
             try
             {
-                LastScanSummary = await libraryScanner.ScanAllAsync(cancellationToken);
-                await ReloadLibraryAsync();
-                await RefreshLibraryArtworkAsync(isExplicitRequest: true, forceThumbnails: true, cancellationToken);
+                LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                    isExplicitRequest: true,
+                    forceThumbnails: true,
+                    cancellationToken,
+                    new[] { source.Id.Value });
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -3170,6 +3850,27 @@ public partial class PosterWallViewModel : ObservableObject
         {
             SelectedSortOption = value.Value;
         }
+    }
+
+    partial void OnSelectedMediaServerProtocolOptionChanged(SettingsOptionItem? value)
+    {
+        if (value is not null)
+        {
+            PendingMediaServerProtocolType = value.Value;
+            ApplyMediaServerProtocolDefaults(value.Value);
+            MediaServerStatus = GetMediaServerConnectionHint(value.Value);
+        }
+    }
+
+    partial void OnPendingMediaServerProtocolTypeChanged(string value)
+    {
+        NotifyMediaServerProtocolDependentProperties();
+    }
+
+    partial void OnIsPlexAuthorizationInProgressChanged(bool value)
+    {
+        OnPropertyChanged(nameof(PlexAuthorizeButtonText));
+        AuthorizePlexCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnDetailPrimaryFileChanged(LibraryVideoItem? value)
@@ -4084,6 +4785,48 @@ public partial class PosterWallViewModel : ObservableObject
                allTvShows.Any(show => NeedsTvShowRefresh(show, settings));
     }
 
+    private async Task RefreshIndexedScanItemArtworkAsync(
+        LibraryScanIndexedItem item,
+        CancellationToken cancellationToken)
+    {
+        var tmdbSettings = Settings.BuildTmdbSettings();
+        if (!tmdbSettings.EnableMetadataEnrichment && !tmdbSettings.EnablePosterDownloads)
+        {
+            await ReloadLibraryAsync();
+            return;
+        }
+
+        await libraryRefreshGate.WaitAsync(cancellationToken);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var summary = item.IsTvShow
+                ? await libraryMetadataEnricher.EnrichMissingTvShowMetadataAsync(
+                    item.Id,
+                    tmdbSettings,
+                    cancellationToken)
+                : await libraryMetadataEnricher.EnrichMissingMovieMetadataAsync(
+                    item.Id,
+                    tmdbSettings,
+                    cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+            await ReloadLibraryAsync();
+            await RefreshOpenDetailIfNeededAsync();
+
+            if (summary.EncounteredNetworkError)
+            {
+                StatusMessage = string.IsNullOrWhiteSpace(summary.ErrorMessage)
+                    ? "自动刮削失败：无法连接网络或 TMDB。"
+                    : $"自动刮削失败：{summary.ErrorMessage}";
+            }
+        }
+        finally
+        {
+            libraryRefreshGate.Release();
+        }
+    }
+
     private async Task RefreshLibraryArtworkAsync(
         bool isExplicitRequest,
         bool forceThumbnails,
@@ -4118,10 +4861,13 @@ public partial class PosterWallViewModel : ObservableObject
                 .Where(movie => movie.Id.HasValue && NeedsMovieRefresh(movie, tmdbSettings))
                 .Select(movie => (Id: movie.Id!.Value, movie.Title))
                 .ToList();
-            var tvShowQueue = allTvShows
-                .Where(show => NeedsTvShowRefresh(show, tmdbSettings) || shouldRefreshThumbnails)
-                .Select(show => (show.Id, show.Title, NeedsMetadata: NeedsTvShowRefresh(show, tmdbSettings)))
+            var tvShowMetadataQueue = allTvShows
+                .Where(show => NeedsTvShowRefresh(show, tmdbSettings))
+                .Select(show => (show.Id, show.Title))
                 .ToList();
+            var tvShowThumbnailQueue = shouldRefreshThumbnails
+                ? allTvShows.Select(show => (show.Id, show.Title)).ToList()
+                : new List<(long Id, string Title)>();
             var totals = new LibraryArtworkRefreshTotals();
 
             foreach (var movie in movieQueue)
@@ -4148,56 +4894,53 @@ public partial class PosterWallViewModel : ObservableObject
                 }
             }
 
-            foreach (var show in tvShowQueue)
+            foreach (var show in tvShowMetadataQueue)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (show.NeedsMetadata)
+                StatusMessage = $"\u6B63\u5728\u522E\u524A\u5267\u96C6\u5143\u6570\u636E\uFF1A{show.Title}...";
+                var metadataSummary = await libraryMetadataEnricher.EnrichMissingTvShowMetadataAsync(
+                    show.Id,
+                    tmdbSettings,
+                    cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                totals.AddMetadata(metadataSummary);
+
+                if (metadataSummary.HasChanges)
                 {
-                    StatusMessage = $"\u6B63\u5728\u522E\u524A\u5267\u96C6\u5143\u6570\u636E\uFF1A{show.Title}...";
-                    var metadataSummary = await libraryMetadataEnricher.EnrichMissingTvShowMetadataAsync(
-                        show.Id,
-                        tmdbSettings,
-                        cancellationToken);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    totals.AddMetadata(metadataSummary);
-
-                    if (metadataSummary.HasChanges)
-                    {
-                        await ReloadLibraryAsync();
-                        await RefreshOpenDetailIfNeededAsync();
-                    }
-
-                    if (metadataSummary.EncounteredNetworkError)
-                    {
-                        StatusMessage = ComposeArtworkRefreshStatusMessage(isExplicitRequest, tmdbSettings, totals);
-                        return;
-                    }
+                    await ReloadLibraryAsync();
+                    await RefreshOpenDetailIfNeededAsync();
                 }
 
-                if (shouldRefreshThumbnails)
+                if (metadataSummary.EncounteredNetworkError)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    StatusMessage = $"\u6B63\u5728\u522E\u524A\u5206\u96C6\u5267\u7167\uFF1A{show.Title}...";
-                    var thumbnailSummary = await libraryThumbnailEnricher.EnrichMissingThumbnailsForTvShowAsync(
-                        show.Id,
-                        tmdbSettings,
-                        cancellationToken);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    totals.AddThumbnails(thumbnailSummary);
+                    StatusMessage = ComposeArtworkRefreshStatusMessage(isExplicitRequest, tmdbSettings, totals);
+                    return;
+                }
+            }
 
-                    if (thumbnailSummary.HasChanges &&
-                        IsDetailOpen &&
-                        currentDetailTvShowId.HasValue &&
-                        currentDetailTvShowId.Value == show.Id)
-                    {
-                        await RefreshDetailFilesAsync();
-                    }
+            foreach (var show in tvShowThumbnailQueue)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                StatusMessage = $"\u6B63\u5728\u522E\u524A\u5206\u96C6\u5267\u7167\uFF1A{show.Title}...";
+                var thumbnailSummary = await libraryThumbnailEnricher.EnrichMissingThumbnailsForTvShowAsync(
+                    show.Id,
+                    tmdbSettings,
+                    cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                totals.AddThumbnails(thumbnailSummary);
 
-                    if (thumbnailSummary.EncounteredNetworkError)
-                    {
-                        StatusMessage = ComposeArtworkRefreshStatusMessage(isExplicitRequest, tmdbSettings, totals);
-                        return;
-                    }
+                if (thumbnailSummary.HasChanges &&
+                    IsDetailOpen &&
+                    currentDetailTvShowId.HasValue &&
+                    currentDetailTvShowId.Value == show.Id)
+                {
+                    await RefreshDetailFilesAsync();
+                }
+
+                if (thumbnailSummary.EncounteredNetworkError)
+                {
+                    StatusMessage = ComposeArtworkRefreshStatusMessage(isExplicitRequest, tmdbSettings, totals);
+                    return;
                 }
             }
 
@@ -4316,6 +5059,42 @@ public partial class PosterWallViewModel : ObservableObject
         }
     }
 
+    private sealed class LibraryScanAggregate
+    {
+        private readonly List<string> diagnostics = [];
+
+        public int SourceCount { get; private set; }
+
+        public int NewMovieCount { get; private set; }
+
+        public int NewVideoFileCount { get; private set; }
+
+        public int RemovedVideoFileCount { get; private set; }
+
+        public int NewTvShowCount { get; private set; }
+
+        public void Add(LibraryScanSummary summary)
+        {
+            SourceCount += summary.SourceCount;
+            NewMovieCount += summary.NewMovieCount;
+            NewVideoFileCount += summary.NewVideoFileCount;
+            RemovedVideoFileCount += summary.RemovedVideoFileCount;
+            NewTvShowCount += summary.NewTvShowCount;
+            diagnostics.AddRange(summary.Diagnostics);
+        }
+
+        public LibraryScanSummary ToSummary()
+        {
+            return new LibraryScanSummary(
+                SourceCount,
+                NewMovieCount,
+                NewVideoFileCount,
+                RemovedVideoFileCount,
+                NewTvShowCount,
+                diagnostics.ToList());
+        }
+    }
+
     private static bool NeedsMovieRefresh(Movie movie, TmdbSettings settings)
     {
         if (movie.IsLocked)
@@ -4371,7 +5150,7 @@ public partial class PosterWallViewModel : ObservableObject
 
     private bool ShouldRefreshThumbnails(TmdbSettings settings, bool forceThumbnails)
     {
-        return settings.EnableEpisodeThumbnailDownloads && allTvShows.Count > 0 && (forceThumbnails || allTvShows.Count > 0);
+        return settings.EnableEpisodeThumbnailDownloads && allTvShows.Count > 0 && forceThumbnails;
     }
 
     private static bool IsUsableLocalPoster(string? posterPath)

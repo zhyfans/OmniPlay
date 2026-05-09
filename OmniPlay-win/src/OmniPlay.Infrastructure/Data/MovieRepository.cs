@@ -1,6 +1,7 @@
 using Dapper;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models.Entities;
+using OmniPlay.Infrastructure.Library;
 
 namespace OmniPlay.Infrastructure.Data;
 
@@ -37,6 +38,39 @@ public sealed class MovieRepository : IMovieRepository
                 ORDER BY movie.title COLLATE NOCASE ASC
                 """,
                 cancellationToken: cancellationToken));
-        return movies.ToList();
+        return movies.Where(ShouldExposeMovieOnHome).ToList();
+    }
+
+    private static bool ShouldExposeMovieOnHome(Movie movie)
+    {
+        if (movie.Id is null or >= 0)
+        {
+            return true;
+        }
+
+        if (movie.IsLocked)
+        {
+            return true;
+        }
+
+        return MediaNameParser.IsUsableLibraryDisplayTitle(movie.Title) &&
+               HasVisibleMetadata(movie);
+    }
+
+    private static bool HasVisibleMetadata(Movie movie)
+    {
+        return movie.IsLocked ||
+               HasText(movie.ReleaseDate) ||
+               HasText(movie.Overview) ||
+               HasText(movie.PosterPath) ||
+               movie.VoteAverage.HasValue ||
+               HasText(movie.ProductionCountryCodes) ||
+               HasText(movie.OriginalLanguage) ||
+               HasText(movie.MetadataLanguage);
+    }
+
+    private static bool HasText(string? value)
+    {
+        return !string.IsNullOrWhiteSpace(value);
     }
 }

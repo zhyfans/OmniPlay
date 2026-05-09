@@ -13,15 +13,21 @@ public sealed class LibraryThumbnailEnricher : ILibraryThumbnailEnricher
     private readonly SqliteDatabase database;
     private readonly IStoragePaths storagePaths;
     private readonly ITmdbMetadataClient tmdbMetadataClient;
+    private readonly ISettingsService? settingsService;
+    private readonly ILocalMetadataSidecarService? localMetadataSidecarService;
 
     public LibraryThumbnailEnricher(
         SqliteDatabase database,
         IStoragePaths storagePaths,
-        ITmdbMetadataClient tmdbMetadataClient)
+        ITmdbMetadataClient tmdbMetadataClient,
+        ISettingsService? settingsService = null,
+        ILocalMetadataSidecarService? localMetadataSidecarService = null)
     {
         this.database = database;
         this.storagePaths = storagePaths;
         this.tmdbMetadataClient = tmdbMetadataClient;
+        this.settingsService = settingsService;
+        this.localMetadataSidecarService = localMetadataSidecarService;
     }
 
     public async Task<LibraryThumbnailEnrichmentSummary> EnrichMissingThumbnailsAsync(
@@ -69,6 +75,7 @@ public sealed class LibraryThumbnailEnricher : ILibraryThumbnailEnricher
 
         var downloadedCount = 0;
         var skippedCount = 0;
+        var exportLocalMetadata = await ShouldExportLocalMetadataAsync(cancellationToken);
         Dictionary<long, TmdbMetadataMatch?> showCache = [];
 
         foreach (var candidate in candidates)
@@ -98,7 +105,8 @@ public sealed class LibraryThumbnailEnricher : ILibraryThumbnailEnricher
                         candidate.ShowTitle,
                         candidate.SourceProtocolType,
                         candidate.SourceBasePath,
-                        candidate.RelativePath);
+                        candidate.RelativePath,
+                        fileName: candidate.FileName);
                     showMatch = await tmdbMetadataClient.SearchTvShowAsync(
                         lookupTitles,
                         candidate.FirstAirDate,
@@ -125,6 +133,11 @@ public sealed class LibraryThumbnailEnricher : ILibraryThumbnailEnricher
 
                 if (!string.IsNullOrWhiteSpace(localPath) && File.Exists(localPath))
                 {
+                    if (exportLocalMetadata)
+                    {
+                        await TryExportEpisodeThumbnailAsync(candidate, localPath, cancellationToken);
+                    }
+
                     downloadedCount++;
                 }
                 else
@@ -147,6 +160,41 @@ public sealed class LibraryThumbnailEnricher : ILibraryThumbnailEnricher
         }
 
         return new LibraryThumbnailEnrichmentSummary(downloadedCount, skippedCount);
+    }
+
+    private async Task<bool> ShouldExportLocalMetadataAsync(CancellationToken cancellationToken)
+    {
+        if (settingsService is null || localMetadataSidecarService is null)
+        {
+            return false;
+        }
+
+        var settings = await settingsService.LoadAsync(cancellationToken);
+        return settings.LocalMetadata.EnableLocalMetadataExport;
+    }
+
+    private async Task TryExportEpisodeThumbnailAsync(
+        ThumbnailCandidate candidate,
+        string thumbnailPath,
+        CancellationToken cancellationToken)
+    {
+        if (localMetadataSidecarService is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await localMetadataSidecarService.ExportEpisodeThumbnailAsync(
+                candidate.SourceProtocolType,
+                candidate.SourceBasePath,
+                candidate.RelativePath,
+                thumbnailPath,
+                cancellationToken);
+        }
+        catch
+        {
+        }
     }
 
     private async Task<IReadOnlyList<ThumbnailCandidate>> LoadCandidatesAsync(long? tvShowId, CancellationToken cancellationToken)

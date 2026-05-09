@@ -17,6 +17,9 @@ public sealed class NetworkSourceDiscoveryItem
         {
             "webdav" => MediaSourceProtocol.WebDav,
             "smb" => MediaSourceProtocol.Smb,
+            "plex" => MediaSourceProtocol.Plex,
+            "emby" => MediaSourceProtocol.Emby,
+            "jellyfin" => MediaSourceProtocol.Jellyfin,
             _ => null
         };
 
@@ -24,6 +27,9 @@ public sealed class NetworkSourceDiscoveryItem
     {
         MediaSourceProtocol.WebDav => "WebDAV",
         MediaSourceProtocol.Smb => "SMB",
+        MediaSourceProtocol.Plex => "Plex",
+        MediaSourceProtocol.Emby => "Emby",
+        MediaSourceProtocol.Jellyfin => "Jellyfin",
         _ => ProtocolType
     };
 }

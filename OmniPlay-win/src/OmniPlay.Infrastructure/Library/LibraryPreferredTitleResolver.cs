@@ -10,7 +10,8 @@ internal static class LibraryPreferredTitleResolver
         string? language,
         string? sourceProtocolType,
         string? baseUrl,
-        string? relativePath)
+        string? relativePath,
+        string? fileName = null)
     {
         if (string.IsNullOrWhiteSpace(matchedTitle))
         {
@@ -27,7 +28,7 @@ internal static class LibraryPreferredTitleResolver
             return matchedTitle;
         }
 
-        var chineseFallback = ResolveChineseFallback(sourceProtocolType, baseUrl, relativePath);
+        var chineseFallback = ResolveChineseFallback(sourceProtocolType, baseUrl, relativePath, fileName);
         return !string.IsNullOrWhiteSpace(chineseFallback)
             ? chineseFallback
             : matchedTitle;
@@ -36,8 +37,18 @@ internal static class LibraryPreferredTitleResolver
     private static string? ResolveChineseFallback(
         string? sourceProtocolType,
         string? baseUrl,
-        string? relativePath)
+        string? relativePath,
+        string? fileName)
     {
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            var fileNameChinese = MediaNameParser.ExtractSearchMetadata(fileName).ChineseTitle;
+            if (!string.IsNullOrWhiteSpace(fileNameChinese))
+            {
+                return fileNameChinese;
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(relativePath))
         {
             return null;

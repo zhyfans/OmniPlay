@@ -108,7 +108,7 @@ class OfflineCacheManager: ObservableObject {
         switch kind {
         case .local, .direct:
             return true
-        case .webdav:
+        case .webdav, .plex, .emby, .jellyfin:
             return false
         }
     }
@@ -117,7 +117,7 @@ class OfflineCacheManager: ObservableObject {
         if isCached(file) { return false }
         guard let mediaSource else { return true }
         guard let kind = mediaSource.protocolKind else { return true }
-        if kind == .webdav { return false }
+        if kind == .webdav || kind == .plex || kind == .emby || kind == .jellyfin { return false }
         let sourceURL = sourceFileURL(for: file, mediaSource: mediaSource)
         return !FileManager.default.fileExists(atPath: sourceURL.path)
     }

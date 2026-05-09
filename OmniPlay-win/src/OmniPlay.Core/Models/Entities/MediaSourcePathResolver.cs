@@ -26,6 +26,8 @@ public static class MediaSourcePathResolver
             MediaSourceProtocol.WebDav => ResolveWebDavUrl(baseUrl, normalizedRelativePath),
             MediaSourceProtocol.Smb => ResolveLocalPath(baseUrl, normalizedRelativePath),
             MediaSourceProtocol.Direct => normalizedRelativePath,
+            MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin =>
+                ResolveMediaServerUrl(baseUrl, normalizedRelativePath),
             _ => string.Empty
         };
     }
@@ -45,6 +47,17 @@ public static class MediaSourcePathResolver
                 normalizedRelativePath,
                 MediaSourceAuthConfigSerializer.DeserializeWebDav(authConfig),
                 includeCredentials: true),
+            MediaSourceProtocol.Plex => AppendQueryParameterIfMissing(
+                AppendQueryParameterIfMissing(
+                    ResolveMediaServerUrl(baseUrl, normalizedRelativePath),
+                    "download",
+                    "1"),
+                "X-Plex-Token",
+                MediaSourceAuthConfigSerializer.DeserializeMediaServer(authConfig)?.Token),
+            MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin => AppendQueryParameter(
+                ResolveMediaServerUrl(baseUrl, normalizedRelativePath),
+                "api_key",
+                MediaSourceAuthConfigSerializer.DeserializeMediaServer(authConfig)?.Token),
             _ => ResolvePlaybackPath(protocol, baseUrl, relativePath)
         };
     }
@@ -90,6 +103,42 @@ public static class MediaSourcePathResolver
     {
         return Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+    }
+
+    public static bool IsMediaServerPlaybackEndpointPath(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var candidate = value.Trim();
+        if (Uri.TryCreate(candidate, UriKind.Absolute, out var uri) &&
+            (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        {
+            candidate = uri.AbsolutePath;
+        }
+
+        var pathOnly = candidate.Split('?', 2)[0]
+            .Replace('\\', '/')
+            .Trim('/');
+        if (string.IsNullOrWhiteSpace(pathOnly))
+        {
+            return false;
+        }
+
+        var parts = pathOnly
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(static part => part.ToLowerInvariant())
+            .ToArray();
+
+        return parts is ["items", _, "download", ..] ||
+               parts is ["videos", _, "master.m3u8", ..] ||
+               (parts.Length >= 3 &&
+                parts[0] == "videos" &&
+                parts[2].StartsWith("stream.", StringComparison.Ordinal)) ||
+               parts is ["library", "parts", ..] ||
+               parts is ["library", "metadata", ..];
     }
 
     public static bool IsPlayableLocation(string? value)
@@ -178,6 +227,63 @@ public static class MediaSourcePathResolver
         return builder.Uri.AbsoluteUri;
     }
 
+    private static string ResolveMediaServerUrl(string? baseUrl, string normalizedRelativePath)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return string.Empty;
+        }
+
+        var normalizedBaseUrl = baseUrl.Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(normalizedRelativePath))
+        {
+            return normalizedBaseUrl;
+        }
+
+        if (!Uri.TryCreate(AppendTrailingSlash(normalizedBaseUrl), UriKind.Absolute, out var baseUri))
+        {
+            return normalizedBaseUrl;
+        }
+
+        return new Uri(baseUri, normalizedRelativePath.TrimStart('/')).AbsoluteUri;
+    }
+
+    private static string AppendQueryParameter(string url, string name, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(value))
+        {
+            return url;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return url;
+        }
+
+        var separator = string.IsNullOrEmpty(uri.Query) ? "?" : "&";
+        return $"{url}{separator}{Uri.EscapeDataString(name)}={Uri.EscapeDataString(value.Trim())}";
+    }
+
+    private static string AppendQueryParameterIfMissing(string url, string name, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(value))
+        {
+            return url;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return url;
+        }
+
+        var needle = $"{Uri.EscapeDataString(name)}=";
+        var hasParameter = uri.Query
+            .TrimStart('?')
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => part.StartsWith(needle, StringComparison.OrdinalIgnoreCase));
+        return hasParameter ? url : AppendQueryParameter(url, name, value);
+    }
+
     private static string AppendTrailingSlash(string value)
     {
         return value.EndsWith("/", StringComparison.Ordinal) ? value : $"{value}/";
@@ -191,6 +297,9 @@ public static class MediaSourcePathResolver
             "webdav" => MediaSourceProtocol.WebDav,
             "smb" => MediaSourceProtocol.Smb,
             "direct" => MediaSourceProtocol.Direct,
+            "plex" => MediaSourceProtocol.Plex,
+            "emby" => MediaSourceProtocol.Emby,
+            "jellyfin" => MediaSourceProtocol.Jellyfin,
             _ => null
         };
     }

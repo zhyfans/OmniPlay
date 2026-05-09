@@ -32,6 +32,9 @@ public sealed class MediaSource
         MediaSourceProtocol.WebDav => "WebDAV",
         MediaSourceProtocol.Smb => "SMB",
         MediaSourceProtocol.Direct => "直连",
+        MediaSourceProtocol.Plex => "Plex",
+        MediaSourceProtocol.Emby => "Emby",
+        MediaSourceProtocol.Jellyfin => "Jellyfin",
         _ => ProtocolType
     };
 
@@ -58,6 +61,9 @@ public sealed class MediaSource
             "webdav" => MediaSourceProtocol.WebDav,
             "smb" => MediaSourceProtocol.Smb,
             "direct" => MediaSourceProtocol.Direct,
+            "plex" => MediaSourceProtocol.Plex,
+            "emby" => MediaSourceProtocol.Emby,
+            "jellyfin" => MediaSourceProtocol.Jellyfin,
             _ => null
         };
 

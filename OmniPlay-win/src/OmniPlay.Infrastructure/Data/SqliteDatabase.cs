@@ -67,6 +67,7 @@ public sealed class SqliteDatabase
             CREATE TABLE IF NOT EXISTS videoFile (
                 id TEXT PRIMARY KEY,
                 sourceId INTEGER NOT NULL,
+                metadataPath TEXT NULL,
                 relativePath TEXT NOT NULL,
                 fileName TEXT NOT NULL,
                 mediaType TEXT NOT NULL,
@@ -104,6 +105,7 @@ public sealed class SqliteDatabase
         EnsureColumn(connection, "tvShow", "originalLanguage", "TEXT NULL");
         EnsureColumn(connection, "tvShow", "metadataLanguage", "TEXT NULL");
 
+        EnsureColumn(connection, "videoFile", "metadataPath", "TEXT NULL");
         EnsureColumn(connection, "videoFile", "playProgress", "REAL NOT NULL DEFAULT 0");
         EnsureColumn(connection, "videoFile", "duration", "REAL NOT NULL DEFAULT 0");
         EnsureColumn(connection, "videoFile", "lastPlayedAt", "REAL NULL");

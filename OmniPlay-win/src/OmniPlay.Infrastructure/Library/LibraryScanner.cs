@@ -18,18 +18,28 @@ public sealed class LibraryScanner : ILibraryScanner
 
     private readonly SqliteDatabase database;
     private readonly IMediaSourceRepository mediaSourceRepository;
+    private readonly ISettingsService? settingsService;
     private readonly IWebDavDiscoveryClient? webDavDiscoveryClient;
+    private readonly ILocalMetadataSidecarService? localMetadataSidecarService;
+    private readonly IMediaServerDiscoveryClient? mediaServerDiscoveryClient;
+    private readonly object deferredUnidentifiedScanLock = new();
+    private readonly List<DeferredPendingScanGroup> deferredUnidentifiedScanGroups = [];
 
     public LibraryScanner(
         SqliteDatabase database,
         IMediaSourceRepository mediaSourceRepository,
         ILibraryMetadataEnricher? metadataEnricher = null,
         ISettingsService? settingsService = null,
-        IWebDavDiscoveryClient? webDavDiscoveryClient = null)
+        IWebDavDiscoveryClient? webDavDiscoveryClient = null,
+        ILocalMetadataSidecarService? localMetadataSidecarService = null,
+        IMediaServerDiscoveryClient? mediaServerDiscoveryClient = null)
     {
         this.database = database;
         this.mediaSourceRepository = mediaSourceRepository;
+        this.settingsService = settingsService;
         this.webDavDiscoveryClient = webDavDiscoveryClient;
+        this.localMetadataSidecarService = localMetadataSidecarService;
+        this.mediaServerDiscoveryClient = mediaServerDiscoveryClient;
     }
 
     public async Task<LibraryScanSummary> ScanAllAsync(CancellationToken cancellationToken = default)
@@ -59,7 +69,85 @@ public sealed class LibraryScanner : ILibraryScanner
         return new LibraryScanSummary(sources.Count, newMovies, newVideoFiles, removedVideoFiles, newTvShows, diagnostics);
     }
 
-    private async Task<LibraryScanSummary> ScanLocalSourceAsync(MediaSource source, CancellationToken cancellationToken)
+    public async Task<LibraryScanSummary> ScanSourceAsync(
+        long sourceId,
+        CancellationToken cancellationToken = default,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed = null,
+        bool deferUnidentifiedGroups = false)
+    {
+        await mediaSourceRepository.PurgeExpiredInactiveAsync(DateTimeOffset.UtcNow, cancellationToken);
+        var source = (await mediaSourceRepository.GetAllAsync(cancellationToken))
+            .FirstOrDefault(source => source.Id == sourceId && source.IsActive);
+        if (source is null)
+        {
+            return new LibraryScanSummary(0, 0, 0);
+        }
+
+        return await ScanSourceWithDiagnosticsAsync(source, cancellationToken, afterItemIndexed, deferUnidentifiedGroups);
+    }
+
+    public void ClearDeferredUnidentifiedScanGroups()
+    {
+        lock (deferredUnidentifiedScanLock)
+        {
+            deferredUnidentifiedScanGroups.Clear();
+        }
+    }
+
+    public async Task<LibraryScanSummary> CommitDeferredUnidentifiedScanGroupsAsync(CancellationToken cancellationToken = default)
+    {
+        List<DeferredPendingScanGroup> pendingGroups;
+        lock (deferredUnidentifiedScanLock)
+        {
+            pendingGroups = deferredUnidentifiedScanGroups.ToList();
+            deferredUnidentifiedScanGroups.Clear();
+        }
+
+        if (pendingGroups.Count == 0)
+        {
+            return new LibraryScanSummary(0, 0, 0);
+        }
+
+        var newMovies = 0;
+        var newVideoFiles = 0;
+        var newTvShows = 0;
+        using var connection = database.OpenConnection();
+        foreach (var pending in pendingGroups)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var commitResult = await UpsertPendingScanGroupAsync(
+                connection,
+                pending.Source,
+                pending.Group,
+                cancellationToken);
+            newMovies += commitResult.NewMovieCount;
+            newTvShows += commitResult.NewTvShowCount;
+            newVideoFiles += commitResult.NewVideoFileCount;
+        }
+
+        using (var transaction = connection.BeginTransaction())
+        {
+            await connection.ExecuteAsync(
+                new CommandDefinition(
+                    "DELETE FROM movie WHERE id NOT IN (SELECT DISTINCT movieId FROM videoFile WHERE movieId IS NOT NULL)",
+                    transaction: transaction,
+                    cancellationToken: cancellationToken));
+            await connection.ExecuteAsync(
+                new CommandDefinition(
+                    "DELETE FROM tvShow WHERE id NOT IN (SELECT DISTINCT episodeId FROM videoFile WHERE episodeId IS NOT NULL)",
+                    transaction: transaction,
+                    cancellationToken: cancellationToken));
+            transaction.Commit();
+        }
+
+        return new LibraryScanSummary(0, newMovies, newVideoFiles, newTvShowCount: newTvShows);
+    }
+
+    private async Task<LibraryScanSummary> ScanLocalSourceAsync(
+        MediaSource source,
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed,
+        bool deferUnidentifiedGroups)
     {
         if (!Directory.Exists(source.BaseUrl))
         {
@@ -67,10 +155,14 @@ public sealed class LibraryScanner : ILibraryScanner
         }
 
         var scannedFiles = EnumerateLocalVideoFiles(source.BaseUrl, cancellationToken);
-        return await ScanSourceAsync(source, scannedFiles, cancellationToken);
+        return await ScanSourceAsync(source, scannedFiles, cancellationToken, afterItemIndexed, deferUnidentifiedGroups);
     }
 
-    private async Task<LibraryScanSummary> ScanSmbSourceAsync(MediaSource source, CancellationToken cancellationToken)
+    private async Task<LibraryScanSummary> ScanSmbSourceAsync(
+        MediaSource source,
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed,
+        bool deferUnidentifiedGroups)
     {
         if (!source.IsValidConfiguration())
         {
@@ -87,7 +179,7 @@ public sealed class LibraryScanner : ILibraryScanner
             }
 
             var scannedFiles = EnumerateLocalVideoFiles(source.BaseUrl, cancellationToken);
-            return await ScanSourceAsync(source, scannedFiles, cancellationToken);
+            return await ScanSourceAsync(source, scannedFiles, cancellationToken, afterItemIndexed, deferUnidentifiedGroups);
         }
         catch (InvalidOperationException ex)
         {
@@ -95,7 +187,11 @@ public sealed class LibraryScanner : ILibraryScanner
         }
     }
 
-    private async Task<LibraryScanSummary> ScanWebDavSourceAsync(MediaSource source, CancellationToken cancellationToken)
+    private async Task<LibraryScanSummary> ScanWebDavSourceAsync(
+        MediaSource source,
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed,
+        bool deferUnidentifiedGroups)
     {
         if (webDavDiscoveryClient is null)
         {
@@ -133,18 +229,66 @@ public sealed class LibraryScanner : ILibraryScanner
                 file.ContentLength))
             .ToList());
 
-        return await ScanSourceAsync(source, scannedFiles, cancellationToken);
+        return await ScanSourceAsync(source, scannedFiles, cancellationToken, afterItemIndexed, deferUnidentifiedGroups);
     }
 
-    private async Task<LibraryScanSummary> ScanSourceWithDiagnosticsAsync(MediaSource source, CancellationToken cancellationToken)
+    private async Task<LibraryScanSummary> ScanMediaServerSourceAsync(
+        MediaSource source,
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed,
+        bool deferUnidentifiedGroups)
+    {
+        if (mediaServerDiscoveryClient is null)
+        {
+            return CreateDiagnosticSummary(source, $"已跳过媒体源“{ResolveSourceDisplayName(source)}”：当前版本未启用媒体服务器扫描。");
+        }
+
+        if (!source.IsValidConfiguration())
+        {
+            return CreateDiagnosticSummary(source, $"已跳过媒体源“{ResolveSourceDisplayName(source)}”：服务器地址配置无效。");
+        }
+
+        IReadOnlyList<MediaServerFileEntry> discoveredFiles;
+        try
+        {
+            discoveredFiles = await mediaServerDiscoveryClient.EnumerateFilesAsync(source, cancellationToken);
+        }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return CreateDiagnosticSummary(source, $"扫描媒体源“{ResolveSourceDisplayName(source)}”失败：连接超时。");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException)
+        {
+            return CreateDiagnosticSummary(source, $"扫描媒体源“{ResolveSourceDisplayName(source)}”失败：{ex.Message}");
+        }
+
+        var scannedFiles = ResolvePrimaryVideoFiles(discoveredFiles
+            .Select(file => new ScannedVideoFile(
+                file.MetadataPath,
+                NormalizeRelativePath(file.RelativePath),
+                file.FileName,
+                file.ContentLength,
+                file.MediaType))
+            .ToList());
+
+        return await ScanSourceAsync(source, scannedFiles, cancellationToken, afterItemIndexed, deferUnidentifiedGroups);
+    }
+
+    private async Task<LibraryScanSummary> ScanSourceWithDiagnosticsAsync(
+        MediaSource source,
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed = null,
+        bool deferUnidentifiedGroups = false)
     {
         try
         {
             return source.ProtocolKind switch
             {
-                MediaSourceProtocol.Local => await ScanLocalSourceAsync(source, cancellationToken),
-                MediaSourceProtocol.WebDav => await ScanWebDavSourceAsync(source, cancellationToken),
-                MediaSourceProtocol.Smb => await ScanSmbSourceAsync(source, cancellationToken),
+                MediaSourceProtocol.Local => await ScanLocalSourceAsync(source, cancellationToken, afterItemIndexed, deferUnidentifiedGroups),
+                MediaSourceProtocol.WebDav => await ScanWebDavSourceAsync(source, cancellationToken, afterItemIndexed, deferUnidentifiedGroups),
+                MediaSourceProtocol.Smb => await ScanSmbSourceAsync(source, cancellationToken, afterItemIndexed, deferUnidentifiedGroups),
+                MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin =>
+                    await ScanMediaServerSourceAsync(source, cancellationToken, afterItemIndexed, deferUnidentifiedGroups),
                 MediaSourceProtocol.Direct => CreateDiagnosticSummary(source, $"已跳过媒体源“{ResolveSourceDisplayName(source)}”：当前版本暂不支持直接链接扫描。"),
                 _ => CreateDiagnosticSummary(source, $"已跳过媒体源“{ResolveSourceDisplayName(source)}”：协议类型无效。")
             };
@@ -166,208 +310,537 @@ public sealed class LibraryScanner : ILibraryScanner
     private async Task<LibraryScanSummary> ScanSourceAsync(
         MediaSource source,
         IReadOnlyList<ScannedVideoFile> scannedFiles,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed = null,
+        bool deferUnidentifiedGroups = false)
     {
         var newMovies = 0;
         var newVideoFiles = 0;
         var removedVideoFiles = 0;
         var newTvShows = 0;
+        var importLocalMetadata = await ShouldImportLocalMetadataAsync(source, cancellationToken);
 
         using var connection = database.OpenConnection();
-        using var transaction = connection.BeginTransaction();
-
         var relativePaths = scannedFiles
             .Select(static file => file.RelativePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, ExistingVideoFileRecord> existingFilesByRelativePath;
 
-        var existingFiles = (await connection.QueryAsync<ExistingVideoFileRecord>(
-            new CommandDefinition(
-                """
-                SELECT id AS Id,
-                       relativePath AS RelativePath,
-                       movieId AS MovieId,
-                       episodeId AS EpisodeId,
-                       playProgress AS PlayProgress,
-                       duration AS Duration
-                FROM videoFile
-                WHERE sourceId = @SourceId
-                """,
-                new { SourceId = source.Id!.Value },
+        {
+            using var transaction = connection.BeginTransaction();
+            var existingFiles = (await connection.QueryAsync<ExistingVideoFileRecord>(
+                new CommandDefinition(
+                    """
+                    SELECT id AS Id,
+                           relativePath AS RelativePath,
+                           movieId AS MovieId,
+                           episodeId AS EpisodeId,
+                           playProgress AS PlayProgress,
+                           duration AS Duration
+                    FROM videoFile
+                    WHERE sourceId = @SourceId
+                    """,
+                    new { SourceId = source.Id!.Value },
+                    transaction,
+                    cancellationToken: cancellationToken))).ToList();
+
+            existingFilesByRelativePath = await NormalizeExistingFilesAsync(
+                connection,
                 transaction,
-                cancellationToken: cancellationToken))).ToList();
+                existingFiles,
+                cancellationToken);
+            removedVideoFiles += existingFiles.Count - existingFilesByRelativePath.Count;
 
-        var existingFilesByRelativePath = await NormalizeExistingFilesAsync(
-            connection,
-            transaction,
-            existingFiles,
-            cancellationToken);
-        removedVideoFiles += existingFiles.Count - existingFilesByRelativePath.Count;
+            foreach (var existingFile in existingFilesByRelativePath.Values.Where(x => !relativePaths.Contains(x.RelativePath)).ToList())
+            {
+                await connection.ExecuteAsync(
+                    new CommandDefinition(
+                        "DELETE FROM videoFile WHERE id = @Id",
+                        new { existingFile.Id },
+                        transaction,
+                        cancellationToken: cancellationToken));
+                removedVideoFiles++;
+                existingFilesByRelativePath.Remove(existingFile.RelativePath);
+            }
 
-        foreach (var existingFile in existingFilesByRelativePath.Values.Where(x => !relativePaths.Contains(x.RelativePath)).ToList())
+            transaction.Commit();
+        }
+
+        var pendingGroups = BuildPendingScanGroups(
+            source,
+            scannedFiles,
+            existingFilesByRelativePath,
+            importLocalMetadata);
+        var groupsToCommit = pendingGroups;
+        if (deferUnidentifiedGroups)
+        {
+            var deferredGroups = pendingGroups
+                .Where(static group => !group.ShouldAttemptAutomaticScrape)
+                .Select(group => new DeferredPendingScanGroup(source, group))
+                .ToList();
+            if (deferredGroups.Count > 0)
+            {
+                lock (deferredUnidentifiedScanLock)
+                {
+                    deferredUnidentifiedScanGroups.AddRange(deferredGroups);
+                }
+            }
+
+            groupsToCommit = pendingGroups
+                .Where(static group => group.ShouldAttemptAutomaticScrape)
+                .ToList();
+        }
+
+        foreach (var group in groupsToCommit)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var commitResult = await UpsertPendingScanGroupAsync(
+                connection,
+                source,
+                group,
+                cancellationToken);
+            newMovies += commitResult.NewMovieCount;
+            newTvShows += commitResult.NewTvShowCount;
+            newVideoFiles += commitResult.NewVideoFileCount;
+
+            if (afterItemIndexed is not null && commitResult.IndexedItem is not null)
+            {
+                await afterItemIndexed(commitResult.IndexedItem, cancellationToken);
+            }
+        }
+
+        using (var transaction = connection.BeginTransaction())
         {
             await connection.ExecuteAsync(
                 new CommandDefinition(
-                    "DELETE FROM videoFile WHERE id = @Id",
-                    new { existingFile.Id },
-                    transaction,
+                    "DELETE FROM movie WHERE id NOT IN (SELECT DISTINCT movieId FROM videoFile WHERE movieId IS NOT NULL)",
+                    transaction: transaction,
                     cancellationToken: cancellationToken));
-            removedVideoFiles++;
-            existingFilesByRelativePath.Remove(existingFile.RelativePath);
+            await connection.ExecuteAsync(
+                new CommandDefinition(
+                    "DELETE FROM tvShow WHERE id NOT IN (SELECT DISTINCT episodeId FROM videoFile WHERE episodeId IS NOT NULL)",
+                    transaction: transaction,
+                    cancellationToken: cancellationToken));
+            transaction.Commit();
         }
+
+        return new LibraryScanSummary(1, newMovies, newVideoFiles, removedVideoFiles, newTvShows);
+    }
+
+    private IReadOnlyList<PendingScanGroup> BuildPendingScanGroups(
+        MediaSource source,
+        IReadOnlyList<ScannedVideoFile> scannedFiles,
+        IReadOnlyDictionary<string, ExistingVideoFileRecord> existingFilesByRelativePath,
+        bool importLocalMetadata)
+    {
+        List<string> orderedKeys = [];
+        Dictionary<string, PendingScanGroup> groups = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> seenScannedPaths = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (var scannedFile in scannedFiles)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (!seenScannedPaths.Add(scannedFile.RelativePath))
+            {
+                continue;
+            }
 
             var metadata = MediaNameParser.ExtractSearchMetadata(scannedFile.MetadataPath);
-            var isTv = MediaNameParser.IsLikelyTvEpisodePath(scannedFile.RelativePath);
-            var hasExistingFile = existingFilesByRelativePath.TryGetValue(scannedFile.RelativePath, out var existingFile);
+            var isTv = string.Equals(scannedFile.MediaType, "tv", StringComparison.OrdinalIgnoreCase) ||
+                       MediaNameParser.IsLikelyTvEpisodePath(scannedFile.RelativePath) ||
+                       MediaNameParser.IsLikelyTvEpisodePath(scannedFile.FileName);
+            existingFilesByRelativePath.TryGetValue(scannedFile.RelativePath, out var existingFile);
 
             if (isTv)
             {
-                var showTitle = ResolveShowTitle(scannedFile.MetadataPath, scannedFile.RelativePath, metadata);
-                var tvShowId = CreateSyntheticEntityId("tv", source.Id!.Value, showTitle);
+                var localShowMetadata = importLocalMetadata
+                    ? localMetadataSidecarService?.ReadTvShowMetadata(scannedFile.MetadataPath)
+                    : null;
+                var localEpisodeMetadata = importLocalMetadata
+                    ? localMetadataSidecarService?.ReadEpisodeMetadata(scannedFile.MetadataPath)
+                    : null;
+                var importedTitle = NormalizeText(localShowMetadata?.Title);
+                var resolvedShowTitle = ResolveShowTitle(
+                    scannedFile.MetadataPath,
+                    scannedFile.RelativePath,
+                    scannedFile.FileName,
+                    source.ProtocolKind,
+                    metadata);
+                var shouldAttemptAutomaticScrape = importedTitle is not null || resolvedShowTitle is not null;
+                var showTitle = importedTitle
+                    ?? resolvedShowTitle
+                    ?? ResolveFallbackDisplayTitle(scannedFile.RelativePath, scannedFile.FileName, isTv: true);
 
-                if (await EnsureTvShowAsync(
-                        connection,
-                        transaction,
+                if (!shouldAttemptAutomaticScrape)
+                {
+                    var unidentifiedMovieId = existingFile?.MovieId
+                                              ?? CreateSyntheticEntityId(
+                                                  "unidentified-tv",
+                                                  source.Id!.Value,
+                                                  showTitle.ToLowerInvariant());
+                    var unidentifiedMovieGroupKey = $"movie:{unidentifiedMovieId}";
+                    if (!groups.TryGetValue(unidentifiedMovieGroupKey, out var unidentifiedMovieGroup))
+                    {
+                        unidentifiedMovieGroup = new PendingScanGroup(
+                            "movie",
+                            unidentifiedMovieId,
+                            showTitle,
+                            metadata: null,
+                            shouldAttemptAutomaticScrape: false);
+                        groups[unidentifiedMovieGroupKey] = unidentifiedMovieGroup;
+                        orderedKeys.Add(unidentifiedMovieGroupKey);
+                    }
+
+                    unidentifiedMovieGroup.Files.Add(new PendingScanFile(scannedFile, existingFile, null));
+                    continue;
+                }
+
+                var tvShowId = CreateSyntheticEntityId(
+                    "tv",
+                    source.Id!.Value,
+                    showTitle);
+                var groupKey = $"tv:{tvShowId}";
+                if (!groups.TryGetValue(groupKey, out var group))
+                {
+                    group = new PendingScanGroup(
+                        "tv",
                         tvShowId,
                         showTitle,
-                        existingFile?.EpisodeId,
-                        cancellationToken))
+                        localShowMetadata,
+                        shouldAttemptAutomaticScrape,
+                        existingFile?.EpisodeId);
+                    groups[groupKey] = group;
+                    orderedKeys.Add(groupKey);
+                }
+                else if (group.Metadata is null && localShowMetadata is not null)
                 {
-                    newTvShows++;
+                    group.Metadata = localShowMetadata;
+                }
+                if (group.CopyFromTvShowId is null && existingFile?.EpisodeId is not null)
+                {
+                    group.CopyFromTvShowId = existingFile.EpisodeId;
                 }
 
-                if (hasExistingFile)
-                {
-                    await UpdateExistingVideoFileAsync(
-                        connection,
-                        transaction,
-                        existingFile!,
-                        scannedFile,
-                        "tv",
-                        movieId: null,
-                        episodeId: tvShowId,
-                        cancellationToken);
-                    continue;
-                }
-
-                await connection.ExecuteAsync(
-                    new CommandDefinition(
-                        """
-                        INSERT INTO videoFile (id, sourceId, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
-                        VALUES (@Id, @SourceId, @RelativePath, @FileName, 'tv', NULL, @EpisodeId, 0, 0)
-                        """,
-                        new
-                        {
-                            Id = Guid.NewGuid().ToString(),
-                            SourceId = source.Id!.Value,
-                            RelativePath = scannedFile.RelativePath,
-                            FileName = scannedFile.FileName,
-                            EpisodeId = tvShowId
-                        },
-                        transaction,
-                        cancellationToken: cancellationToken));
+                group.Files.Add(new PendingScanFile(scannedFile, existingFile, localEpisodeMetadata));
+                continue;
             }
-            else
+
+            var localMovieMetadata = importLocalMetadata
+                ? localMetadataSidecarService?.ReadMovieMetadata(scannedFile.MetadataPath)
+                : null;
+            var importedMovieTitle = NormalizeText(localMovieMetadata?.Title);
+            var resolvedMovieTitle = ResolveMovieTitle(scannedFile.MetadataPath, scannedFile.FileName, metadata);
+            var shouldAttemptMovieScrape = importedMovieTitle is not null || resolvedMovieTitle is not null;
+            var movieTitle = importedMovieTitle
+                ?? resolvedMovieTitle
+                ?? ResolveFallbackDisplayTitle(scannedFile.RelativePath, scannedFile.FileName, isTv: false);
+
+            var movieId = existingFile?.MovieId
+                          ?? CreateSyntheticEntityId(
+                              shouldAttemptMovieScrape ? "movie" : "unidentified-movie",
+                              source.Id!.Value,
+                              shouldAttemptMovieScrape
+                                  ? GetMovieGroupingKey(scannedFile.RelativePath, movieTitle)
+                                  : scannedFile.RelativePath);
+            var movieGroupKey = $"movie:{movieId}";
+            if (!groups.TryGetValue(movieGroupKey, out var movieGroup))
             {
-                var movieTitle = ResolveMovieTitle(scannedFile.MetadataPath, metadata);
-                if (hasExistingFile && existingFile!.MovieId.HasValue)
-                {
-                    await UpdateUnenrichedMoviePlaceholderAsync(
-                        connection,
-                        transaction,
-                        existingFile.MovieId.Value,
-                        movieTitle,
-                        cancellationToken);
-                    await UpdateExistingVideoFileAsync(
-                        connection,
-                        transaction,
-                        existingFile,
-                        scannedFile,
-                        "movie",
-                        existingFile.MovieId,
-                        episodeId: null,
-                        cancellationToken);
-                    continue;
-                }
-
-                var movieId = CreateSyntheticEntityId("movie", source.Id!.Value, GetMovieGroupingKey(scannedFile.RelativePath, movieTitle));
-                var existingMovie = await connection.ExecuteScalarAsync<long?>(
-                    new CommandDefinition(
-                        "SELECT id FROM movie WHERE id = @Id LIMIT 1",
-                        new { Id = movieId },
-                        transaction,
-                        cancellationToken: cancellationToken));
-
-                if (!existingMovie.HasValue)
-                {
-                    await connection.ExecuteAsync(
-                        new CommandDefinition(
-                            """
-                            INSERT INTO movie (id, title, releaseDate, overview, posterPath, voteAverage, isLocked)
-                            VALUES (@Id, @Title, @ReleaseDate, NULL, NULL, NULL, 0)
-                            """,
-                            new
-                            {
-                                Id = movieId,
-                                Title = movieTitle,
-                                ReleaseDate = (string?)null
-                            },
-                            transaction,
-                            cancellationToken: cancellationToken));
-                    newMovies++;
-                }
-
-                if (hasExistingFile)
-                {
-                    await UpdateExistingVideoFileAsync(
-                        connection,
-                        transaction,
-                        existingFile!,
-                        scannedFile,
-                        "movie",
-                        movieId,
-                        episodeId: null,
-                        cancellationToken);
-                    continue;
-                }
-
-                await connection.ExecuteAsync(
-                    new CommandDefinition(
-                        """
-                        INSERT INTO videoFile (id, sourceId, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
-                        VALUES (@Id, @SourceId, @RelativePath, @FileName, 'movie', @MovieId, NULL, 0, 0)
-                        """,
-                        new
-                        {
-                            Id = Guid.NewGuid().ToString(),
-                            SourceId = source.Id!.Value,
-                            RelativePath = scannedFile.RelativePath,
-                            FileName = scannedFile.FileName,
-                            MovieId = movieId
-                        },
-                        transaction,
-                        cancellationToken: cancellationToken));
+                movieGroup = new PendingScanGroup("movie", movieId, movieTitle, localMovieMetadata, shouldAttemptMovieScrape);
+                groups[movieGroupKey] = movieGroup;
+                orderedKeys.Add(movieGroupKey);
+            }
+            else if (movieGroup.Metadata is null && localMovieMetadata is not null)
+            {
+                movieGroup.Metadata = localMovieMetadata;
             }
 
-            newVideoFiles++;
+            movieGroup.Files.Add(new PendingScanFile(scannedFile, existingFile, null));
         }
 
-        await connection.ExecuteAsync(
-            new CommandDefinition(
-                "DELETE FROM movie WHERE id NOT IN (SELECT DISTINCT movieId FROM videoFile WHERE movieId IS NOT NULL)",
-                transaction: transaction,
-                cancellationToken: cancellationToken));
-        await connection.ExecuteAsync(
-            new CommandDefinition(
-                "DELETE FROM tvShow WHERE id NOT IN (SELECT DISTINCT episodeId FROM videoFile WHERE episodeId IS NOT NULL)",
-                transaction: transaction,
-                cancellationToken: cancellationToken));
+        var orderedGroups = orderedKeys.Select(key => groups[key]).ToList();
+        return orderedGroups
+            .Where(static group => group.ShouldAttemptAutomaticScrape)
+            .Concat(orderedGroups.Where(static group => !group.ShouldAttemptAutomaticScrape))
+            .ToList();
+    }
+
+    private async Task<PendingScanGroupCommitResult> UpsertPendingScanGroupAsync(
+        System.Data.IDbConnection connection,
+        MediaSource source,
+        PendingScanGroup group,
+        CancellationToken cancellationToken)
+    {
+        using var transaction = connection.BeginTransaction();
+        var newMovies = 0;
+        var newTvShows = 0;
+        var newVideoFiles = 0;
+
+        if (group.IsTvShow)
+        {
+            if (await EnsureTvShowAsync(
+                    connection,
+                    transaction,
+                    group.EntityId,
+                    group.Title,
+                    group.CopyFromTvShowId,
+                    !group.ShouldAttemptAutomaticScrape,
+                    group.ShouldAttemptAutomaticScrape ? null : "未能自动识别影视名称，可手动重新匹配。",
+                    cancellationToken))
+            {
+                newTvShows++;
+            }
+
+            if (group.Metadata is not null)
+            {
+                await ApplyLocalTvShowMetadataAsync(
+                    connection,
+                    transaction,
+                    group.EntityId,
+                    group.Metadata,
+                    cancellationToken);
+            }
+
+            foreach (var file in group.Files)
+            {
+                if (file.ExistingFile is not null)
+                {
+                    await UpdateExistingVideoFileAsync(
+                        connection,
+                        transaction,
+                        file.ExistingFile,
+                        file.ScannedFile,
+                        "tv",
+                        movieId: null,
+                        episodeId: group.EntityId,
+                        cancellationToken,
+                        file.EpisodeMetadata);
+                    continue;
+                }
+
+                await connection.ExecuteAsync(
+                    new CommandDefinition(
+                        """
+                        INSERT INTO videoFile (
+                            id,
+                            sourceId,
+                            metadataPath,
+                            relativePath,
+                            fileName,
+                            mediaType,
+                            movieId,
+                            episodeId,
+                            playProgress,
+                            duration,
+                            customSeasonNumber,
+                            customEpisodeNumber,
+                            customEpisodeSubtitle,
+                            customEpisodeThumbnailPath)
+                        VALUES (
+                            @Id,
+                            @SourceId,
+                            @MetadataPath,
+                            @RelativePath,
+                            @FileName,
+                            'tv',
+                            NULL,
+                            @EpisodeId,
+                            0,
+                            0,
+                            @CustomSeasonNumber,
+                            @CustomEpisodeNumber,
+                            @CustomEpisodeSubtitle,
+                            @CustomEpisodeThumbnailPath)
+                        """,
+                        new
+                        {
+                            Id = Guid.NewGuid().ToString(),
+                            SourceId = source.Id!.Value,
+                            MetadataPath = file.ScannedFile.MetadataPath,
+                            RelativePath = file.ScannedFile.RelativePath,
+                            FileName = file.ScannedFile.FileName,
+                            EpisodeId = group.EntityId,
+                            CustomSeasonNumber = file.EpisodeMetadata?.SeasonNumber,
+                            CustomEpisodeNumber = file.EpisodeMetadata?.EpisodeNumber,
+                            CustomEpisodeSubtitle = NormalizeText(file.EpisodeMetadata?.Title),
+                            CustomEpisodeThumbnailPath = NormalizeText(file.EpisodeMetadata?.ThumbnailPath)
+                        },
+                        transaction,
+                        cancellationToken: cancellationToken));
+                newVideoFiles++;
+            }
+        }
+        else
+        {
+            var existingMovie = await connection.ExecuteScalarAsync<long?>(
+                new CommandDefinition(
+                    "SELECT id FROM movie WHERE id = @Id LIMIT 1",
+                    new { Id = group.EntityId },
+                    transaction,
+                    cancellationToken: cancellationToken));
+
+            if (!existingMovie.HasValue)
+            {
+                await connection.ExecuteAsync(
+                    new CommandDefinition(
+                        """
+                        INSERT INTO movie (
+                            id,
+                            title,
+                            releaseDate,
+                            overview,
+                            posterPath,
+                            voteAverage,
+                            isLocked,
+                            metadataLanguage)
+                        VALUES (
+                            @Id,
+                            @Title,
+                            @ReleaseDate,
+                            @Overview,
+                            @PosterPath,
+                            @VoteAverage,
+                            @IsLocked,
+                            @MetadataLanguage)
+                        """,
+                        new
+                        {
+                            Id = group.EntityId,
+                            Title = group.Title,
+                            ReleaseDate = NormalizeText(group.Metadata?.Date),
+                            Overview = NormalizeText(group.Metadata?.Overview)
+                                       ?? (group.ShouldAttemptAutomaticScrape ? null : "未能自动识别影视名称，可手动重新匹配。"),
+                            PosterPath = NormalizeText(group.Metadata?.PosterPath),
+                            VoteAverage = group.Metadata?.VoteAverage,
+                            IsLocked = group.Metadata is not null || !group.ShouldAttemptAutomaticScrape ? 1 : 0,
+                            MetadataLanguage = group.Metadata is null ? null : "local"
+                        },
+                        transaction,
+                        cancellationToken: cancellationToken));
+                newMovies++;
+            }
+            else if (group.Metadata is not null)
+            {
+                await ApplyLocalMovieMetadataAsync(
+                    connection,
+                    transaction,
+                    group.EntityId,
+                    group.Metadata with { Title = group.Title },
+                    cancellationToken);
+            }
+            else if (group.Files.Any(static file => file.ExistingFile?.MovieId is not null))
+            {
+                await UpdateUnenrichedMoviePlaceholderAsync(
+                    connection,
+                    transaction,
+                    group.EntityId,
+                    group.Title,
+                    cancellationToken);
+            }
+
+            foreach (var file in group.Files)
+            {
+                if (file.ExistingFile is not null)
+                {
+                    await UpdateExistingVideoFileAsync(
+                        connection,
+                        transaction,
+                        file.ExistingFile,
+                        file.ScannedFile,
+                        "movie",
+                        group.EntityId,
+                        episodeId: null,
+                        cancellationToken);
+                    continue;
+                }
+
+                await connection.ExecuteAsync(
+                    new CommandDefinition(
+                        """
+                        INSERT INTO videoFile (id, sourceId, metadataPath, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
+                        VALUES (@Id, @SourceId, @MetadataPath, @RelativePath, @FileName, 'movie', @MovieId, NULL, 0, 0)
+                        """,
+                        new
+                        {
+                            Id = Guid.NewGuid().ToString(),
+                            SourceId = source.Id!.Value,
+                            MetadataPath = file.ScannedFile.MetadataPath,
+                            RelativePath = file.ScannedFile.RelativePath,
+                            FileName = file.ScannedFile.FileName,
+                            MovieId = group.EntityId
+                        },
+                        transaction,
+                        cancellationToken: cancellationToken));
+                newVideoFiles++;
+            }
+        }
 
         transaction.Commit();
-        return new LibraryScanSummary(1, newMovies, newVideoFiles, removedVideoFiles, newTvShows);
+
+        var shouldIndexExistingPlaceholder =
+            group.ShouldAttemptAutomaticScrape &&
+            newVideoFiles == 0 &&
+            newMovies == 0 &&
+            newTvShows == 0 &&
+            group.EntityId < 0 &&
+            await SyntheticPlaceholderNeedsMetadataAsync(connection, group, cancellationToken);
+
+        var indexedItem = group.ShouldAttemptAutomaticScrape &&
+                          (newVideoFiles > 0 || newMovies > 0 || newTvShows > 0 || shouldIndexExistingPlaceholder)
+            ? new LibraryScanIndexedItem(group.EntityId, group.Title, group.MediaType, group.Files.Count)
+            : null;
+        return new PendingScanGroupCommitResult(newMovies, newTvShows, newVideoFiles, indexedItem);
+    }
+
+    private static async Task<bool> SyntheticPlaceholderNeedsMetadataAsync(
+        System.Data.IDbConnection connection,
+        PendingScanGroup group,
+        CancellationToken cancellationToken)
+    {
+        var sql = group.IsTvShow
+            ? """
+              SELECT COUNT(*)
+              FROM tvShow
+              WHERE id = @Id
+                AND isLocked = 0
+                AND (firstAirDate IS NULL OR TRIM(firstAirDate) = '')
+                AND (overview IS NULL OR TRIM(overview) = '')
+                AND (posterPath IS NULL OR TRIM(posterPath) = '')
+                AND voteAverage IS NULL
+                AND (productionCountryCodes IS NULL OR TRIM(productionCountryCodes) = '')
+                AND (originalLanguage IS NULL OR TRIM(originalLanguage) = '')
+                AND (metadataLanguage IS NULL OR TRIM(metadataLanguage) = '')
+              """
+            : """
+              SELECT COUNT(*)
+              FROM movie
+              WHERE id = @Id
+                AND isLocked = 0
+                AND (releaseDate IS NULL OR TRIM(releaseDate) = '')
+                AND (overview IS NULL OR TRIM(overview) = '')
+                AND (posterPath IS NULL OR TRIM(posterPath) = '')
+                AND voteAverage IS NULL
+                AND (productionCountryCodes IS NULL OR TRIM(productionCountryCodes) = '')
+                AND (originalLanguage IS NULL OR TRIM(originalLanguage) = '')
+                AND (metadataLanguage IS NULL OR TRIM(metadataLanguage) = '')
+              """;
+        var count = await connection.ExecuteScalarAsync<int>(
+            new CommandDefinition(
+                sql,
+                new { Id = group.EntityId },
+                cancellationToken: cancellationToken));
+        return count > 0;
+    }
+
+    private async Task<bool> ShouldImportLocalMetadataAsync(MediaSource source, CancellationToken cancellationToken)
+    {
+        if (source.ProtocolKind != MediaSourceProtocol.Local ||
+            localMetadataSidecarService is null ||
+            settingsService is null)
+        {
+            return false;
+        }
+
+        var settings = await settingsService.LoadAsync(cancellationToken);
+        return settings.LocalMetadata.EnableLocalMetadataImport;
     }
 
     private static async Task<bool> EnsureTvShowAsync(
@@ -376,6 +849,8 @@ public sealed class LibraryScanner : ILibraryScanner
         long tvShowId,
         string title,
         long? copyFromTvShowId,
+        bool isLocked,
+        string? overview,
         CancellationToken cancellationToken)
     {
         var existingShow = await connection.ExecuteScalarAsync<long?>(
@@ -439,12 +914,14 @@ public sealed class LibraryScanner : ILibraryScanner
             new CommandDefinition(
                 """
                 INSERT INTO tvShow (id, title, firstAirDate, overview, posterPath, voteAverage, isLocked)
-                VALUES (@Id, @Title, NULL, NULL, NULL, NULL, 0)
+                VALUES (@Id, @Title, NULL, @Overview, NULL, NULL, @IsLocked)
                 """,
                 new
                 {
                     Id = tvShowId,
-                    Title = title
+                    Title = title,
+                    Overview = NormalizeText(overview),
+                    IsLocked = isLocked ? 1 : 0
                 },
                 transaction,
                 cancellationToken: cancellationToken));
@@ -492,27 +969,38 @@ public sealed class LibraryScanner : ILibraryScanner
         string mediaType,
         long? movieId,
         long? episodeId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        LocalSidecarMetadata? localEpisodeMetadata = null)
     {
         await connection.ExecuteAsync(
             new CommandDefinition(
                 """
                 UPDATE videoFile
-                SET relativePath = @RelativePath,
+                SET metadataPath = @MetadataPath,
+                    relativePath = @RelativePath,
                     fileName = @FileName,
                     mediaType = @MediaType,
                     movieId = @MovieId,
-                    episodeId = @EpisodeId
+                    episodeId = @EpisodeId,
+                    customSeasonNumber = COALESCE(@CustomSeasonNumber, customSeasonNumber),
+                    customEpisodeNumber = COALESCE(@CustomEpisodeNumber, customEpisodeNumber),
+                    customEpisodeSubtitle = COALESCE(@CustomEpisodeSubtitle, customEpisodeSubtitle),
+                    customEpisodeThumbnailPath = COALESCE(@CustomEpisodeThumbnailPath, customEpisodeThumbnailPath)
                 WHERE id = @Id
                 """,
                 new
                 {
                     Id = existingFile.Id,
+                    MetadataPath = scannedFile.MetadataPath,
                     RelativePath = scannedFile.RelativePath,
                     FileName = scannedFile.FileName,
                     MediaType = mediaType,
                     MovieId = movieId,
-                    EpisodeId = episodeId
+                    EpisodeId = episodeId,
+                    CustomSeasonNumber = localEpisodeMetadata?.SeasonNumber,
+                    CustomEpisodeNumber = localEpisodeMetadata?.EpisodeNumber,
+                    CustomEpisodeSubtitle = NormalizeText(localEpisodeMetadata?.Title),
+                    CustomEpisodeThumbnailPath = NormalizeText(localEpisodeMetadata?.ThumbnailPath)
                 },
                 transaction,
                 cancellationToken: cancellationToken));
@@ -520,6 +1008,72 @@ public sealed class LibraryScanner : ILibraryScanner
         existingFile.RelativePath = scannedFile.RelativePath;
         existingFile.MovieId = movieId;
         existingFile.EpisodeId = episodeId;
+    }
+
+    private static async Task ApplyLocalMovieMetadataAsync(
+        System.Data.IDbConnection connection,
+        System.Data.IDbTransaction transaction,
+        long movieId,
+        LocalSidecarMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                """
+                UPDATE movie
+                SET title = COALESCE(@Title, title),
+                    releaseDate = COALESCE(@ReleaseDate, releaseDate),
+                    overview = COALESCE(@Overview, overview),
+                    posterPath = COALESCE(@PosterPath, posterPath),
+                    voteAverage = COALESCE(@VoteAverage, voteAverage),
+                    isLocked = 1,
+                    metadataLanguage = 'local'
+                WHERE id = @Id
+                """,
+                new
+                {
+                    Id = movieId,
+                    Title = NormalizeText(metadata.Title),
+                    ReleaseDate = NormalizeText(metadata.Date),
+                    Overview = NormalizeText(metadata.Overview),
+                    PosterPath = NormalizeText(metadata.PosterPath),
+                    VoteAverage = metadata.VoteAverage
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+    }
+
+    private static async Task ApplyLocalTvShowMetadataAsync(
+        System.Data.IDbConnection connection,
+        System.Data.IDbTransaction transaction,
+        long tvShowId,
+        LocalSidecarMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                """
+                UPDATE tvShow
+                SET title = COALESCE(@Title, title),
+                    firstAirDate = COALESCE(@FirstAirDate, firstAirDate),
+                    overview = COALESCE(@Overview, overview),
+                    posterPath = COALESCE(@PosterPath, posterPath),
+                    voteAverage = COALESCE(@VoteAverage, voteAverage),
+                    isLocked = 1,
+                    metadataLanguage = 'local'
+                WHERE id = @Id
+                """,
+                new
+                {
+                    Id = tvShowId,
+                    Title = NormalizeText(metadata.Title),
+                    FirstAirDate = NormalizeText(metadata.Date),
+                    Overview = NormalizeText(metadata.Overview),
+                    PosterPath = NormalizeText(metadata.PosterPath),
+                    VoteAverage = metadata.VoteAverage
+                },
+                transaction,
+                cancellationToken: cancellationToken));
     }
 
     private static IReadOnlyList<ScannedVideoFile> EnumerateLocalVideoFiles(
@@ -672,6 +1226,12 @@ public sealed class LibraryScanner : ILibraryScanner
         return normalized.TrimStart('/');
     }
 
+    private static string? NormalizeText(string? value)
+    {
+        var trimmed = value?.Trim();
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+
     private static bool TryGetBdmvGroupKey(string relativePath, out string groupKey)
     {
         var normalized = NormalizeRelativePath(relativePath);
@@ -706,24 +1266,43 @@ public sealed class LibraryScanner : ILibraryScanner
         }
     }
 
-    private static string ResolveMovieTitle(string absolutePath, SearchMetadata metadata)
+    private static string? ResolveMovieTitle(string absolutePath, string fileName, SearchMetadata metadata)
     {
-        return metadata.ChineseTitle
-               ?? metadata.ForeignTitle
-               ?? metadata.FullCleanTitle
-               ?? MediaNameParser.CleanedTitleSource(absolutePath);
+        var fileMetadata = MediaNameParser.ExtractSearchMetadata(fileName);
+        return MediaNameParser.ExtractedDisplayTitle(absolutePath, fileName)
+               ?? UsableTitle(metadata.ChineseTitle)
+               ?? UsableTitle(metadata.ForeignTitle)
+               ?? UsableTitle(fileMetadata.ChineseTitle)
+               ?? UsableTitle(fileMetadata.ForeignTitle)
+               ?? UsableTitle(metadata.FullCleanTitle)
+               ?? UsableTitle(fileMetadata.FullCleanTitle);
     }
 
-    private static string ResolveShowTitle(string absolutePath, string relativePath, SearchMetadata metadata)
+    private static string? ResolveShowTitle(
+        string absolutePath,
+        string relativePath,
+        string fileName,
+        MediaSourceProtocol? sourceProtocol,
+        SearchMetadata metadata)
     {
-        return ResolveShowTitleFromRelativePath(relativePath)
-               ?? metadata.ChineseTitle
-               ?? metadata.ForeignTitle
-               ?? MediaNameParser.CleanedTitleSource(absolutePath);
+        var fileMetadata = MediaNameParser.ExtractSearchMetadata(fileName);
+        return ResolveShowTitleFromRelativePath(relativePath, sourceProtocol)
+               ?? MediaNameParser.ExtractedDisplayTitle(relativePath, fileName)
+               ?? UsableTitle(metadata.ChineseTitle)
+               ?? UsableTitle(metadata.ForeignTitle)
+               ?? UsableTitle(metadata.FullCleanTitle)
+               ?? UsableTitle(fileMetadata.ChineseTitle)
+               ?? UsableTitle(fileMetadata.ForeignTitle)
+               ?? UsableTitle(fileMetadata.FullCleanTitle);
     }
 
-    private static string? ResolveShowTitleFromRelativePath(string relativePath)
+    private static string? ResolveShowTitleFromRelativePath(string relativePath, MediaSourceProtocol? sourceProtocol)
     {
+        if (sourceProtocol is MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin)
+        {
+            return null;
+        }
+
         var normalized = NormalizeRelativePath(relativePath);
         var parts = normalized
             .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -744,6 +1323,73 @@ public sealed class LibraryScanner : ILibraryScanner
         return CleanShowFolderTitle(parentFolder);
     }
 
+    private static string ResolveFallbackDisplayTitle(string relativePath, string fileName, bool isTv)
+    {
+        var normalizedPath = NormalizeRelativePath(relativePath).Trim();
+        var parts = normalizedPath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var bdmvIndex = Array.FindIndex(parts, static part => part.Equals("BDMV", StringComparison.OrdinalIgnoreCase));
+        if (bdmvIndex > 0)
+        {
+            return SanitizeFallbackTitle(parts[bdmvIndex - 1], fileName);
+        }
+
+        var streamIndex = Array.FindIndex(parts, static part => part.Equals("STREAM", StringComparison.OrdinalIgnoreCase));
+        if (streamIndex > 1)
+        {
+            return SanitizeFallbackTitle(parts[streamIndex - 2], fileName);
+        }
+
+        if (isTv)
+        {
+            var showFolderTitle = ResolveFallbackShowFolderTitle(parts);
+            if (!string.IsNullOrWhiteSpace(showFolderTitle))
+            {
+                return showFolderTitle;
+            }
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        return SanitizeFallbackTitle(stem, string.IsNullOrWhiteSpace(normalizedPath) ? fileName : normalizedPath);
+    }
+
+    private static string? ResolveFallbackShowFolderTitle(IReadOnlyList<string> pathParts)
+    {
+        if (pathParts.Count < 2)
+        {
+            return null;
+        }
+
+        var parent = pathParts[^2];
+        if (IsSeasonFolderName(parent) && pathParts.Count >= 3)
+        {
+            return SanitizeFallbackTitle(pathParts[^3], parent);
+        }
+
+        return SanitizeFallbackTitle(parent, pathParts[^1]);
+    }
+
+    private static string SanitizeFallbackTitle(string? value, string fallback)
+    {
+        var cleaned = Regex.Replace(value ?? string.Empty, @"[._]+", " ");
+        cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
+        if (!string.IsNullOrWhiteSpace(cleaned))
+        {
+            return cleaned;
+        }
+
+        var fallbackStem = Path.GetFileNameWithoutExtension(fallback);
+        if (string.IsNullOrWhiteSpace(fallbackStem))
+        {
+            fallbackStem = fallback;
+        }
+
+        fallbackStem = Regex.Replace(fallbackStem ?? string.Empty, @"[._]+", " ");
+        fallbackStem = Regex.Replace(fallbackStem, @"\s+", " ").Trim();
+        return string.IsNullOrWhiteSpace(fallbackStem) ? "未识别视频" : fallbackStem;
+    }
+
     private static string? CleanShowFolderTitle(string folderName)
     {
         if (string.IsNullOrWhiteSpace(folderName))
@@ -753,11 +1399,16 @@ public sealed class LibraryScanner : ILibraryScanner
 
         var trimmed = folderName.Trim();
         var metadata = MediaNameParser.ExtractSearchMetadata(trimmed);
-        return ExtractPrimaryCjkTitleSegment(metadata.FullCleanTitle)
-               ?? metadata.ChineseTitle
-               ?? metadata.ForeignTitle
-               ?? metadata.FullCleanTitle
-               ?? trimmed;
+        return UsableTitle(ExtractPrimaryCjkTitleSegment(metadata.FullCleanTitle))
+               ?? UsableTitle(metadata.ChineseTitle)
+               ?? UsableTitle(metadata.ForeignTitle)
+               ?? UsableTitle(metadata.FullCleanTitle)
+               ?? UsableTitle(trimmed);
+    }
+
+    private static string? UsableTitle(string? title)
+    {
+        return MediaNameParser.IsUsableLibraryDisplayTitle(title) ? title!.Trim() : null;
     }
 
     private static string? ExtractPrimaryCjkTitleSegment(string? title)
@@ -856,6 +1507,54 @@ public sealed class LibraryScanner : ILibraryScanner
         public double Duration { get; set; }
     }
 
+    private sealed class PendingScanGroup
+    {
+        public PendingScanGroup(
+            string mediaType,
+            long entityId,
+            string title,
+            LocalSidecarMetadata? metadata,
+            bool shouldAttemptAutomaticScrape = true,
+            long? copyFromTvShowId = null)
+        {
+            MediaType = mediaType;
+            EntityId = entityId;
+            Title = title;
+            Metadata = metadata;
+            ShouldAttemptAutomaticScrape = shouldAttemptAutomaticScrape;
+            CopyFromTvShowId = copyFromTvShowId;
+        }
+
+        public string MediaType { get; }
+
+        public long EntityId { get; }
+
+        public string Title { get; }
+
+        public LocalSidecarMetadata? Metadata { get; set; }
+
+        public bool ShouldAttemptAutomaticScrape { get; }
+
+        public long? CopyFromTvShowId { get; set; }
+
+        public List<PendingScanFile> Files { get; } = [];
+
+        public bool IsTvShow => string.Equals(MediaType, "tv", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed record PendingScanFile(
+        ScannedVideoFile ScannedFile,
+        ExistingVideoFileRecord? ExistingFile,
+        LocalSidecarMetadata? EpisodeMetadata);
+
+    private sealed record DeferredPendingScanGroup(MediaSource Source, PendingScanGroup Group);
+
+    private sealed record PendingScanGroupCommitResult(
+        int NewMovieCount,
+        int NewTvShowCount,
+        int NewVideoFileCount,
+        LibraryScanIndexedItem? IndexedItem);
+
     private static IReadOnlyList<ScannedVideoFile> ResolvePrimaryVideoFiles(IReadOnlyList<ScannedVideoFile> scannedFiles)
     {
         List<ScannedVideoFile> normalFiles = [];
@@ -914,6 +1613,7 @@ public sealed class LibraryScanner : ILibraryScanner
         string MetadataPath,
         string RelativePath,
         string FileName,
-        long FileSize);
+        long FileSize,
+        string? MediaType = null);
 
 }

@@ -17,6 +17,7 @@ class ThumbnailManager: ObservableObject {
         let tmdbTVId: Int64?
         let season: Int
         let episode: Int
+        let sourceId: Int64
     }
 
     private struct TMDBSeasonSummary {
@@ -26,6 +27,9 @@ class ThumbnailManager: ObservableObject {
 
     private var webFetchQueue: [EpisodeThumbnailTask] = []
     private var isFetching = false
+    private var currentFetchTask: Task<Void, Never>? = nil
+    private var currentFetchSourceID: Int64? = nil
+    private var currentFetchID: UUID? = nil
     private var failedTMDBFileIDs: Set<String>
     private let failedTMDBStoreKey = "ThumbnailTMDBFailedFileIDs"
     private let failedTMDBMappingVersionKey = "ThumbnailTMDBMappingVersion"
@@ -49,10 +53,34 @@ class ThumbnailManager: ObservableObject {
     }
     
     func startBatchWebFetch(tasks: [(String, String, Int64?, Int, Int)], forceRetry: Bool = false) {
-        let typedTasks = tasks.map {
-            EpisodeThumbnailTask(fileId: $0.0, title: $0.1, tmdbTVId: $0.2, season: $0.3, episode: $0.4)
+        DispatchQueue.global(qos: .background).async {
+            guard let queue = AppDatabase.shared.dbQueue else { return }
+            let typedTasks: [EpisodeThumbnailTask]
+            do {
+                typedTasks = try queue.read { db in
+                    try tasks.compactMap { task in
+                        guard let sourceId = try Int64.fetchOne(
+                            db,
+                            sql: "SELECT sourceId FROM videoFile WHERE id = ?",
+                            arguments: [task.0]
+                        ) else {
+                            return nil
+                        }
+                        return EpisodeThumbnailTask(
+                            fileId: task.0,
+                            title: task.1,
+                            tmdbTVId: task.2,
+                            season: task.3,
+                            episode: task.4,
+                            sourceId: sourceId
+                        )
+                    }
+                }
+            } catch {
+                return
+            }
+            self.startBatchWebFetch(tasks: typedTasks, forceRetry: forceRetry)
         }
-        startBatchWebFetch(tasks: typedTasks, forceRetry: forceRetry)
     }
 
     private func startBatchWebFetch(tasks: [EpisodeThumbnailTask], forceRetry: Bool = false) {
@@ -77,18 +105,42 @@ class ThumbnailManager: ObservableObject {
             if !self.isFetching { self.processNextWebFetch() }
         }
     }
+
+    func cancelTasks(forSourceID sourceID: Int64) {
+        DispatchQueue.global(qos: .background).async {
+            self.webFetchQueue.removeAll { $0.sourceId == sourceID }
+            guard self.currentFetchSourceID == sourceID else { return }
+            self.currentFetchTask?.cancel()
+            self.currentFetchTask = nil
+            self.currentFetchSourceID = nil
+            self.currentFetchID = nil
+            self.isFetching = false
+            DispatchQueue.main.async {
+                self.progressMessage = ""
+            }
+            if !self.webFetchQueue.isEmpty {
+                self.processNextWebFetch()
+            }
+        }
+    }
     
     private func processNextWebFetch() {
         guard !webFetchQueue.isEmpty else {
+            isFetching = false
+            currentFetchTask = nil
+            currentFetchSourceID = nil
+            currentFetchID = nil
             DispatchQueue.main.async {
                 self.progressMessage = ""
-                self.isFetching = false
             }
             return
         }
         
         isFetching = true
         let task = webFetchQueue.removeFirst()
+        let fetchID = UUID()
+        currentFetchID = fetchID
+        currentFetchSourceID = task.sourceId
         let fileId = task.fileId
         let title = task.title
         let season = task.season
@@ -98,7 +150,11 @@ class ThumbnailManager: ObservableObject {
             self.progressMessage = "获取剧照: \(title) S\(String(format: "%02d", season))E\(String(format: "%02d", episode))"
         }
         
-        Task {
+        let fetchTask = Task {
+            guard !Task.isCancelled, await self.sourceExists(task.sourceId) else {
+                self.finishCurrentFetch(fetchID: fetchID)
+                return
+            }
             // 1. 先尝试向 TMDB 请求官方剧照
             let tmdbSuccess = await fetchFromTMDB(
                 fileId: fileId,
@@ -107,13 +163,26 @@ class ThumbnailManager: ObservableObject {
                 season: season,
                 episode: episode
             )
-            if tmdbSuccess {
-                clearTMDBFailure(for: fileId)
-            } else {
-                markTMDBFailure(for: fileId)
+            if !Task.isCancelled, await self.sourceExists(task.sourceId) {
+                if tmdbSuccess {
+                    clearTMDBFailure(for: fileId)
+                } else {
+                    markTMDBFailure(for: fileId)
+                }
             }
             
             try? await Task.sleep(nanoseconds: 1_000_000_000) // 延迟防封IP
+            self.finishCurrentFetch(fetchID: fetchID)
+        }
+        currentFetchTask = fetchTask
+    }
+
+    private func finishCurrentFetch(fetchID: UUID) {
+        DispatchQueue.global(qos: .background).async {
+            guard self.currentFetchID == fetchID else { return }
+            self.currentFetchTask = nil
+            self.currentFetchSourceID = nil
+            self.currentFetchID = nil
             self.processNextWebFetch()
         }
     }
@@ -160,6 +229,10 @@ class ThumbnailManager: ObservableObject {
             
             let localFileURL = thumbDirectory.appendingPathComponent("\(fileId).jpg")
             try imageData.write(to: localFileURL, options: .atomic)
+
+            if UserDefaults.standard.bool(forKey: "enableLocalMetadataExport") {
+                await exportLocalSidecarThumbnail(fileId: fileId, thumbnailURL: localFileURL)
+            }
             
             await MainActor.run {
                 NotificationCenter.default.post(name: NSNotification.Name("ThumbnailGenerated_\(fileId)"), object: nil)
@@ -168,6 +241,21 @@ class ThumbnailManager: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    private func exportLocalSidecarThumbnail(fileId: String, thumbnailURL: URL) async {
+        guard let queue = AppDatabase.shared.dbQueue else { return }
+        let snapshot = try? await queue.read { db -> (VideoFile, MediaSource)? in
+            guard let file = try VideoFile.fetchOne(db, key: fileId),
+                  let source = try MediaSource.fetchOne(db, key: file.sourceId) else {
+                return nil
+            }
+            return (file, source)
+        }
+        guard let (file, source) = snapshot, source.protocolKind == .local else { return }
+        let videoURL = URL(fileURLWithPath: MediaSourceProtocol.local.normalizedBaseURL(source.baseUrl))
+            .appendingPathComponent(file.relativePath)
+        LocalMetadataSidecarStore.shared.exportEpisodeThumbnail(sourceURL: thumbnailURL, videoURL: videoURL)
     }
 
     private func fetchMappedEpisodeStillPath(tvId: Int, season: Int, episode: Int, language: String) async -> String? {
@@ -303,6 +391,22 @@ class ThumbnailManager: ObservableObject {
         thumbDirectory.appendingPathComponent("\(fileId).jpg")
     }
 
+    private func sourceExists(_ sourceID: Int64) async -> Bool {
+        guard let queue = AppDatabase.shared.dbQueue else { return false }
+        do {
+            return try await queue.read { db in
+                let count = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM mediaSource WHERE id = ?",
+                    arguments: [sourceID]
+                ) ?? 0
+                return count > 0
+            }
+        } catch {
+            return false
+        }
+    }
+
     func replaceThumbnail(fileId: String, with sourceURL: URL) throws {
         let destinationURL = thumbnailURL(for: fileId)
         if FileManager.default.fileExists(atPath: destinationURL.path) {
@@ -396,7 +500,8 @@ class ThumbnailManager: ObservableObject {
                     title: movie.title,
                     tmdbTVId: movie.id ?? movieId,
                     season: resolvedInfo.season,
-                    episode: resolvedInfo.episode
+                    episode: resolvedInfo.episode,
+                    sourceId: file.sourceId
                 )
             )
         }

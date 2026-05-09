@@ -316,6 +316,118 @@ struct BusinessLogicIntegrationTests {
         #expect(fakeMovie == nil)
     }
 
+    @Test("Scan should surface files whose title cannot be extracted after scrape candidates")
+    func scanSurfacesUnidentifiedFilesWithoutAutoScrape() async throws {
+        let dbURL = makeTempDBURL()
+        defer { cleanupDBFiles(at: dbURL) }
+
+        let libraryRoot = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("omniplay-unidentified-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: libraryRoot) }
+
+        let showDirectory = libraryRoot.appendingPathComponent("Show", isDirectory: true)
+        try FileManager.default.createDirectory(at: showDirectory, withIntermediateDirectories: true)
+        try Data(repeating: 0, count: 32).write(to: showDirectory.appendingPathComponent("S01E01.mp4"))
+
+        let dbQueue = try DatabaseQueue(path: dbURL.path)
+        try await prepareTestSchema(on: dbQueue)
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "INSERT INTO mediaSource (id, name, protocolType, baseUrl) VALUES (?, ?, ?, ?)",
+                arguments: [77, "本地源", "local", libraryRoot.path]
+            )
+        }
+
+        let source = MediaSource(
+            id: 77,
+            name: "本地源",
+            protocolType: MediaSourceProtocol.local.rawValue,
+            baseUrl: libraryRoot.path,
+            authConfig: nil
+        )
+        let manager = MediaLibraryManager(dbQueue: dbQueue)
+        let counter = AsyncCounter()
+
+        let result = await manager.scanLocalSourceWithResult(source) { _ in
+            await counter.increment()
+        }
+
+        let visibleMovies = try manager.fetchAllMovies()
+        let files = try await dbQueue.read { db in
+            try VideoFile.filter(Column("sourceId") == 77).fetchAll(db)
+        }
+        let callbackCount = await counter.value
+
+        #expect(result.isSuccess)
+        #expect(result.insertedCount == 1)
+        #expect(callbackCount == 0)
+        #expect(visibleMovies.count == 1)
+        #expect(visibleMovies.first?.title == "Show")
+        #expect(visibleMovies.first?.isLocked == true)
+        #expect(files.first?.mediaType == "movie")
+    }
+
+    @Test("Scan can defer unidentified files until scraping phase completes")
+    func scanDefersUnidentifiedFilesUntilAfterScrapePhase() async throws {
+        let dbURL = makeTempDBURL()
+        defer { cleanupDBFiles(at: dbURL) }
+
+        let libraryRoot = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("omniplay-deferred-unidentified-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: libraryRoot) }
+
+        let showDirectory = libraryRoot.appendingPathComponent("Show", isDirectory: true)
+        try FileManager.default.createDirectory(at: showDirectory, withIntermediateDirectories: true)
+        try Data(repeating: 0, count: 32).write(to: showDirectory.appendingPathComponent("S01E01.mp4"))
+
+        let dbQueue = try DatabaseQueue(path: dbURL.path)
+        try await prepareTestSchema(on: dbQueue)
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "INSERT INTO mediaSource (id, name, protocolType, baseUrl) VALUES (?, ?, ?, ?)",
+                arguments: [78, "本地源", "local", libraryRoot.path]
+            )
+        }
+
+        let source = MediaSource(
+            id: 78,
+            name: "本地源",
+            protocolType: MediaSourceProtocol.local.rawValue,
+            baseUrl: libraryRoot.path,
+            authConfig: nil
+        )
+        let manager = MediaLibraryManager(dbQueue: dbQueue)
+        let counter = AsyncCounter()
+
+        let result = await manager.scanLocalSourceWithResult(source, deferUnidentifiedGroups: true) { _ in
+            await counter.increment()
+        }
+
+        let moviesBeforeInsert = try manager.fetchAllMovies()
+        let filesBeforeInsert = try await dbQueue.read { db in
+            try VideoFile.filter(Column("sourceId") == 78).fetchAll(db)
+        }
+        let callbackCount = await counter.value
+
+        #expect(result.isSuccess)
+        #expect(result.insertedCount == 0)
+        #expect(callbackCount == 0)
+        #expect(moviesBeforeInsert.isEmpty)
+        #expect(filesBeforeInsert.isEmpty)
+
+        let insertedCount = await manager.insertDeferredUnidentifiedMedia(from: [result])
+        let visibleMovies = try manager.fetchAllMovies()
+        let files = try await dbQueue.read { db in
+            try VideoFile.filter(Column("sourceId") == 78).fetchAll(db)
+        }
+
+        #expect(insertedCount == 1)
+        #expect(visibleMovies.count == 1)
+        #expect(visibleMovies.first?.title == "Show")
+        #expect(visibleMovies.first?.isLocked == true)
+        #expect(files.first?.mediaType == "movie")
+    }
+
     private func prepareTestSchema(on dbQueue: DatabaseQueue) async throws {
         try await dbQueue.write { db in
             try db.create(table: "mediaSource") { t in
@@ -370,5 +482,15 @@ struct BusinessLogicIntegrationTests {
         try? fm.removeItem(atPath: path)
         try? fm.removeItem(atPath: "\(path)-shm")
         try? fm.removeItem(atPath: "\(path)-wal")
+    }
+}
+
+private actor AsyncCounter {
+    private var storage = 0
+
+    var value: Int { storage }
+
+    func increment() {
+        storage += 1
     }
 }

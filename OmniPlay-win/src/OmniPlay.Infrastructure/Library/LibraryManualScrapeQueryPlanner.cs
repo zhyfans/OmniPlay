@@ -11,27 +11,30 @@ internal static class LibraryManualScrapeQueryPlanner
         string? sourceProtocolType,
         string? baseUrl,
         string? relativePath,
-        string? manualQuery = null)
+        string? manualQuery = null,
+        string? fileName = null,
+        string? metadataPath = null)
     {
         var seedQuery = string.IsNullOrWhiteSpace(manualQuery)
             ? currentTitle
             : manualQuery.Trim();
         var seedMetadata = MediaNameParser.ExtractSearchMetadata(seedQuery);
 
-        string? metadataPath = null;
         SearchMetadataSnapshot? pathMetadata = null;
-        if (!string.IsNullOrWhiteSpace(baseUrl) && !string.IsNullOrWhiteSpace(relativePath))
+        var resolvedMetadataPath = ResolveSearchMetadataPath(
+            sourceProtocolType,
+            baseUrl,
+            relativePath,
+            fileName,
+            metadataPath);
+        if (!string.IsNullOrWhiteSpace(resolvedMetadataPath))
         {
-            metadataPath = MediaSourcePathResolver.ResolveMetadataPath(
-                sourceProtocolType,
-                baseUrl,
-                relativePath);
-            var extracted = MediaNameParser.ExtractSearchMetadata(metadataPath);
+            var extracted = MediaNameParser.ExtractSearchMetadata(resolvedMetadataPath);
             pathMetadata = new SearchMetadataSnapshot(
                 extracted.ChineseTitle,
                 extracted.ForeignTitle,
                 extracted.FullCleanTitle,
-                MediaNameParser.ExtractParentFolderChineseTitle(metadataPath));
+                MediaNameParser.ExtractParentFolderChineseTitle(resolvedMetadataPath));
         }
 
         var primaryQuery = seedMetadata.ChineseTitle
@@ -91,6 +94,38 @@ internal static class LibraryManualScrapeQueryPlanner
 
             attempts.Add(new LibraryScrapeQueryAttempt(trimmed, label, secondaryQuery));
         }
+    }
+
+    private static string? ResolveSearchMetadataPath(
+        string? sourceProtocolType,
+        string? baseUrl,
+        string? relativePath,
+        string? fileName,
+        string? metadataPath)
+    {
+        var trimmedMetadataPath = metadataPath?.Trim();
+        if (!string.IsNullOrWhiteSpace(trimmedMetadataPath) &&
+            !MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(trimmedMetadataPath))
+        {
+            return trimmedMetadataPath;
+        }
+
+        var trimmedFileName = fileName?.Trim();
+        if (MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(relativePath) &&
+            !string.IsNullOrWhiteSpace(trimmedFileName))
+        {
+            return trimmedFileName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(baseUrl) && !string.IsNullOrWhiteSpace(relativePath))
+        {
+            return MediaSourcePathResolver.ResolveMetadataPath(
+                sourceProtocolType,
+                baseUrl,
+                relativePath);
+        }
+
+        return string.IsNullOrWhiteSpace(trimmedFileName) ? null : trimmedFileName;
     }
 
     private static IReadOnlyList<string> BuildForeignQueryCandidates(string? foreignTitle)

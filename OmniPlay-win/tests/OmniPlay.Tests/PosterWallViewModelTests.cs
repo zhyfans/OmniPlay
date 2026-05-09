@@ -15,6 +15,31 @@ namespace OmniPlay.Tests;
 public sealed class PosterWallViewModelTests
 {
     [Fact]
+    public void MediaServerProtocolSelection_UsesRecommendedPlexDefaults()
+    {
+        var viewModel = CreateViewModel(
+            new FakeVideoFileRepository(),
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()));
+
+        viewModel.OpenMediaServerPanelCommand.Execute(null);
+
+        Assert.Equal("http://127.0.0.1:32400", viewModel.PendingMediaServerBaseUrl);
+        Assert.Contains("X-Plex-Token", viewModel.PendingMediaServerTokenWatermark, StringComparison.Ordinal);
+        Assert.False(viewModel.PendingMediaServerUsesUserId);
+        Assert.True(viewModel.PendingMediaServerUsesPlex);
+        Assert.Equal("登录 Plex", viewModel.PlexAuthorizeButtonText);
+
+        viewModel.SelectedMediaServerProtocolOption = viewModel.MediaServerProtocolOptions.Single(option => option.Value == "jellyfin");
+
+        Assert.Equal("http://127.0.0.1:8096", viewModel.PendingMediaServerBaseUrl);
+        Assert.True(viewModel.PendingMediaServerUsesUserId);
+        Assert.False(viewModel.PendingMediaServerUsesPlex);
+        Assert.DoesNotContain("X-Plex-Token", viewModel.PendingMediaServerTokenWatermark, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task OpenStandalonePrimaryCommand_ClosesOverlayAndLaunchesStandaloneWindow()
     {
         var filePath = CreateMediaFile();
@@ -630,6 +655,46 @@ public sealed class PosterWallViewModelTests
         await viewModel.OpenPosterEditCommand.ExecuteAsync(poster);
 
         Assert.Equal("movies/流浪地球 2/流浪地球 2.mkv", viewModel.PosterSourceFileText);
+    }
+
+    [Fact]
+    public async Task OpenPosterScrapeAndEditCommands_ShowFileNameForMediaServerEndpoint()
+    {
+        var videoRepository = new FakeVideoFileRepository();
+        videoRepository.MovieFilesById[9] =
+        [
+            new LibraryVideoItem
+            {
+                Id = "jellyfin-movie",
+                FileName = "流浪地球 2.2023.mkv",
+                RelativePath = "Items/46d8cc57db7e62f142e6a68aa3e1bb4a/Download",
+                AbsolutePath = "http://127.0.0.1:8096/Items/46d8cc57db7e62f142e6a68aa3e1bb4a/Download",
+                PlaybackPath = "http://127.0.0.1:8096/Items/46d8cc57db7e62f142e6a68aa3e1bb4a/Download?api_key=token"
+            }
+        ];
+        var viewModel = CreateViewModel(
+            videoRepository,
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()));
+        var poster = new LibraryPosterItem
+        {
+            Id = "movie-9",
+            Title = "错误标题",
+            MediaKind = "电影",
+            MovieId = 9
+        };
+
+        await viewModel.OpenPosterScrapeCommand.ExecuteAsync(poster);
+
+        Assert.Equal("流浪地球 2.2023.mkv", viewModel.PosterSourceFileText);
+        Assert.Equal("流浪地球 2", viewModel.PosterScrapeQuery);
+        Assert.Equal("2023", viewModel.PosterScrapeYear);
+        viewModel.ClosePosterScrapeCommand.Execute(null);
+
+        await viewModel.OpenPosterEditCommand.ExecuteAsync(poster);
+
+        Assert.Equal("流浪地球 2.2023.mkv", viewModel.PosterSourceFileText);
     }
 
     [Fact]
@@ -2021,6 +2086,24 @@ public sealed class PosterWallViewModelTests
             }
 
             return Summary;
+        }
+
+        public async Task<LibraryScanSummary> ScanSourceAsync(
+            long sourceId,
+            CancellationToken cancellationToken = default,
+            Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed = null,
+            bool deferUnidentifiedGroups = false)
+        {
+            return await ScanAllAsync(cancellationToken);
+        }
+
+        public void ClearDeferredUnidentifiedScanGroups()
+        {
+        }
+
+        public Task<LibraryScanSummary> CommitDeferredUnidentifiedScanGroupsAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new LibraryScanSummary(0, 0, 0));
         }
     }
 

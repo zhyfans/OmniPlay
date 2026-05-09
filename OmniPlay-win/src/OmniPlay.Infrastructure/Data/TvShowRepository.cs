@@ -1,6 +1,7 @@
 using Dapper;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models.Entities;
+using OmniPlay.Infrastructure.Library;
 
 namespace OmniPlay.Infrastructure.Data;
 
@@ -37,6 +38,39 @@ public sealed class TvShowRepository : ITvShowRepository
                 ORDER BY tvShow.title COLLATE NOCASE ASC
                 """,
                 cancellationToken: cancellationToken));
-        return shows.ToList();
+        return shows.Where(ShouldExposeShowOnHome).ToList();
+    }
+
+    private static bool ShouldExposeShowOnHome(TvShow show)
+    {
+        if (show.Id >= 0)
+        {
+            return true;
+        }
+
+        if (show.IsLocked)
+        {
+            return true;
+        }
+
+        return MediaNameParser.IsUsableLibraryDisplayTitle(show.Title) &&
+               HasVisibleMetadata(show);
+    }
+
+    private static bool HasVisibleMetadata(TvShow show)
+    {
+        return show.IsLocked ||
+               HasText(show.FirstAirDate) ||
+               HasText(show.Overview) ||
+               HasText(show.PosterPath) ||
+               show.VoteAverage.HasValue ||
+               HasText(show.ProductionCountryCodes) ||
+               HasText(show.OriginalLanguage) ||
+               HasText(show.MetadataLanguage);
+    }
+
+    private static bool HasText(string? value)
+    {
+        return !string.IsNullOrWhiteSpace(value);
     }
 }

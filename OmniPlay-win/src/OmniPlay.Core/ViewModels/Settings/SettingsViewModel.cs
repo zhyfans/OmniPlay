@@ -135,6 +135,12 @@ public partial class SettingsViewModel : ObservableObject
     private bool showMediaSourceRealPath = true;
 
     [ObservableProperty]
+    private bool enableLocalMetadataImport;
+
+    [ObservableProperty]
+    private bool enableLocalMetadataExport;
+
+    [ObservableProperty]
     private bool enableBuiltInPublicTmdbSource = true;
 
     [ObservableProperty]
@@ -204,7 +210,17 @@ public partial class SettingsViewModel : ObservableObject
             AutoScanOnStartup = AutoScanOnStartup,
             ShowMediaSourceRealPath = ShowMediaSourceRealPath,
             Tmdb = BuildTmdbSettings(),
+            LocalMetadata = BuildLocalMetadataSettings(),
             Playback = BuildPlaybackPreferenceSettings()
+        };
+    }
+
+    public LocalMetadataSettings BuildLocalMetadataSettings()
+    {
+        return new LocalMetadataSettings
+        {
+            EnableLocalMetadataImport = EnableLocalMetadataImport,
+            EnableLocalMetadataExport = EnableLocalMetadataExport
         };
     }
 
@@ -348,6 +364,8 @@ public partial class SettingsViewModel : ObservableObject
     {
         AutoScanOnStartup = settings.AutoScanOnStartup;
         ShowMediaSourceRealPath = settings.ShowMediaSourceRealPath;
+        EnableLocalMetadataImport = settings.LocalMetadata.EnableLocalMetadataImport;
+        EnableLocalMetadataExport = settings.LocalMetadata.EnableLocalMetadataExport;
         EnableTmdbMetadataEnrichment = true;
         EnableTmdbPosterDownloads = true;
         EnableTmdbEpisodeThumbnailDownloads = true;

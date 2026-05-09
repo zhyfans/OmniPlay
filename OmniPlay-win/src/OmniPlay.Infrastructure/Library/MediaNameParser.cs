@@ -99,6 +99,42 @@ public static partial class MediaNameParser
         return ExtractBracketedChineseTitle(parentName) ?? ExtractSearchMetadata(parentName).ChineseTitle;
     }
 
+    public static string? ExtractedDisplayTitle(string relativePath, string fileName)
+    {
+        var useFileNameFirst = IsLikelyMediaServerEndpointPath(relativePath);
+        var primary = ExtractSearchMetadata(useFileNameFirst ? fileName : relativePath);
+        var secondary = ExtractSearchMetadata(useFileNameFirst ? relativePath : fileName);
+        var parentChineseTitle = useFileNameFirst ? null : ExtractParentFolderChineseTitle(relativePath);
+
+        var candidates = new[]
+        {
+            primary.ChineseTitle,
+            parentChineseTitle,
+            secondary.ChineseTitle,
+            primary.ForeignTitle,
+            secondary.ForeignTitle,
+            primary.FullCleanTitle,
+            secondary.FullCleanTitle
+        };
+
+        foreach (var candidate in candidates)
+        {
+            var title = UsableDisplayTitle(candidate);
+            if (title is not null && !LooksLikeRawReleaseName(title))
+            {
+                return title;
+            }
+        }
+
+        return null;
+    }
+
+    public static bool IsUsableLibraryDisplayTitle(string? title)
+    {
+        var normalized = UsableDisplayTitle(title);
+        return normalized is not null && !LooksLikeRawReleaseName(normalized);
+    }
+
     public static EpisodeInfo ParseEpisodeInfo(string fileName, int fallbackIndex)
     {
         var episode = fallbackIndex + 1;
@@ -238,6 +274,76 @@ public static partial class MediaNameParser
             .OrderByDescending(static x => string.Concat(x).Length)
             .Select(static x => string.Concat(x).Trim())
             .FirstOrDefault(static x => x.Length > 0);
+    }
+
+    private static string? UsableDisplayTitle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = Regex.Replace(value, @"[._]+", " ");
+        normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
+        if (normalized.Length == 0)
+        {
+            return null;
+        }
+
+        var blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "download",
+            "downloads",
+            "items",
+            "library",
+            "libraries",
+            "media",
+            "movie",
+            "movies",
+            "film",
+            "films",
+            "show",
+            "shows",
+            "series",
+            "tv",
+            "video",
+            "videos",
+            "stream",
+            "bdmv",
+            "plex",
+            "emby",
+            "jellyfin"
+        };
+        if (blocked.Contains(normalized))
+        {
+            return null;
+        }
+
+        if (normalized.All(char.IsDigit))
+        {
+            var compact = normalized.Trim('0');
+            if (normalized.Length < 3 || compact.Length == 0)
+            {
+                return null;
+            }
+        }
+
+        return Regex.IsMatch(normalized, @"[A-Za-z\p{IsCJKUnifiedIdeographs}\d]")
+            ? normalized
+            : null;
+    }
+
+    private static bool LooksLikeRawReleaseName(string value)
+    {
+        return Regex.IsMatch(
+            value,
+            @"(?i)(\b(480p|720p|1080p|2160p|4k|uhd|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|truehd|atmos|dts|hdr|dv)\b|[._]{2,})");
+    }
+
+    private static bool IsLikelyMediaServerEndpointPath(string relativePath)
+    {
+        var normalized = relativePath.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+        return Regex.IsMatch(normalized, @"^(items/[^/]+/download|library/parts/|library/metadata/|video/|videos/)");
     }
 
     private static string? ExtractForeignTitle(IReadOnlyList<string> tokens)

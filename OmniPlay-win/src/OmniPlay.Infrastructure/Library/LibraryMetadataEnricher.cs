@@ -12,11 +12,19 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
 {
     private readonly SqliteDatabase database;
     private readonly ITmdbMetadataClient tmdbMetadataClient;
+    private readonly ISettingsService? settingsService;
+    private readonly ILocalMetadataSidecarService? localMetadataSidecarService;
 
-    public LibraryMetadataEnricher(SqliteDatabase database, ITmdbMetadataClient tmdbMetadataClient)
+    public LibraryMetadataEnricher(
+        SqliteDatabase database,
+        ITmdbMetadataClient tmdbMetadataClient,
+        ISettingsService? settingsService = null,
+        ILocalMetadataSidecarService? localMetadataSidecarService = null)
     {
         this.database = database;
         this.tmdbMetadataClient = tmdbMetadataClient;
+        this.settingsService = settingsService;
+        this.localMetadataSidecarService = localMetadataSidecarService;
     }
 
     public async Task<LibraryMetadataEnrichmentSummary> EnrichMissingMetadataAsync(
@@ -30,13 +38,14 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         }
 
         var state = new EnrichmentState();
+        var localMetadataSettings = await LoadLocalMetadataSettingsAsync(cancellationToken);
         var movies = await LoadMovieCandidatesAsync(movieId: null, cancellationToken);
-        await EnrichMoviesAsync(movies, state, settings, cancellationToken);
+        await EnrichMoviesAsync(movies, state, settings, localMetadataSettings, cancellationToken);
 
         if (!state.EncounteredNetworkError)
         {
             var tvShows = await LoadTvShowCandidatesAsync(tvShowId: null, cancellationToken);
-            await EnrichTvShowsAsync(tvShows, state, settings, cancellationToken);
+            await EnrichTvShowsAsync(tvShows, state, settings, localMetadataSettings, cancellationToken);
         }
 
         return state.ToSummary();
@@ -54,8 +63,9 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         }
 
         var state = new EnrichmentState();
+        var localMetadataSettings = await LoadLocalMetadataSettingsAsync(cancellationToken);
         var movies = await LoadMovieCandidatesAsync(movieId, cancellationToken);
-        await EnrichMoviesAsync(movies, state, settings, cancellationToken);
+        await EnrichMoviesAsync(movies, state, settings, localMetadataSettings, cancellationToken);
         return state.ToSummary();
     }
 
@@ -71,8 +81,9 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         }
 
         var state = new EnrichmentState();
+        var localMetadataSettings = await LoadLocalMetadataSettingsAsync(cancellationToken);
         var tvShows = await LoadTvShowCandidatesAsync(tvShowId, cancellationToken);
-        await EnrichTvShowsAsync(tvShows, state, settings, cancellationToken);
+        await EnrichTvShowsAsync(tvShows, state, settings, localMetadataSettings, cancellationToken);
         return state.ToSummary();
     }
 
@@ -80,6 +91,7 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         IReadOnlyList<MovieMetadataCandidate> candidates,
         EnrichmentState state,
         TmdbSettings settings,
+        LocalMetadataSettings localMetadataSettings,
         CancellationToken cancellationToken)
     {
         foreach (var candidate in candidates.Where(candidate => NeedsMovieRefresh(candidate, settings)))
@@ -92,7 +104,8 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                     candidate.Title,
                     candidate.SourceProtocolType,
                     candidate.BaseUrl,
-                    candidate.RelativePath);
+                    candidate.RelativePath,
+                    fileName: candidate.FileName);
                 var searchYear = ResolveMovieSearchYear(candidate);
                 var match = await tmdbMetadataClient.SearchMovieAsync(
                     lookupTitles,
@@ -118,6 +131,11 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 {
                     state.DownloadedPosters++;
                 }
+
+                if (localMetadataSettings.EnableLocalMetadataExport && result.Metadata is not null)
+                {
+                    await TryExportMovieSidecarAsync(candidate, result.Metadata, cancellationToken);
+                }
             }
             catch (Exception ex) when (ShouldStopOnExternalFailure(ex))
             {
@@ -135,6 +153,7 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         IReadOnlyList<TvShowMetadataCandidate> candidates,
         EnrichmentState state,
         TmdbSettings settings,
+        LocalMetadataSettings localMetadataSettings,
         CancellationToken cancellationToken)
     {
         foreach (var candidate in candidates.Where(candidate => NeedsTvShowRefresh(candidate, settings)))
@@ -147,9 +166,10 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                     candidate.Title,
                     candidate.SourceProtocolType,
                     candidate.BaseUrl,
-                    candidate.RelativePath);
+                    candidate.RelativePath,
+                    fileName: candidate.FileName);
                 var searchYear = ResolveTvShowSearchYear(candidate);
-                var preferredSeason = ResolvePreferredSeason(candidate.RelativePath);
+                var preferredSeason = ResolvePreferredSeason(candidate.RelativePath, candidate.FileName);
                 var match = await tmdbMetadataClient.SearchTvShowAsync(
                     lookupTitles,
                     searchYear,
@@ -180,6 +200,11 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 if (result.DownloadedPoster)
                 {
                     state.DownloadedPosters++;
+                }
+
+                if (localMetadataSettings.EnableLocalMetadataExport && result.Metadata is not null)
+                {
+                    await TryExportTvShowSidecarAsync(candidate, result.Metadata, cancellationToken);
                 }
             }
             catch (Exception ex) when (ShouldStopOnExternalFailure(ex))
@@ -217,6 +242,65 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 match.MediaType,
                 match.Id,
                 cancellationToken);
+    }
+
+    private async Task<LocalMetadataSettings> LoadLocalMetadataSettingsAsync(CancellationToken cancellationToken)
+    {
+        if (settingsService is null)
+        {
+            return new LocalMetadataSettings();
+        }
+
+        var settings = await settingsService.LoadAsync(cancellationToken);
+        return settings.LocalMetadata;
+    }
+
+    private async Task TryExportMovieSidecarAsync(
+        MovieMetadataCandidate candidate,
+        LocalSidecarMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        if (localMetadataSidecarService is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await localMetadataSidecarService.ExportMovieAsync(
+                candidate.SourceProtocolType,
+                candidate.BaseUrl,
+                candidate.RelativePath,
+                metadata,
+                cancellationToken);
+        }
+        catch
+        {
+        }
+    }
+
+    private async Task TryExportTvShowSidecarAsync(
+        TvShowMetadataCandidate candidate,
+        LocalSidecarMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        if (localMetadataSidecarService is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await localMetadataSidecarService.ExportTvShowAsync(
+                candidate.SourceProtocolType,
+                candidate.BaseUrl,
+                candidate.RelativePath,
+                metadata,
+                cancellationToken);
+        }
+        catch
+        {
+        }
     }
 
     private async Task<IReadOnlyList<MovieMetadataCandidate>> LoadMovieCandidatesAsync(
@@ -260,7 +344,14 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                            WHERE vf.movieId = movie.id AND vf.mediaType = 'movie'
                            ORDER BY vf.relativePath COLLATE NOCASE ASC
                            LIMIT 1
-                       ) AS RelativePath
+                       ) AS RelativePath,
+                       (
+                           SELECT vf.fileName
+                           FROM videoFile vf
+                           WHERE vf.movieId = movie.id AND vf.mediaType = 'movie'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS FileName
                 FROM movie
                 WHERE movie.isLocked = 0
                   {filterByMovie}
@@ -315,7 +406,14 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                            WHERE vf.episodeId = tvShow.id AND vf.mediaType = 'tv'
                            ORDER BY vf.relativePath COLLATE NOCASE ASC
                            LIMIT 1
-                       ) AS RelativePath
+                       ) AS RelativePath,
+                       (
+                           SELECT vf.fileName
+                           FROM videoFile vf
+                           WHERE vf.episodeId = tvShow.id AND vf.mediaType = 'tv'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS FileName
                 FROM tvShow
                 WHERE tvShow.isLocked = 0
                   {filterByTvShow}
@@ -343,7 +441,8 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 ResolveDesiredMetadataLanguage(settings.Language),
                 candidate.SourceProtocolType,
                 candidate.BaseUrl,
-                candidate.RelativePath)
+                candidate.RelativePath,
+                candidate.FileName)
             : candidate.Title;
         var newReleaseDate = settings.EnableMetadataEnrichment ? match.ReleaseDate ?? candidate.ReleaseDate : candidate.ReleaseDate;
         var newOverview = settings.EnableMetadataEnrichment ? PreferOverview(match.Overview, candidate.Overview) : candidate.Overview;
@@ -399,7 +498,16 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
 
         return new UpdateResult(
             updatedMetadata,
-            !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) && IsUsableLocalPoster(newPosterPath));
+            !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) && IsUsableLocalPoster(newPosterPath),
+            new LocalSidecarMetadata
+            {
+                Title = newTitle,
+                Date = newReleaseDate,
+                Overview = newOverview,
+                PosterPath = newPosterPath,
+                VoteAverage = newVoteAverage,
+                TmdbId = match.Id
+            });
     }
 
     private async Task<UpdateResult> UpdateTvShowAsync(
@@ -416,7 +524,8 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 ResolveDesiredMetadataLanguage(settings.Language),
                 candidate.SourceProtocolType,
                 candidate.BaseUrl,
-                candidate.RelativePath)
+                candidate.RelativePath,
+                candidate.FileName)
             : candidate.Title;
         var newFirstAirDate = settings.EnableMetadataEnrichment ? match.FirstAirDate ?? candidate.FirstAirDate : candidate.FirstAirDate;
         var newOverview = settings.EnableMetadataEnrichment ? PreferOverview(match.Overview, candidate.Overview) : candidate.Overview;
@@ -472,7 +581,16 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
 
         return new UpdateResult(
             updatedMetadata,
-            !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) && IsUsableLocalPoster(newPosterPath));
+            !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) && IsUsableLocalPoster(newPosterPath),
+            new LocalSidecarMetadata
+            {
+                Title = newTitle,
+                Date = newFirstAirDate,
+                Overview = newOverview,
+                PosterPath = newPosterPath,
+                VoteAverage = newVoteAverage,
+                TmdbId = match.Id
+            });
     }
 
     private static bool NeedsMovieRefresh(MovieMetadataCandidate candidate, TmdbSettings settings)
@@ -506,16 +624,18 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                && File.Exists(posterPath);
     }
 
-    private static int? ResolvePreferredSeason(string? relativePath)
+    private static int? ResolvePreferredSeason(string? relativePath, string? fileName)
     {
-        if (string.IsNullOrWhiteSpace(relativePath))
+        if (string.IsNullOrWhiteSpace(relativePath) && string.IsNullOrWhiteSpace(fileName))
         {
             return null;
         }
 
         return MediaNameParser.ResolvePreferredSeason(
-            relativePath,
-            Path.GetFileName(relativePath) ?? relativePath);
+            relativePath ?? string.Empty,
+            string.IsNullOrWhiteSpace(fileName)
+                ? Path.GetFileName(relativePath) ?? relativePath ?? string.Empty
+                : fileName);
     }
 
     private static string? ResolveMovieSearchYear(MovieMetadataCandidate candidate)
@@ -524,6 +644,12 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         if (!string.IsNullOrWhiteSpace(currentYear))
         {
             return currentYear;
+        }
+
+        var fileNameYear = NormalizeYear(MediaNameParser.ExtractSearchMetadata(candidate.FileName ?? string.Empty).Year);
+        if (!string.IsNullOrWhiteSpace(fileNameYear))
+        {
+            return fileNameYear;
         }
 
         if (string.IsNullOrWhiteSpace(candidate.BaseUrl) ||
@@ -545,6 +671,15 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         if (!string.IsNullOrWhiteSpace(currentYear))
         {
             return currentYear;
+        }
+
+        if (!MediaNameParser.IsLikelyTvEpisodePath(candidate.FileName ?? string.Empty))
+        {
+            var fileNameYear = NormalizeYear(MediaNameParser.ExtractSearchMetadata(candidate.FileName ?? string.Empty).Year);
+            if (!string.IsNullOrWhiteSpace(fileNameYear))
+            {
+                return fileNameYear;
+            }
         }
 
         if (string.IsNullOrWhiteSpace(candidate.BaseUrl) ||
@@ -621,7 +756,8 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         string? MetadataLanguage,
         string? SourceProtocolType,
         string? BaseUrl,
-        string? RelativePath);
+        string? RelativePath,
+        string? FileName);
 
     private sealed record TvShowMetadataCandidate(
         long Id,
@@ -635,9 +771,13 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         string? MetadataLanguage,
         string? SourceProtocolType,
         string? BaseUrl,
-        string? RelativePath);
+        string? RelativePath,
+        string? FileName);
 
-    private sealed record UpdateResult(bool UpdatedMetadata, bool DownloadedPoster);
+    private sealed record UpdateResult(
+        bool UpdatedMetadata,
+        bool DownloadedPoster,
+        LocalSidecarMetadata? Metadata = null);
 
     private sealed class EnrichmentState
     {

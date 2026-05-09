@@ -368,7 +368,21 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
                            WHERE vf.movieId = movie.id AND vf.mediaType = 'movie'
                            ORDER BY vf.relativePath COLLATE NOCASE ASC
                            LIMIT 1
-                       ) AS RelativePath
+                       ) AS RelativePath,
+                       (
+                           SELECT vf.fileName
+                           FROM videoFile vf
+                           WHERE vf.movieId = movie.id AND vf.mediaType = 'movie'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS FileName,
+                       (
+                           SELECT vf.metadataPath
+                           FROM videoFile vf
+                           WHERE vf.movieId = movie.id AND vf.mediaType = 'movie'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS MetadataPath
                 FROM movie
                 WHERE movie.id = @MovieId
                 LIMIT 1
@@ -414,7 +428,21 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
                            WHERE vf.episodeId = tvShow.id AND vf.mediaType = 'tv'
                            ORDER BY vf.relativePath COLLATE NOCASE ASC
                            LIMIT 1
-                       ) AS RelativePath
+                       ) AS RelativePath,
+                       (
+                           SELECT vf.fileName
+                           FROM videoFile vf
+                           WHERE vf.episodeId = tvShow.id AND vf.mediaType = 'tv'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS FileName,
+                       (
+                           SELECT vf.metadataPath
+                           FROM videoFile vf
+                           WHERE vf.episodeId = tvShow.id AND vf.mediaType = 'tv'
+                           ORDER BY vf.relativePath COLLATE NOCASE ASC
+                           LIMIT 1
+                       ) AS MetadataPath
                 FROM tvShow
                 WHERE tvShow.id = @TvShowId
                 LIMIT 1
@@ -689,13 +717,17 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
             manualYear,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
-            candidate.RelativePath);
+            candidate.RelativePath,
+            candidate.FileName,
+            candidate.MetadataPath);
         var attempts = BuildQueryAttempts(
             candidate.Title,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
             candidate.RelativePath,
-            manualQuery);
+            manualQuery,
+            candidate.FileName,
+            candidate.MetadataPath);
         foreach (var attempt in attempts)
         {
             var matches = await tmdbMetadataClient.SearchMovieCandidatesAsync(
@@ -723,19 +755,23 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         string? manualYear,
         CancellationToken cancellationToken)
     {
-        var preferredSeason = ResolvePreferredSeason(candidate.RelativePath);
+        var preferredSeason = ResolvePreferredSeason(candidate.RelativePath, candidate.FileName, candidate.MetadataPath);
         var searchYear = ResolveSearchYear(
             candidate.FirstAirDate,
             manualYear,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
-            candidate.RelativePath);
+            candidate.RelativePath,
+            candidate.FileName,
+            candidate.MetadataPath);
         var attempts = BuildQueryAttempts(
             candidate.Title,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
             candidate.RelativePath,
-            manualQuery);
+            manualQuery,
+            candidate.FileName,
+            candidate.MetadataPath);
         foreach (var attempt in attempts)
         {
             var matches = await tmdbMetadataClient.SearchTvShowCandidatesAsync(
@@ -769,13 +805,17 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
             manualYear,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
-            candidate.RelativePath);
+            candidate.RelativePath,
+            candidate.FileName,
+            candidate.MetadataPath);
         var attempts = BuildQueryAttempts(
             candidate.Title,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
             candidate.RelativePath,
-            manualQuery);
+            manualQuery,
+            candidate.FileName,
+            candidate.MetadataPath);
         foreach (var attempt in attempts)
         {
             var match = await tmdbMetadataClient.SearchMovieAsync(
@@ -801,19 +841,23 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         string? manualYear,
         CancellationToken cancellationToken)
     {
-        var preferredSeason = ResolvePreferredSeason(candidate.RelativePath);
+        var preferredSeason = ResolvePreferredSeason(candidate.RelativePath, candidate.FileName, candidate.MetadataPath);
         var searchYear = ResolveSearchYear(
             candidate.FirstAirDate,
             manualYear,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
-            candidate.RelativePath);
+            candidate.RelativePath,
+            candidate.FileName,
+            candidate.MetadataPath);
         var attempts = BuildQueryAttempts(
             candidate.Title,
             candidate.SourceProtocolType,
             candidate.BaseUrl,
             candidate.RelativePath,
-            manualQuery);
+            manualQuery,
+            candidate.FileName,
+            candidate.MetadataPath);
         foreach (var attempt in attempts)
         {
             var match = await tmdbMetadataClient.SearchTvShowAsync(
@@ -845,7 +889,9 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         string? manualYear,
         string? sourceProtocolType,
         string? baseUrl,
-        string? relativePath)
+        string? relativePath,
+        string? fileName,
+        string? metadataPath)
     {
         if (manualYear is not null)
         {
@@ -858,16 +904,15 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
             return normalizedCurrentYear;
         }
 
-        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(relativePath))
-        {
-            return null;
-        }
-
-        var metadataPath = MediaSourcePathResolver.ResolveMetadataPath(
+        var searchMetadataPath = ResolveSearchMetadataPath(
             sourceProtocolType,
             baseUrl,
-            relativePath);
-        return NormalizeSearchYear(MediaNameParser.ExtractSearchMetadata(metadataPath).Year);
+            relativePath,
+            fileName,
+            metadataPath);
+        return string.IsNullOrWhiteSpace(searchMetadataPath)
+            ? null
+            : NormalizeSearchYear(MediaNameParser.ExtractSearchMetadata(searchMetadataPath).Year);
     }
 
     private static string? NormalizeSearchYear(string? value)
@@ -886,14 +931,50 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         string? sourceProtocolType,
         string? baseUrl,
         string? relativePath,
-        string? manualQuery)
+        string? manualQuery,
+        string? fileName,
+        string? metadataPath)
     {
         return LibraryManualScrapeQueryPlanner.Build(
             currentTitle,
             sourceProtocolType,
             baseUrl,
             relativePath,
-            manualQuery);
+            manualQuery,
+            fileName,
+            metadataPath);
+    }
+
+    private static string? ResolveSearchMetadataPath(
+        string? sourceProtocolType,
+        string? baseUrl,
+        string? relativePath,
+        string? fileName,
+        string? metadataPath)
+    {
+        var trimmedMetadataPath = metadataPath?.Trim();
+        if (!string.IsNullOrWhiteSpace(trimmedMetadataPath) &&
+            !MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(trimmedMetadataPath))
+        {
+            return trimmedMetadataPath;
+        }
+
+        var trimmedFileName = fileName?.Trim();
+        if (MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(relativePath) &&
+            !string.IsNullOrWhiteSpace(trimmedFileName))
+        {
+            return trimmedFileName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(baseUrl) && !string.IsNullOrWhiteSpace(relativePath))
+        {
+            return MediaSourcePathResolver.ResolveMetadataPath(
+                sourceProtocolType,
+                baseUrl,
+                relativePath);
+        }
+
+        return string.IsNullOrWhiteSpace(trimmedFileName) ? null : trimmedFileName;
     }
 
     private static string BuildNoMatchMessage(
@@ -973,16 +1054,22 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
 
-    private static int? ResolvePreferredSeason(string? relativePath)
+    private static int? ResolvePreferredSeason(string? relativePath, string? fileName, string? metadataPath)
     {
-        if (string.IsNullOrWhiteSpace(relativePath))
+        var searchPath = ResolveSearchMetadataPath(
+            null,
+            null,
+            relativePath,
+            fileName,
+            metadataPath);
+        if (string.IsNullOrWhiteSpace(searchPath))
         {
             return null;
         }
 
         return MediaNameParser.ResolvePreferredSeason(
-            relativePath,
-            Path.GetFileName(relativePath) ?? relativePath);
+            searchPath,
+            Path.GetFileName(searchPath) ?? searchPath);
     }
 
     private static bool IsUsableLocalPoster(string? posterPath)
@@ -1017,6 +1104,10 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         public string? BaseUrl { get; init; }
 
         public string? RelativePath { get; init; }
+
+        public string? FileName { get; init; }
+
+        public string? MetadataPath { get; init; }
     }
 
     private sealed class TvShowCandidate
@@ -1044,6 +1135,10 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         public string? BaseUrl { get; init; }
 
         public string? RelativePath { get; init; }
+
+        public string? FileName { get; init; }
+
+        public string? MetadataPath { get; init; }
     }
 
     private sealed record UpdateResult(bool Updated, bool DownloadedPoster);

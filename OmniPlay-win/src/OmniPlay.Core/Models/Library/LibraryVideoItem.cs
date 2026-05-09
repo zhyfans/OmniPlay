@@ -10,14 +10,20 @@ public sealed class LibraryVideoItem
 
     public string RelativePath { get; init; } = string.Empty;
 
+    public string? MetadataPath { get; init; }
+
     public string AbsolutePath { get; init; } = string.Empty;
 
     public string PlaybackPath { get; init; } = string.Empty;
 
+    public string? LocalIsoPlaybackPath { get; init; }
+
     public string EffectivePlaybackPath =>
-        string.IsNullOrWhiteSpace(PlaybackPath)
-            ? AbsolutePath
-            : PlaybackPath;
+        !string.IsNullOrWhiteSpace(LocalIsoPlaybackPath)
+            ? LocalIsoPlaybackPath
+            : string.IsNullOrWhiteSpace(PlaybackPath)
+                ? AbsolutePath
+                : PlaybackPath;
 
     public string? ThumbnailPath { get; init; }
 

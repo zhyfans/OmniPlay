@@ -88,6 +88,112 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task ScanAllAsync_SurfacesNewFilesWithoutUsableDisplayTitle()
+    {
+        CreateMediaFile("shows/Show/S01E01.mp4", 128);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Library",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(0, summary.NewTvShowCount);
+        Assert.Equal(1, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        var movie = await connection.QuerySingleAsync<UnidentifiedMovieRecord>(
+            "SELECT title, overview, isLocked FROM movie");
+        Assert.Equal("Show", movie.Title);
+        Assert.Contains("未能自动识别影视名称", movie.Overview, StringComparison.Ordinal);
+        Assert.Equal(1, movie.IsLocked);
+        Assert.Equal("movie", await connection.ExecuteScalarAsync<string>("SELECT mediaType FROM videoFile"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM movie"));
+        Assert.Equal(0, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM tvShow"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM videoFile"));
+    }
+
+    [Fact]
+    public async Task ScanSourceAsync_DefersUnidentifiedFilesUntilCommitted()
+    {
+        CreateMediaFile("shows/Show/S01E01.mp4", 128);
+
+        var sourceId = await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Library",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        var callbackCount = 0;
+        scanner.ClearDeferredUnidentifiedScanGroups();
+        var summary = await scanner.ScanSourceAsync(
+            sourceId,
+            afterItemIndexed: (_, _) =>
+            {
+                callbackCount++;
+                return Task.CompletedTask;
+            },
+            deferUnidentifiedGroups: true);
+
+        Assert.Equal(0, summary.NewMovieCount);
+        Assert.Equal(0, summary.NewTvShowCount);
+        Assert.Equal(0, summary.NewVideoFileCount);
+        Assert.Equal(0, callbackCount);
+
+        using (var connection = database.OpenConnection())
+        {
+            Assert.Equal(0, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM movie"));
+            Assert.Equal(0, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM videoFile"));
+        }
+
+        var committedSummary = await scanner.CommitDeferredUnidentifiedScanGroupsAsync();
+
+        Assert.Equal(1, committedSummary.NewMovieCount);
+        Assert.Equal(0, committedSummary.NewTvShowCount);
+        Assert.Equal(1, committedSummary.NewVideoFileCount);
+
+        using (var connection = database.OpenConnection())
+        {
+            var movie = await connection.QuerySingleAsync<UnidentifiedMovieRecord>(
+                "SELECT title, overview, isLocked FROM movie");
+            Assert.Equal("Show", movie.Title);
+            Assert.Contains("未能自动识别影视名称", movie.Overview, StringComparison.Ordinal);
+            Assert.Equal(1, movie.IsLocked);
+            Assert.Equal("movie", await connection.ExecuteScalarAsync<string>("SELECT mediaType FROM videoFile"));
+        }
+    }
+
+    [Fact]
+    public async Task ScanAllAsync_GroupsRootEpisodeFilesByExtractedShowTitle()
+    {
+        CreateMediaFile("shows/The.Glory.S01E01.2160p.NF.WEB-DL.HEVC.mkv", 96);
+        CreateMediaFile("shows/The.Glory.S01E02.2160p.NF.WEB-DL.HEVC.mkv", 96);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Library",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewTvShowCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM tvShow"));
+        Assert.Equal("The Glory", await connection.ExecuteScalarAsync<string>("SELECT title FROM tvShow"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT episodeId) FROM videoFile WHERE mediaType = 'tv'"));
+    }
+
+    [Fact]
     public async Task ScanAllAsync_RefreshesOldUnenrichedMoviePlaceholder()
     {
         CreateMediaFile("movies/Inception.2010.1080p.BluRay.x264.mkv", 128);
@@ -432,6 +538,11 @@ public sealed class LibraryScannerTests : IDisposable
     private sealed record MovieScanRecord(
         string Title,
         string? ReleaseDate);
+
+    private sealed record UnidentifiedMovieRecord(
+        string Title,
+        string? Overview,
+        long IsLocked);
 
     private sealed record TvShowRecord(
         long Id,

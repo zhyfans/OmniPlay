@@ -235,6 +235,15 @@ public sealed class MpvPlayer : IMediaPlayer
             SetOption("keep-open", "yes");
             SetOption("panscan", "1.0");
             SetOption("wid", hostHandle.ToInt64().ToString(CultureInfo.InvariantCulture));
+            if (TryCreateRemoteHttpHeaderFields(filePath, out var remoteHeaders))
+            {
+                SetOption("http-header-fields", remoteHeaders);
+            }
+            var localIsoPath = ResolveLocalIsoPath(filePath);
+            if (localIsoPath is not null)
+            {
+                SetOption("bluray-device", localIsoPath);
+            }
 
             var initResult = MpvNative.Initialize(playerHandle);
             if (initResult < 0)
@@ -243,7 +252,15 @@ public sealed class MpvPlayer : IMediaPlayer
                 return MediaPlayerOpenResult.Failure($"libmpv 初始化失败，错误码 {initResult}。");
             }
 
-            var loadResult = MpvNative.Command(playerHandle, "loadfile", filePath);
+            var loadResult = localIsoPath is not null
+                ? MpvNative.Command(playerHandle, "loadfile", "bd://")
+                : MpvNative.Command(playerHandle, "loadfile", filePath);
+            if (loadResult < 0 && localIsoPath is not null)
+            {
+                MpvNative.SetPropertyString(playerHandle, "dvd-device", localIsoPath);
+                loadResult = MpvNative.Command(playerHandle, "loadfile", "dvd://");
+            }
+
             if (loadResult < 0)
             {
                 DestroyPlayer();
@@ -262,6 +279,72 @@ public sealed class MpvPlayer : IMediaPlayer
             DestroyPlayer();
             return MediaPlayerOpenResult.Failure($"libmpv 播放启动失败：{ex.Message}");
         }
+    }
+
+    private static string? ResolveLocalIsoPath(string filePath)
+    {
+        if (MediaSourcePathResolver.IsRemoteHttpUrl(filePath) ||
+            !string.Equals(Path.GetExtension(filePath), ".iso", StringComparison.OrdinalIgnoreCase) ||
+            !File.Exists(filePath))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(filePath);
+    }
+
+    private static bool TryCreateRemoteHttpHeaderFields(string filePath, out string headerFields)
+    {
+        headerFields = string.Empty;
+        if (!Uri.TryCreate(filePath, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return false;
+        }
+
+        var token = ReadQueryParameter(uri.Query, "X-Plex-Token");
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            headerFields = string.Join(
+                ',',
+                "X-Plex-Product: OmniPlay",
+                "X-Plex-Version: 1.0",
+                "X-Plex-Client-Identifier: omniplay-windows",
+                "X-Plex-Device-Name: OmniPlay",
+                "X-Plex-Platform: Windows",
+                $"X-Plex-Token: {token.Trim()}");
+            return true;
+        }
+
+        token = ReadQueryParameter(uri.Query, "api_key");
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return false;
+        }
+
+        headerFields = string.Join(
+            ',',
+            $"X-Emby-Token: {token.Trim()}",
+            $"X-MediaBrowser-Token: {token.Trim()}");
+        return true;
+    }
+
+    private static string? ReadQueryParameter(string query, string name)
+    {
+        foreach (var part in query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = part.IndexOf('=');
+            var rawName = separator >= 0 ? part[..separator] : part;
+            if (!string.Equals(Uri.UnescapeDataString(rawName), name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var rawValue = separator >= 0 ? part[(separator + 1)..] : string.Empty;
+            return Uri.UnescapeDataString(rawValue.Replace("+", "%20", StringComparison.Ordinal));
+        }
+
+        return null;
     }
 
     private PlayerPlaybackState ReadStateCore()

@@ -5,5 +5,8 @@ public enum MediaSourceProtocol
     Local,
     WebDav,
     Smb,
-    Direct
+    Direct,
+    Plex,
+    Emby,
+    Jellyfin
 }

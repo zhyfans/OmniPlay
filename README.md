@@ -17,7 +17,7 @@
 
 ### 媒体源管理
 
-- 支持添加本地文件夹、WebDAV、SMB。mac版因为开发一直有bug，不支持SMB直连，请在访达中挂载SMB，再在软件中添加本地文件夹，间接连接SMB。可以将访达挂载的SMB添加到开机自启
+- 支持添加本地文件夹、WebDAV、SMB、plex、emby、jellyfin。mac版因为开发一直有bug，不支持SMB直连，请在访达中挂载SMB，再在软件中添加本地文件夹，间接连接SMB。可以将访达挂载的SMB添加到开机自启
 - 不需要将电影、剧集分不同文件夹进行挂载，软件自动识别。
 
 ### 自动扫描与刮削
@@ -45,7 +45,7 @@ PRODUCT_BUNDLE_IDENTIFIER = nan.OmniPlay
 PRODUCT_NAME = 觅影
 MARKETING_VERSION = 1.0
 CURRENT_PROJECT_VERSION = 1
-MACOSX_DEPLOYMENT_TARGET = 26.2
+MACOSX_DEPLOYMENT_TARGET = 14.0
 DEVELOPMENT_TEAM = DT95MB3RG4
 ENABLE_HARDENED_RUNTIME = YES
 ```

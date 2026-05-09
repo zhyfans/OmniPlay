@@ -6,6 +6,9 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
     case local
     case webdav
     case direct
+    case plex
+    case emby
+    case jellyfin
 
     nonisolated func normalizedBaseURL(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -19,9 +22,23 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
                 value.removeLast()
             }
             return value
-        case .webdav:
+        case .webdav, .plex, .emby, .jellyfin:
             guard let url = URL(string: trimmed) else { return trimmed }
-            var normalized = url.absoluteString
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            if components?.host?.caseInsensitiveCompare("localhost") == .orderedSame {
+                components?.host = "127.0.0.1"
+            }
+            if components?.scheme?.lowercased() == "http", components?.port == nil {
+                switch self {
+                case .plex:
+                    components?.port = 32400
+                case .emby, .jellyfin:
+                    components?.port = 8096
+                default:
+                    break
+                }
+            }
+            var normalized = components?.url?.absoluteString ?? url.absoluteString
             if normalized.hasSuffix("/") {
                 normalized.removeLast()
             }
@@ -36,7 +53,7 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
         switch self {
         case .local:
             return !normalized.isEmpty
-        case .webdav:
+        case .webdav, .plex, .emby, .jellyfin:
             guard let url = URL(string: normalized), let scheme = url.scheme?.lowercased() else { return false }
             return (scheme == "http" || scheme == "https") && (url.host?.isEmpty == false)
         case .direct:
@@ -61,6 +78,38 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
             }
         }
         return nil
+    }
+}
+
+nonisolated struct MediaServerAuthConfig: Codable {
+    var token: String
+    var userId: String?
+    var libraryId: String?
+    var libraryName: String?
+    var libraryType: String?
+
+    nonisolated static func encode(
+        token: String,
+        userId: String?,
+        libraryId: String? = nil,
+        libraryName: String? = nil,
+        libraryType: String? = nil
+    ) -> String? {
+        let normalized = MediaServerAuthConfig(
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+            userId: userId?.trimmingCharacters(in: .whitespacesAndNewlines),
+            libraryId: libraryId?.trimmingCharacters(in: .whitespacesAndNewlines),
+            libraryName: libraryName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            libraryType: libraryType?.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard !normalized.token.isEmpty || normalized.userId?.isEmpty == false || normalized.libraryId?.isEmpty == false else { return nil }
+        guard let data = try? JSONEncoder().encode(normalized) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    nonisolated static func decode(_ value: String?) -> MediaServerAuthConfig? {
+        guard let value, let data = value.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(MediaServerAuthConfig.self, from: data)
     }
 }
 

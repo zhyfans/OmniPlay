@@ -145,6 +145,89 @@ enum MediaNameParser {
         return nil
     }
 
+    nonisolated static func combinedSearchMetadata(relativePath: String, fileName: String) -> (chineseTitle: String?, parentChineseTitle: String?, foreignTitle: String?, fullCleanTitle: String?, year: String?) {
+        let useFileNameFirst = isLikelyMediaServerEndpointPath(relativePath)
+        let primaryRawPath = useFileNameFirst ? fileName : relativePath
+        let secondaryRawPath = useFileNameFirst ? relativePath : fileName
+        let primary = extractSearchMetadata(from: primaryRawPath)
+        let secondary = extractSearchMetadata(from: secondaryRawPath)
+        let parentChinese = useFileNameFirst ? nil : extractParentFolderChineseTitle(from: relativePath)
+
+        return (
+            chineseTitle: nonEmpty(primary.chineseTitle) ?? nonEmpty(secondary.chineseTitle),
+            parentChineseTitle: nonEmpty(parentChinese),
+            foreignTitle: nonEmpty(primary.foreignTitle) ?? nonEmpty(secondary.foreignTitle),
+            fullCleanTitle: nonEmpty(primary.fullCleanTitle) ?? nonEmpty(secondary.fullCleanTitle),
+            year: nonEmpty(primary.year) ?? nonEmpty(secondary.year)
+        )
+    }
+
+    nonisolated static func bestDisplayTitle(relativePath: String, fileName: String) -> String {
+        let metadata = combinedSearchMetadata(relativePath: relativePath, fileName: fileName)
+        return metadata.chineseTitle
+            ?? metadata.parentChineseTitle
+            ?? metadata.foreignTitle
+            ?? metadata.fullCleanTitle
+            ?? ((fileName as NSString).deletingPathExtension)
+    }
+
+    nonisolated static func extractedDisplayTitle(relativePath: String, fileName: String) -> String? {
+        let metadata = combinedSearchMetadata(relativePath: relativePath, fileName: fileName)
+        for candidate in [metadata.chineseTitle, metadata.parentChineseTitle, metadata.foreignTitle, metadata.fullCleanTitle] {
+            if let title = usableDisplayTitle(candidate) {
+                return title
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func isUsableLibraryDisplayTitle(_ title: String) -> Bool {
+        usableDisplayTitle(title) != nil && !looksLikeRawReleaseName(title)
+    }
+
+    nonisolated private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    nonisolated private static func usableDisplayTitle(_ value: String?) -> String? {
+        guard let trimmed = nonEmpty(value) else { return nil }
+        let normalized = trimmed
+            .replacingOccurrences(of: #"[._]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+
+        let lower = normalized.lowercased()
+        let blocked: Set<String> = ["download", "downloads", "items", "library", "libraries", "media", "movie", "movies", "film", "films", "show", "shows", "series", "tv", "video", "videos", "stream", "bdmv", "plex", "emby", "jellyfin"]
+        guard !blocked.contains(lower) else { return nil }
+
+        if normalized.allSatisfy({ $0.isNumber }) {
+            let compact = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "0"))
+            guard normalized.count >= 3, !compact.isEmpty else { return nil }
+        }
+
+        let hasTitleCharacter = normalized.range(of: #"[A-Za-z\p{Han}\d]"#, options: .regularExpression) != nil
+        guard hasTitleCharacter else { return nil }
+        return normalized
+    }
+
+    nonisolated private static func looksLikeRawReleaseName(_ value: String) -> Bool {
+        value.range(
+            of: #"(?i)(\b(480p|720p|1080p|2160p|4k|uhd|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|truehd|atmos|dts|hdr|dv)\b|[._]{2,})"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    nonisolated private static func isLikelyMediaServerEndpointPath(_ relativePath: String) -> Bool {
+        let normalized = relativePath
+            .replacingOccurrences(of: #"^/+"#, with: "", options: .regularExpression)
+            .lowercased()
+        return normalized.range(of: #"^(items/[^/]+/download|library/parts/|library/metadata/|video/|videos/)"#, options: .regularExpression) != nil
+    }
+
     nonisolated static func parseEpisodeDescriptor(from fileName: String, fallbackIndex: Int) -> EpisodeDescriptor {
         var season = 1
         var episode = fallbackIndex + 1
@@ -624,11 +707,46 @@ class MediaLibraryManager {
         }
         self.dbQueue = sharedQueue
     }
+
+    fileprivate func sourceExists(_ sourceID: Int64) async throws -> Bool {
+        try await dbQueue.read { db in
+            let count = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM mediaSource WHERE id = ? AND COALESCE(isEnabled, 1) = 1",
+                arguments: [sourceID]
+            ) ?? 0
+            return count > 0
+        }
+    }
     
     func fetchAllMovies() throws -> [Movie] {
         try dbQueue.read { db in
-            try Movie.fetchVisibleLibrary(in: db)
+            try Movie.fetchVisibleLibrary(in: db).filter(shouldExposeMovieInLibrary)
         }
+    }
+
+    private func shouldExposeMovieInLibrary(_ movie: Movie) -> Bool {
+        guard let id = movie.id, id < 0 else { return true }
+        if movie.isLocked { return true }
+        guard MediaNameParser.isUsableLibraryDisplayTitle(movie.title) else { return false }
+        if hasVisiblePlaceholderMetadata(movie.posterPath) { return true }
+        if hasVisiblePlaceholderMetadata(movie.releaseDate) { return true }
+        if let overview = normalizedPlaceholderMetadata(movie.overview),
+           overview != "正在排队等待刮削..." {
+            return true
+        }
+        if movie.voteAverage != nil { return true }
+        return false
+    }
+
+    private func hasVisiblePlaceholderMetadata(_ value: String?) -> Bool {
+        normalizedPlaceholderMetadata(value) != nil
+    }
+
+    private func normalizedPlaceholderMetadata(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     func cleanupExpiredDisabledSources(retention: TimeInterval = 30 * 24 * 60 * 60) throws {
@@ -692,21 +810,71 @@ class MediaLibraryManager {
     }
     
     // 🌟 核心升级：3轮递进式自动刮削引擎
-    func processUnmatchedFiles() async throws {
+    func processUnmatchedFiles(sourceID: Int64? = nil, placeholderMovieID: Int64? = nil) async throws {
         let unmatchedFiles = try await dbQueue.read { db in
-            try VideoFile.fetchVisibleUnmatched(in: db)
+            if let sourceID, let placeholderMovieID {
+                return try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.sourceId = ?
+                      AND videoFile.movieId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [sourceID, placeholderMovieID]
+                )
+            }
+            if let sourceID {
+                return try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.sourceId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [sourceID]
+                )
+            }
+            if let placeholderMovieID {
+                return try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.movieId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [placeholderMovieID]
+                )
+            }
+            return try VideoFile.fetchVisibleUnmatched(in: db)
         }
         if unmatchedFiles.isEmpty {
             print("🤖 递进刮削器：没有找到需要刮削的新文件。")
             return
         }
         
-        print("🤖 递进刮削器：开始刮削 \(unmatchedFiles.count) 个新文件...")
+        let representativeFiles = representativeUnmatchedFiles(from: unmatchedFiles)
+        print("🤖 递进刮削器：开始刮削 \(representativeFiles.count) 个影视条目（来自 \(unmatchedFiles.count) 个新文件）...")
         
         var tvAutoReuseCache: [String: TMDBResult] = [:]
 
-        for file in unmatchedFiles {
-            if Task.isCancelled { return }
+        for file in representativeFiles {
+            try Task.checkCancellation()
+            guard try await sourceExists(file.sourceId) else { continue }
+            let isStillUnmatched = try await dbQueue.read { db -> Bool in
+                guard let current = try VideoFile.fetchOne(db, key: file.id) else { return false }
+                return current.mediaType == "unmatched"
+            }
+            guard isStillUnmatched else { continue }
             if let movieId = file.movieId { let isLocked = try await dbQueue.read { db in try Movie.fetchOne(db, key: movieId)?.isLocked ?? false }; if isLocked { continue } }
             
             if let reuseKey = tvAutoReuseKey(for: file),
@@ -720,8 +888,8 @@ class MediaLibraryManager {
             let extraction = extractTitlesAndYear(from: file)
             let targetYear = extraction.year
             let preferredMediaType: String? = {
-                if MediaNameParser.isLikelyTVEpisodePath(file.relativePath) { return "tv" }
-                if MediaNameParser.isLikelyMoviePath(file.relativePath) { return "movie" }
+                if MediaNameParser.isLikelyTVEpisodePath(file.relativePath) || MediaNameParser.isLikelyTVEpisodePath(file.fileName) { return "tv" }
+                if MediaNameParser.isLikelyMoviePath(file.relativePath) || MediaNameParser.isLikelyMoviePath(file.fileName) { return "movie" }
                 return nil
             }()
             let preferredSeason = MediaNameParser.resolvePreferredSeason(
@@ -872,6 +1040,22 @@ class MediaLibraryManager {
 
         await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
     }
+
+    private func representativeUnmatchedFiles(from files: [VideoFile]) -> [VideoFile] {
+        var seenKeys = Set<String>()
+        var representatives: [VideoFile] = []
+        let sortedFiles = files.sorted {
+            if $0.sourceId != $1.sourceId { return $0.sourceId < $1.sourceId }
+            return $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+        }
+        for file in sortedFiles {
+            let groupKey = file.movieId.map { "movie:\($0)" } ?? "file:\(file.id)"
+            guard !seenKeys.contains(groupKey) else { continue }
+            seenKeys.insert(groupKey)
+            representatives.append(file)
+        }
+        return representatives
+    }
     
     private func saveScrapingResult(_ tmdbResult: TMDBResult, for file: VideoFile) async throws {
         if let path = tmdbResult.posterPath { PosterManager.shared.downloadPoster(posterPath: path) }
@@ -895,25 +1079,52 @@ class MediaLibraryManager {
                 movie = Movie(id: resultId, title: rTitle, releaseDate: rDate, overview: rOverview, posterPath: rPoster, voteAverage: rVoteAverage, isLocked: false)
                 try movie.insert(db)
             }
-            if var fileToUpdate = try VideoFile.fetchOne(db, key: rFileId) { fileToUpdate.mediaType = "movie"; fileToUpdate.movieId = movie.id; try fileToUpdate.update(db) }
+            if let fakeId = oldFakeMovieId, fakeId < 0 {
+                let groupedFiles = try VideoFile
+                    .filter(Column("movieId") == fakeId)
+                    .fetchAll(db)
+                for var groupedFile in groupedFiles {
+                    groupedFile.mediaType = "movie"
+                    groupedFile.movieId = movie.id
+                    try groupedFile.update(db)
+                }
+            } else if var fileToUpdate = try VideoFile.fetchOne(db, key: rFileId) {
+                fileToUpdate.mediaType = "movie"
+                fileToUpdate.movieId = movie.id
+                try fileToUpdate.update(db)
+            }
             if let fakeId = oldFakeMovieId, fakeId < 0 { _ = try Movie.deleteOne(db, key: fakeId) }
         }
-        
-        if isTVResult(tmdbResult) {
-            ThumbnailManager.shared.enqueueEpisodeThumbnails(for: resultId)
+
+        let exportSource = try? await dbQueue.read { db in
+            try MediaSource.fetchOne(db, key: file.sourceId)
+        }
+        if UserDefaults.standard.bool(forKey: "enableLocalMetadataExport"),
+           let source = exportSource,
+           source.protocolKind == .local {
+            let videoURL = URL(fileURLWithPath: MediaSourceProtocol.local.normalizedBaseURL(source.baseUrl))
+                .appendingPathComponent(file.relativePath)
+            let sidecar = LocalSidecarMetadata(
+                title: rTitle,
+                date: rDate,
+                overview: rOverview,
+                posterPath: rPoster,
+                thumbnailPath: nil,
+                voteAverage: rVoteAverage,
+                tmdbId: tmdbResult.id,
+                seasonNumber: nil,
+                episodeNumber: nil
+            )
+            if isTVResult(tmdbResult) {
+                await LocalMetadataSidecarStore.shared.exportTVShow(metadata: sidecar, videoURL: videoURL)
+            } else {
+                await LocalMetadataSidecarStore.shared.exportMovie(metadata: sidecar, videoURL: videoURL)
+            }
         }
     }
     
     private func extractTitlesAndYear(from file: VideoFile) -> (chineseTitle: String?, parentChineseTitle: String?, foreignTitle: String?, fullCleanTitle: String?, year: String?) {
-        let extracted = MediaNameParser.extractSearchMetadata(from: file.relativePath)
-        let parentChinese = MediaNameParser.extractParentFolderChineseTitle(from: file.relativePath)
-        return (
-            chineseTitle: extracted.chineseTitle,
-            parentChineseTitle: parentChinese,
-            foreignTitle: extracted.foreignTitle,
-            fullCleanTitle: extracted.fullCleanTitle,
-            year: extracted.year
-        )
+        return MediaNameParser.combinedSearchMetadata(relativePath: file.relativePath, fileName: file.fileName)
     }
 
     private func isYearPlausibleMatch(
@@ -968,14 +1179,18 @@ class MediaLibraryManager {
     }
 
     private func tvAutoReuseKey(for file: VideoFile) -> String? {
-        guard MediaNameParser.isLikelyTVEpisodePath(file.relativePath) else { return nil }
-        let parent = (file.relativePath as NSString).deletingLastPathComponent
+        guard MediaNameParser.isLikelyTVEpisodePath(file.relativePath) || MediaNameParser.isLikelyTVEpisodePath(file.fileName) else { return nil }
+        let extracted = extractTitlesAndYear(from: file)
+        let parent = extracted.chineseTitle
+            ?? extracted.parentChineseTitle
+            ?? extracted.foreignTitle
+            ?? (file.relativePath as NSString).deletingLastPathComponent
         guard !parent.isEmpty else { return nil }
         return "\(file.sourceId)#\(parent.lowercased())"
     }
 
     private func shouldAutoReuseTVResult(_ result: TMDBResult, for file: VideoFile) -> Bool {
-        guard MediaNameParser.isLikelyTVEpisodePath(file.relativePath) else { return false }
+        guard MediaNameParser.isLikelyTVEpisodePath(file.relativePath) || MediaNameParser.isLikelyTVEpisodePath(file.fileName) else { return false }
         if let mediaType = result.mediaType?.lowercased() {
             if mediaType == "tv" { return true }
             if mediaType == "movie" { return false }
@@ -1034,8 +1249,58 @@ struct MediaSourceScanResult {
     let errorCategory: MediaSourceScanErrorCategory?
     let userMessage: String
     let diagnostic: MediaSourceScanDiagnostic?
+    fileprivate let deferredUnidentifiedGroups: [PendingScannedMediaGroup]
 
     var isSuccess: Bool { errorCategory == nil }
+
+    init(
+        sourceId: Int64?,
+        sourceName: String,
+        protocolType: String,
+        scannedCount: Int,
+        insertedCount: Int,
+        removedCount: Int,
+        errorCategory: MediaSourceScanErrorCategory?,
+        userMessage: String,
+        diagnostic: MediaSourceScanDiagnostic?
+    ) {
+        self.init(
+            sourceId: sourceId,
+            sourceName: sourceName,
+            protocolType: protocolType,
+            scannedCount: scannedCount,
+            insertedCount: insertedCount,
+            removedCount: removedCount,
+            errorCategory: errorCategory,
+            userMessage: userMessage,
+            diagnostic: diagnostic,
+            deferredUnidentifiedGroups: []
+        )
+    }
+
+    fileprivate init(
+        sourceId: Int64?,
+        sourceName: String,
+        protocolType: String,
+        scannedCount: Int,
+        insertedCount: Int,
+        removedCount: Int,
+        errorCategory: MediaSourceScanErrorCategory?,
+        userMessage: String,
+        diagnostic: MediaSourceScanDiagnostic?,
+        deferredUnidentifiedGroups: [PendingScannedMediaGroup]
+    ) {
+        self.sourceId = sourceId
+        self.sourceName = sourceName
+        self.protocolType = protocolType
+        self.scannedCount = scannedCount
+        self.insertedCount = insertedCount
+        self.removedCount = removedCount
+        self.errorCategory = errorCategory
+        self.userMessage = userMessage
+        self.diagnostic = diagnostic
+        self.deferredUnidentifiedGroups = deferredUnidentifiedGroups
+    }
 }
 
 enum MediaSourceScanDiagnosticsFormatter {
@@ -1080,6 +1345,24 @@ enum MediaSourceScanDiagnosticsFormatter {
 private struct ScannedMediaFile {
     let relativePath: String
     let fileName: String
+}
+
+private struct LocalSidecarImport {
+    let metadata: LocalSidecarMetadata?
+    let episodeMetadata: LocalSidecarMetadata?
+}
+
+private struct PendingScannedMediaItem {
+    let file: ScannedMediaFile
+    let sidecar: LocalSidecarImport?
+}
+
+private struct PendingScannedMediaGroup {
+    let fakeMovieId: Int64
+    let displayTitle: String
+    var importedMetadata: LocalSidecarMetadata?
+    let shouldAttemptAutomaticScrape: Bool
+    var items: [PendingScannedMediaItem]
 }
 
 enum WebDAVScannerRuntimeOverrides {
@@ -1170,7 +1453,7 @@ struct WebDAVPreflightChecker {
         if let protocolClasses = WebDAVScannerRuntimeOverrides.protocolClasses {
             config.protocolClasses = protocolClasses
         }
-        let session = URLSession(configuration: config)
+        let session = URLSession(configuration: config, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
 
         do {
             let (_, response) = try await session.data(for: request)
@@ -1247,10 +1530,25 @@ struct WebDAVPreflightChecker {
 }
 
 struct WebDAVDirectoryItem: Identifiable, Equatable {
+    let id: String
     let url: URL
     let displayName: String
+    let protocolKind: MediaSourceProtocol
+    let authConfig: String?
 
-    var id: String { url.absoluteString }
+    init(
+        id: String? = nil,
+        url: URL,
+        displayName: String,
+        protocolKind: MediaSourceProtocol = .webdav,
+        authConfig: String? = nil
+    ) {
+        self.url = url
+        self.displayName = displayName
+        self.protocolKind = protocolKind
+        self.authConfig = authConfig
+        self.id = id ?? "\(protocolKind.rawValue):\(url.absoluteString)"
+    }
 }
 
 enum WebDAVDirectoryBrowserError: LocalizedError {
@@ -1404,7 +1702,7 @@ struct WebDAVDirectoryBrowser {
         if let protocolClasses = WebDAVScannerRuntimeOverrides.protocolClasses {
             config.protocolClasses = protocolClasses
         }
-        let session = URLSession(configuration: config)
+        let session = URLSession(configuration: config, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
 
         do {
             let (data, response) = try await session.data(for: request)
@@ -1505,6 +1803,467 @@ struct WebDAVDirectoryBrowser {
             return last.removingPercentEncoding ?? last
         }
         return url.host ?? "未命名文件夹"
+    }
+}
+
+enum MediaServerLibraryBrowserError: LocalizedError {
+    case invalidConfiguration(String)
+    case httpFailed(statusCode: Int, message: String)
+    case networkFailed(String)
+    case requestFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidConfiguration(let message),
+             .httpFailed(_, let message),
+             .networkFailed(let message),
+             .requestFailed(let message):
+            return message
+        }
+    }
+
+    var allowsWholeLibraryFallback: Bool {
+        if case .httpFailed(let statusCode, _) = self {
+            return statusCode == 404
+        }
+        return false
+    }
+}
+
+private struct EmbyCompatibleResolvedAuth {
+    let token: String
+    let userId: String
+}
+
+private struct EmbyCompatibleUser {
+    let id: String
+    let name: String
+}
+
+struct MediaServerLibraryBrowser {
+    private let session: URLSession
+
+    init() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        session = URLSession(configuration: configuration, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
+    }
+
+    func listLibraries(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String,
+        userId: String
+    ) async throws -> [WebDAVDirectoryItem] {
+        let normalizedURL = protocolKind.normalizedBaseURL(baseURL)
+        guard protocolKind == .plex || protocolKind == .emby || protocolKind == .jellyfin,
+              protocolKind.isValidBaseURL(normalizedURL) else {
+            throw MediaServerLibraryBrowserError.invalidConfiguration("媒体服务器地址无效，请输入 http(s):// 开头且包含主机名的地址。")
+        }
+
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToken.isEmpty else {
+            throw MediaServerLibraryBrowserError.invalidConfiguration("\(protocolLabel(protocolKind)) 需要密码、访问令牌或 API Key 才能读取媒体库。")
+        }
+
+        switch protocolKind {
+        case .plex:
+            return try await listPlexLibraries(baseURL: normalizedURL, token: trimmedToken, userId: userId)
+        case .emby, .jellyfin:
+            return try await listEmbyCompatibleLibraries(protocolKind: protocolKind, baseURL: normalizedURL, token: trimmedToken, userId: userId)
+        default:
+            return []
+        }
+    }
+
+    private func listPlexLibraries(baseURL: String, token: String, userId: String) async throws -> [WebDAVDirectoryItem] {
+        let request = try makeRequest(protocolKind: .plex, baseURL: baseURL, relativePath: "library/sections", token: token)
+        let data = try await fetchData(request)
+        guard let document = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) else {
+            throw MediaServerLibraryBrowserError.requestFailed("Plex 媒体库响应解析失败。")
+        }
+
+        let directories = (try? document.nodes(forXPath: "//*[local-name()='Directory']")) ?? []
+        let items = directories.compactMap { node -> WebDAVDirectoryItem? in
+            guard let element = node as? XMLElement,
+                  let key = element.attribute(forName: "key")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !key.isEmpty else { return nil }
+
+            let title = element.attribute(forName: "title")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? element.attribute(forName: "name")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? "Plex 媒体库"
+            let type = element.attribute(forName: "type")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return makeItem(
+                protocolKind: .plex,
+                baseURL: baseURL,
+                token: token,
+                userId: userId,
+                libraryId: key,
+                libraryName: title,
+                libraryType: type
+            )
+        }
+        return items.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
+    private func listEmbyCompatibleLibraries(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String,
+        userId: String
+    ) async throws -> [WebDAVDirectoryItem] {
+        let userInput = userId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedAuth = try await resolveEmbyCompatibleAuth(
+            protocolKind: protocolKind,
+            baseURL: baseURL,
+            credential: token,
+            userInput: userInput
+        )
+        let resolvedUserId = resolvedAuth.userId
+        let resolvedToken = resolvedAuth.token
+        if !resolvedUserId.isEmpty {
+            let userPath = resolvedUserId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? resolvedUserId
+            let url = try makeURL(protocolKind: protocolKind, baseURL: baseURL, relativePath: "Users/\(userPath)/Views", token: resolvedToken)
+            do {
+                let data = try await fetchData(url)
+                let items = try parseEmbyLibraryItems(
+                    data: data,
+                    protocolKind: protocolKind,
+                    baseURL: baseURL,
+                    token: resolvedToken,
+                    userId: resolvedUserId,
+                    expectsItemsObject: true
+                )
+                if !items.isEmpty { return items }
+            } catch {
+                if !userInput.isEmpty, resolvedUserId == userInput, !looksLikeEmbyCompatibleUserId(userInput) {
+                    throw MediaServerLibraryBrowserError.invalidConfiguration("无法解析 \(protocolLabel(protocolKind)) 用户“\(userInput)”。请留空用户字段，或填写用户 ID/GUID。")
+                }
+                throw error
+            }
+        }
+
+        let url = try makeURL(protocolKind: protocolKind, baseURL: baseURL, relativePath: "Library/VirtualFolders", token: resolvedToken)
+        do {
+            let data = try await fetchData(url)
+            let items = try parseEmbyLibraryItems(
+                data: data,
+                protocolKind: protocolKind,
+                baseURL: baseURL,
+                token: resolvedToken,
+                userId: resolvedUserId,
+                expectsItemsObject: false
+            )
+            if !items.isEmpty { return items }
+        } catch let error as MediaServerLibraryBrowserError {
+            guard resolvedUserId.isEmpty, error.allowsWholeLibraryFallback else { throw error }
+        } catch {
+            throw error
+        }
+
+        return [makeItem(
+            protocolKind: protocolKind,
+            baseURL: baseURL,
+            token: resolvedToken,
+            userId: resolvedUserId,
+            libraryId: nil,
+            libraryName: "全部媒体库",
+            libraryType: nil
+        )]
+    }
+
+    private func resolveEmbyCompatibleAuth(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        credential: String,
+        userInput: String
+    ) async throws -> EmbyCompatibleResolvedAuth {
+        let trimmedCredential = credential.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        var tokenAuthError: MediaServerLibraryBrowserError?
+        if trimmed.isEmpty {
+            do {
+                let currentUser = try await fetchCurrentEmbyCompatibleUser(protocolKind: protocolKind, baseURL: baseURL, token: trimmedCredential)
+                return EmbyCompatibleResolvedAuth(token: trimmedCredential, userId: currentUser?.id ?? "")
+            } catch let error as MediaServerLibraryBrowserError {
+                tokenAuthError = error
+            }
+            if let tokenAuthError, case .networkFailed = tokenAuthError {
+                throw tokenAuthError
+            }
+            return EmbyCompatibleResolvedAuth(token: trimmedCredential, userId: "")
+        }
+
+        do {
+            if let currentUser = try await fetchCurrentEmbyCompatibleUser(protocolKind: protocolKind, baseURL: baseURL, token: trimmedCredential) {
+                if currentUser.id.caseInsensitiveCompare(trimmed) == .orderedSame ||
+                    currentUser.name.caseInsensitiveCompare(trimmed) == .orderedSame {
+                    return EmbyCompatibleResolvedAuth(token: trimmedCredential, userId: currentUser.id)
+                }
+            }
+        } catch let error as MediaServerLibraryBrowserError {
+            tokenAuthError = error
+            if case .networkFailed = error {
+                throw error
+            }
+        }
+
+        if looksLikeEmbyCompatibleUserId(trimmed) {
+            return EmbyCompatibleResolvedAuth(token: trimmedCredential, userId: trimmed)
+        }
+
+        do {
+            if let matched = try await fetchEmbyCompatibleUsers(protocolKind: protocolKind, baseURL: baseURL, token: trimmedCredential)
+                .first(where: { user in
+                    user.id.caseInsensitiveCompare(trimmed) == .orderedSame ||
+                    user.name.caseInsensitiveCompare(trimmed) == .orderedSame
+                }) {
+                return EmbyCompatibleResolvedAuth(token: trimmedCredential, userId: matched.id)
+            }
+        } catch let error as MediaServerLibraryBrowserError {
+            tokenAuthError = error
+            if case .networkFailed = error {
+                throw error
+            }
+        }
+
+        do {
+            return try await authenticateEmbyCompatibleUser(
+                protocolKind: protocolKind,
+                baseURL: baseURL,
+                username: trimmed,
+                password: trimmedCredential
+            )
+        } catch let error as MediaServerLibraryBrowserError {
+            if case .networkFailed = error {
+                throw error
+            }
+            if tokenAuthError != nil {
+                throw MediaServerLibraryBrowserError.invalidConfiguration("\(protocolLabel(protocolKind)) 认证失败：请检查用户名，以及下方填写的是密码、访问令牌或 API Key。")
+            }
+            throw error
+        }
+    }
+
+    private func fetchCurrentEmbyCompatibleUser(protocolKind: MediaSourceProtocol, baseURL: String, token: String) async throws -> EmbyCompatibleUser? {
+        let url = try makeURL(protocolKind: protocolKind, baseURL: baseURL, relativePath: "Users/Me", token: token)
+        let data = try await fetchData(url)
+        guard let dictionary = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        guard let id = (dictionary["Id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty else { return nil }
+        let name = (dictionary["Name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return EmbyCompatibleUser(id: id, name: name)
+    }
+
+    private func fetchEmbyCompatibleUsers(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String
+    ) async throws -> [EmbyCompatibleUser] {
+        let url = try makeURL(protocolKind: protocolKind, baseURL: baseURL, relativePath: "Users", token: token)
+        let data = try await fetchData(url)
+        guard let dictionaries = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return dictionaries.compactMap { dictionary in
+            guard let id = (dictionary["Id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !id.isEmpty else { return nil }
+            let name = (dictionary["Name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return EmbyCompatibleUser(id: id, name: name)
+        }
+    }
+
+    private func authenticateEmbyCompatibleUser(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        username: String,
+        password: String
+    ) async throws -> EmbyCompatibleResolvedAuth {
+        let url = try makeURL(protocolKind: protocolKind, baseURL: baseURL, relativePath: "Users/AuthenticateByName", token: nil)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(embyAuthorizationHeader(protocolKind: protocolKind), forHTTPHeaderField: "X-Emby-Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["Username": username, "Pw": password])
+
+        let data = try await fetchData(request)
+        guard let dictionary = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = (dictionary["AccessToken"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !accessToken.isEmpty else {
+            throw MediaServerLibraryBrowserError.requestFailed("\(protocolLabel(protocolKind)) 登录响应缺少访问令牌。")
+        }
+        let user = dictionary["User"] as? [String: Any]
+        let userId = (user?["Id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? (dictionary["UserId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ""
+        return EmbyCompatibleResolvedAuth(token: accessToken, userId: userId)
+    }
+
+    private func embyAuthorizationHeader(protocolKind: MediaSourceProtocol) -> String {
+        let label = protocolLabel(protocolKind)
+        return #"MediaBrowser Client="OmniPlay", Device="OmniPlay", DeviceId="omniplay-mac", Version="1.0""#
+            .replacingOccurrences(of: "OmniPlay", with: label, options: [], range: nil)
+    }
+
+    private func looksLikeEmbyCompatibleUserId(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowed = CharacterSet(charactersIn: "0123456789abcdefABCDEF-")
+        return trimmed.count >= 16 && trimmed.rangeOfCharacter(from: allowed.inverted) == nil
+    }
+
+    private func parseEmbyLibraryItems(
+        data: Data,
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String,
+        userId: String,
+        expectsItemsObject: Bool
+    ) throws -> [WebDAVDirectoryItem] {
+        let object = try JSONSerialization.jsonObject(with: data)
+        let dictionaries: [[String: Any]]
+        if expectsItemsObject {
+            dictionaries = (object as? [String: Any])?["Items"] as? [[String: Any]] ?? []
+        } else if let array = object as? [[String: Any]] {
+            dictionaries = array
+        } else {
+            dictionaries = (object as? [String: Any])?["Items"] as? [[String: Any]] ?? []
+        }
+
+        var seen: Set<String> = []
+        let items = dictionaries.compactMap { dictionary -> WebDAVDirectoryItem? in
+            let id = (dictionary["Id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? (dictionary["ItemId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let id, !id.isEmpty, !seen.contains(id) else { return nil }
+            seen.insert(id)
+
+            let name = (dictionary["Name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? "\(protocolLabel(protocolKind)) 媒体库"
+            let type = (dictionary["CollectionType"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return makeItem(
+                protocolKind: protocolKind,
+                baseURL: baseURL,
+                token: token,
+                userId: userId,
+                libraryId: id,
+                libraryName: name,
+                libraryType: type
+            )
+        }
+        return items.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
+    private func makeItem(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String,
+        userId: String,
+        libraryId: String?,
+        libraryName: String,
+        libraryType: String?
+    ) -> WebDAVDirectoryItem {
+        let normalizedURL = protocolKind.normalizedBaseURL(baseURL)
+        let url = URL(string: normalizedURL) ?? URL(string: normalizedURL + "/")!
+        let trimmedName = libraryName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = trimmedName.isEmpty ? "\(protocolLabel(protocolKind)) 媒体库" : trimmedName
+        let authConfig = MediaServerAuthConfig.encode(
+            token: token,
+            userId: userId,
+            libraryId: libraryId,
+            libraryName: displayName,
+            libraryType: libraryType
+        )
+        let key = libraryId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = "\(protocolKind.rawValue):\(normalizedURL):\(key?.isEmpty == false ? key! : "all")"
+        return WebDAVDirectoryItem(
+            id: id,
+            url: url,
+            displayName: displayName,
+            protocolKind: protocolKind,
+            authConfig: authConfig
+        )
+    }
+
+    private func makeURL(protocolKind: MediaSourceProtocol, baseURL: String, relativePath: String, token: String?) throws -> URL {
+        let normalized = protocolKind.normalizedBaseURL(baseURL)
+        guard let base = URL(string: normalized + "/") else {
+            throw MediaServerLibraryBrowserError.invalidConfiguration("媒体服务器地址无效。")
+        }
+
+        let composed = URL(string: relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/")), relativeTo: base)?.absoluteURL
+        guard var components = composed.flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else {
+            throw MediaServerLibraryBrowserError.invalidConfiguration("媒体服务器地址无效。")
+        }
+
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let tokenName = protocolKind == .plex ? "X-Plex-Token" : "api_key"
+            var queryItems = components.queryItems ?? []
+            queryItems.append(URLQueryItem(name: tokenName, value: token.trimmingCharacters(in: .whitespacesAndNewlines)))
+            components.queryItems = queryItems
+        }
+
+        guard let url = components.url else {
+            throw MediaServerLibraryBrowserError.invalidConfiguration("媒体服务器地址无效。")
+        }
+        return url
+    }
+
+    private func makeRequest(protocolKind: MediaSourceProtocol, baseURL: String, relativePath: String, token: String?) throws -> URLRequest {
+        let url = try makeURL(
+            protocolKind: protocolKind,
+            baseURL: baseURL,
+            relativePath: relativePath,
+            token: protocolKind == .plex ? nil : token
+        )
+        var request = URLRequest(url: url)
+        if protocolKind == .plex {
+            request.setValue("application/xml", forHTTPHeaderField: "Accept")
+            applyPlexHeaders(to: &request, token: token)
+        }
+        return request
+    }
+
+    private func applyPlexHeaders(to request: inout URLRequest, token: String?) {
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Product")
+        request.setValue("1.0", forHTTPHeaderField: "X-Plex-Version")
+        request.setValue("omniplay-mac", forHTTPHeaderField: "X-Plex-Client-Identifier")
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Device-Name")
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            request.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Plex-Token")
+        }
+    }
+
+    private func fetchData(_ url: URL) async throws -> Data {
+        try await fetchData(URLRequest(url: url))
+    }
+
+    private func fetchData(_ request: URLRequest) async throws -> Data {
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw MediaServerLibraryBrowserError.requestFailed("媒体服务器请求失败：未收到有效响应。")
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let authHint = http.statusCode == 401 || http.statusCode == 403 ? " 请检查用户名、密码、访问令牌或 API Key。" : ""
+                throw MediaServerLibraryBrowserError.httpFailed(statusCode: http.statusCode, message: "媒体服务器请求失败：HTTP \(http.statusCode)。\(authHint)")
+            }
+            return data
+        } catch let error as MediaServerLibraryBrowserError {
+            throw error
+        } catch let error as URLError {
+            throw MediaServerLibraryBrowserError.networkFailed("媒体服务器网络错误（\(error.code.rawValue)）：\(error.localizedDescription)。请确认服务器地址和端口可访问；如果 Jellyfin 在本机，请使用 http://127.0.0.1:8096。")
+        } catch {
+            throw MediaServerLibraryBrowserError.requestFailed("媒体服务器请求异常：\(error.localizedDescription)")
+        }
+    }
+
+    private func protocolLabel(_ value: MediaSourceProtocol) -> String {
+        switch value {
+        case .plex: return "Plex"
+        case .emby: return "Emby"
+        case .jellyfin: return "Jellyfin"
+        default: return "媒体服务器"
+        }
     }
 }
 
@@ -1611,7 +2370,7 @@ private struct WebDAVScanner: MediaSourceScanner {
         if let protocolClasses = WebDAVScannerRuntimeOverrides.protocolClasses {
             configuration.protocolClasses = protocolClasses
         }
-        session = URLSession(configuration: configuration)
+        session = URLSession(configuration: configuration, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
     }
 
     private struct AuthCredential {
@@ -1922,6 +2681,328 @@ private struct WebDAVScanner: MediaSourceScanner {
     }
 }
 
+private struct MediaServerScanner: MediaSourceScanner {
+    let sourceDescription: String
+    private let session: URLSession
+
+    init(source: MediaSource) {
+        sourceDescription = source.baseUrl
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 60
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        session = URLSession(configuration: configuration, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
+    }
+
+    func scanFiles(in source: MediaSource) async throws -> [ScannedMediaFile] {
+        switch source.protocolKind {
+        case .plex:
+            return try await scanPlex(source)
+        case .emby, .jellyfin:
+            return try await scanEmbyCompatible(source)
+        default:
+            throw MediaSourceScanError.unsupportedProtocol(source.protocolType)
+        }
+    }
+
+    private func scanPlex(_ source: MediaSource) async throws -> [ScannedMediaFile] {
+        let auth = MediaServerAuthConfig.decode(source.authConfig)
+        let sectionsRequest = try makeRequest(protocolKind: .plex, baseURL: source.baseUrl, relativePath: "library/sections", tokenName: "X-Plex-Token", token: auth?.token)
+        let (sectionData, sectionResponse) = try await session.data(for: sectionsRequest)
+        try validateHTTP(sectionResponse)
+        guard let sectionDocument = try? XMLDocument(data: sectionData, options: [.nodeLoadExternalEntitiesNever]) else {
+            throw MediaSourceScanError.requestFailed("Plex 响应解析失败。")
+        }
+
+        let directories = (try? sectionDocument.nodes(forXPath: "//*[local-name()='Directory']")) ?? []
+        var results: [ScannedMediaFile] = []
+        for directory in directories {
+            guard let element = directory as? XMLElement,
+                  let key = element.attribute(forName: "key")?.stringValue,
+                  !key.isEmpty else { continue }
+            if let libraryId = auth?.libraryId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !libraryId.isEmpty,
+               key != libraryId {
+                continue
+            }
+            let sectionType = element.attribute(forName: "type")?.stringValue?.lowercased()
+            let itemType = sectionType == "show" ? "4" : "1"
+            let sectionRequest = try makeRequest(protocolKind: .plex, baseURL: source.baseUrl, relativePath: "library/sections/\(key)/all?type=\(itemType)", tokenName: "X-Plex-Token", token: auth?.token)
+            let (data, response) = try await session.data(for: sectionRequest)
+            try validateHTTP(response)
+            guard let document = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) else { continue }
+            let videos = (try? document.nodes(forXPath: "//*[local-name()='Video']")) ?? []
+            for videoNode in videos {
+                guard let video = videoNode as? XMLElement else { continue }
+                let title = video.attribute(forName: "title")?.stringValue
+                    ?? video.attribute(forName: "grandparentTitle")?.stringValue
+                    ?? "Plex"
+                let parts = (try? video.nodes(forXPath: ".//*[local-name()='Part']")) ?? []
+                for partNode in parts {
+                    guard let part = partNode as? XMLElement,
+                          let key = part.attribute(forName: "key")?.stringValue,
+                          !key.isEmpty else { continue }
+                    let filePath = part.attribute(forName: "file")?.stringValue
+                    results.append(ScannedMediaFile(
+                        relativePath: key.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+                        fileName: resolveFileName(path: filePath, fallback: title)
+                    ))
+                }
+            }
+        }
+        return results
+    }
+
+    private func scanEmbyCompatible(_ source: MediaSource) async throws -> [ScannedMediaFile] {
+        let auth = MediaServerAuthConfig.decode(source.authConfig)
+        let queryPrefix: String
+        if let libraryId = auth?.libraryId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !libraryId.isEmpty {
+            queryPrefix = "ParentId=\(libraryId)&Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
+        } else {
+            queryPrefix = "Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
+        }
+
+        let relativePath: String
+        if let userId = auth?.userId, !userId.isEmpty {
+            relativePath = "Users/\(userId)/Items?\(queryPrefix)"
+        } else {
+            relativePath = "Items?\(queryPrefix)"
+        }
+        let url = try makeURL(protocolKind: source.protocolKind ?? .jellyfin, baseURL: source.baseUrl, relativePath: relativePath, tokenName: "api_key", token: auth?.token)
+        let (data, response) = try await session.data(from: url)
+        try validateHTTP(response)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = object["Items"] as? [[String: Any]] else {
+            return []
+        }
+
+        return items.compactMap { item in
+            guard let id = item["Id"] as? String, !id.isEmpty else { return nil }
+            let name = (item["Name"] as? String) ?? id
+            let mediaSources = item["MediaSources"] as? [[String: Any]]
+            let mediaPath = (mediaSources?.first?["Path"] as? String) ?? (item["Path"] as? String)
+            let fileName = resolveFileName(path: mediaPath, fallback: name)
+            let mediaSourceId = mediaSources?.first?["Id"] as? String
+            let container = mediaSources?.first?["Container"] as? String
+            return ScannedMediaFile(
+                relativePath: embyCompatiblePlaybackRelativePath(
+                    itemId: id,
+                    mediaSourceId: mediaSourceId,
+                    fileName: fileName,
+                    mediaPath: mediaPath,
+                    container: container
+                ),
+                fileName: fileName
+            )
+        }
+    }
+
+    private func embyCompatiblePlaybackRelativePath(itemId: String, mediaSourceId: String?, fileName: String, mediaPath: String?, container: String?) -> String {
+        guard isEmbyCompatibleDiscImageOrFolder(fileName: fileName, mediaPath: mediaPath, container: container) else {
+            return "Items/\(itemId)/Download"
+        }
+        var components = URLComponents()
+        components.path = "Videos/\(itemId)/master.m3u8"
+        let resolvedMediaSourceId = mediaSourceId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? mediaSourceId!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : itemId
+        let playSessionId = "omniplay\(itemId.filter { $0.isLetter || $0.isNumber })"
+        let quality = embyCompatibleHlsQuality(for: fileName)
+        let items = [
+            URLQueryItem(name: "MediaSourceId", value: resolvedMediaSourceId),
+            URLQueryItem(name: "PlaySessionId", value: playSessionId),
+            URLQueryItem(name: "DeviceId", value: "omniplay-mac"),
+            URLQueryItem(name: "EnableAutoStreamCopy", value: "true"),
+            URLQueryItem(name: "AllowVideoStreamCopy", value: "true"),
+            URLQueryItem(name: "AllowAudioStreamCopy", value: "true"),
+            URLQueryItem(name: "EnableAdaptiveBitrateStreaming", value: "false"),
+            URLQueryItem(name: "VideoCodec", value: "h264,hevc"),
+            URLQueryItem(name: "AudioCodec", value: "aac,ac3,eac3,dts,flac,truehd,mp3,opus,vorbis"),
+            URLQueryItem(name: "SegmentContainer", value: "ts"),
+            URLQueryItem(name: "SegmentLength", value: "6"),
+            URLQueryItem(name: "MinSegments", value: "1"),
+            URLQueryItem(name: "VideoBitRate", value: "\(quality.videoBitRate)"),
+            URLQueryItem(name: "MaxStreamingBitrate", value: "\(quality.maxStreamingBitrate)"),
+            URLQueryItem(name: "AudioBitRate", value: "640000"),
+            URLQueryItem(name: "MaxWidth", value: "\(quality.maxWidth)"),
+            URLQueryItem(name: "MaxHeight", value: "\(quality.maxHeight)"),
+            URLQueryItem(name: "Profile", value: "high"),
+            URLQueryItem(name: "Level", value: "51"),
+            URLQueryItem(name: "RequireAvc", value: "false"),
+            URLQueryItem(name: "TranscodingMaxAudioChannels", value: "6"),
+            URLQueryItem(name: "BreakOnNonKeyFrames", value: "false"),
+            URLQueryItem(name: "CopyTimestamps", value: "true"),
+            URLQueryItem(name: "Context", value: "Streaming")
+        ]
+        components.queryItems = items
+        return components.string ?? "Videos/\(itemId)/master.m3u8"
+    }
+
+    private func embyCompatibleHlsQuality(for fileName: String) -> (videoBitRate: Int, maxStreamingBitrate: Int, maxWidth: Int, maxHeight: Int) {
+        let lower = fileName.lowercased()
+        if lower.contains("2160p") || lower.contains("uhd") || lower.contains("4k") {
+            return (60_000_000, 70_000_000, 3840, 2160)
+        }
+        return (35_000_000, 45_000_000, 1920, 1080)
+    }
+
+    private func isEmbyCompatibleDiscImageOrFolder(fileName: String, mediaPath: String?, container: String?) -> Bool {
+        let lowerName = fileName.lowercased()
+        let fileExtension = (fileName as NSString).pathExtension.lowercased()
+        if fileExtension == "iso" { return true }
+        let lowerPath = mediaPath?.lowercased() ?? ""
+        if lowerPath.contains("/bdmv") || lowerPath.contains("\\bdmv") { return true }
+        let lowerContainer = container?.lowercased() ?? ""
+        if lowerContainer.contains("iso") || lowerContainer.contains("bluray") || lowerContainer.contains("bdmv") { return true }
+        let mediaFileExtensions: Set<String> = ["mp4", "mkv", "mov", "avi", "rmvb", "flv", "webm", "m2ts", "m2t", "ts", "m4v", "wmv"]
+        if mediaFileExtensions.contains(fileExtension) { return false }
+        return lowerName.contains("bdmv")
+            || lowerName.contains("blu-ray")
+            || lowerName.contains("bluray")
+            || lowerName.contains("uhd")
+    }
+
+    private func makeURL(protocolKind: MediaSourceProtocol, baseURL: String, relativePath: String, tokenName: String, token: String?) throws -> URL {
+        let normalized = protocolKind.normalizedBaseURL(baseURL)
+        guard let base = URL(string: normalized + "/") else {
+            throw MediaSourceScanError.invalidBaseURL(baseURL)
+        }
+        let composed = URL(string: relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/")), relativeTo: base)?.absoluteURL
+        guard var components = composed.flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else {
+            throw MediaSourceScanError.invalidBaseURL(baseURL)
+        }
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var items = components.queryItems ?? []
+            items.append(URLQueryItem(name: tokenName, value: token.trimmingCharacters(in: .whitespacesAndNewlines)))
+            components.queryItems = items
+        }
+        guard let url = components.url else {
+            throw MediaSourceScanError.invalidBaseURL(baseURL)
+        }
+        return url
+    }
+
+    private func makeRequest(protocolKind: MediaSourceProtocol, baseURL: String, relativePath: String, tokenName: String, token: String?) throws -> URLRequest {
+        let url = try makeURL(
+            protocolKind: protocolKind,
+            baseURL: baseURL,
+            relativePath: relativePath,
+            tokenName: protocolKind == .plex ? "" : tokenName,
+            token: protocolKind == .plex ? nil : token
+        )
+        var request = URLRequest(url: url)
+        if protocolKind == .plex {
+            request.setValue("application/xml", forHTTPHeaderField: "Accept")
+            applyPlexHeaders(to: &request, token: token)
+        }
+        return request
+    }
+
+    private func applyPlexHeaders(to request: inout URLRequest, token: String?) {
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Product")
+        request.setValue("1.0", forHTTPHeaderField: "X-Plex-Version")
+        request.setValue("omniplay-mac", forHTTPHeaderField: "X-Plex-Client-Identifier")
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Device-Name")
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            request.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Plex-Token")
+        }
+    }
+
+    private func validateHTTP(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw MediaSourceScanError.requestFailed("媒体服务器请求失败：未收到有效响应。")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw MediaSourceScanError.requestFailed("媒体服务器请求失败：HTTP \(http.statusCode)。")
+        }
+    }
+
+    private func resolveFileName(path: String?, fallback: String) -> String {
+        let name = path.map { ($0 as NSString).lastPathComponent } ?? ""
+        if !name.isEmpty { return name }
+        return fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "media" : fallback
+    }
+}
+
+struct MediaServerPreflightResult {
+    let isReachable: Bool
+    let message: String
+    let mediaCount: Int
+}
+
+struct MediaServerPreflightChecker {
+    func check(
+        protocolKind: MediaSourceProtocol,
+        baseURL: String,
+        token: String,
+        userId: String
+    ) async -> MediaServerPreflightResult {
+        let normalizedURL = protocolKind.normalizedBaseURL(baseURL)
+        guard protocolKind == .plex || protocolKind == .emby || protocolKind == .jellyfin,
+              protocolKind.isValidBaseURL(normalizedURL) else {
+            return MediaServerPreflightResult(
+                isReachable: false,
+                message: "媒体服务器地址无效，请输入 http(s):// 开头且包含主机名的地址。",
+                mediaCount: 0
+            )
+        }
+
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToken.isEmpty else {
+            return MediaServerPreflightResult(
+                isReachable: false,
+                message: "\(protocolLabel(protocolKind)) 需要访问令牌才能读取媒体列表和生成播放地址。",
+                mediaCount: 0
+            )
+        }
+
+        let source = MediaSource(
+            id: nil,
+            name: protocolLabel(protocolKind),
+            protocolType: protocolKind.rawValue,
+            baseUrl: normalizedURL,
+            authConfig: MediaServerAuthConfig.encode(token: trimmedToken, userId: userId),
+            isEnabled: true,
+            disabledAt: nil
+        )
+
+        do {
+            let files = try await MediaServerScanner(source: source).scanFiles(in: source)
+            let samples = Array(Set(files.map(\.fileName).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })).prefix(3)
+            var message = files.isEmpty
+                ? "预扫描成功：连接可用，但没有发现电影或剧集条目。"
+                : "预扫描成功：发现 \(files.count) 个可传输媒体条目。"
+            if !samples.isEmpty {
+                message += " 示例：\(samples.joined(separator: "、"))"
+            }
+            return MediaServerPreflightResult(isReachable: true, message: message, mediaCount: files.count)
+        } catch let error as MediaSourceScanError {
+            return MediaServerPreflightResult(
+                isReachable: false,
+                message: "媒体服务器预扫描失败：\(error.localizedDescription)",
+                mediaCount: 0
+            )
+        } catch {
+            return MediaServerPreflightResult(
+                isReachable: false,
+                message: "媒体服务器预扫描失败：\(error.localizedDescription)",
+                mediaCount: 0
+            )
+        }
+    }
+
+    private func protocolLabel(_ value: MediaSourceProtocol) -> String {
+        switch value {
+        case .plex: return "Plex"
+        case .emby: return "Emby"
+        case .jellyfin: return "Jellyfin"
+        default: return "媒体服务器"
+        }
+    }
+}
+
 private enum MediaSourceScannerFactory {
     static func make(source: MediaSource) throws -> any MediaSourceScanner {
         guard let protocolKind = source.protocolKind else {
@@ -1935,6 +3016,11 @@ private enum MediaSourceScannerFactory {
                 throw MediaSourceScanError.invalidBaseURL(source.baseUrl)
             }
             return WebDAVScanner(source: source)
+        case .plex, .emby, .jellyfin:
+            guard source.protocolKind?.isValidBaseURL(source.baseUrl) == true else {
+                throw MediaSourceScanError.invalidBaseURL(source.baseUrl)
+            }
+            return MediaServerScanner(source: source)
         case .direct:
             throw MediaSourceScanError.unsupportedProtocol(MediaSourceProtocol.direct.rawValue)
         }
@@ -1947,7 +3033,11 @@ extension MediaLibraryManager {
         _ = await scanLocalSourceWithResult(source)
     }
 
-    func scanLocalSourceWithResult(_ source: MediaSource) async -> MediaSourceScanResult {
+    func scanLocalSourceWithResult(
+        _ source: MediaSource,
+        deferUnidentifiedGroups: Bool = false,
+        afterGroupIndexed: ((Int64) async -> Void)? = nil
+    ) async -> MediaSourceScanResult {
         guard let sourceId = source.id else {
             let message = "媒体源缺少ID，无法扫描。"
             return MediaSourceScanResult(
@@ -2003,19 +3093,39 @@ extension MediaLibraryManager {
             )
         }
 
+        let sourceStillEnabled = (try? await sourceExists(sourceId)) == true
+        if Task.isCancelled || !sourceStillEnabled {
+            return MediaSourceScanResult(
+                sourceId: sourceId,
+                sourceName: scanningSource.name,
+                protocolType: scanningSource.protocolType,
+                scannedCount: 0,
+                insertedCount: 0,
+                removedCount: 0,
+                errorCategory: nil,
+                userMessage: "扫描已停止：媒体源已关闭、移除或同步任务已取消。",
+                diagnostic: nil
+            )
+        }
+
         print("✅ 雷达扫描完毕：共找到 \(scannedFiles.count) 个可用视频文件。准备入库...")
         print("==================================\n")
 
         let scannedPathSet = Set(scannedFiles.map(\.relativePath))
+        let localSidecarImports = buildLocalSidecarImports(for: scannedFiles, source: scanningSource)
         var insertedCount = 0
         var removedCount = 0
+        var deferredUnidentifiedGroups: [PendingScannedMediaGroup] = []
 
         do {
-            let counts = try await dbQueue.write { db -> (inserted: Int, removed: Int) in
+            let existingFiles = try await dbQueue.read { db in
                 let existingFiles = try VideoFile
                     .filter(Column("sourceId") == sourceId)
                     .fetchAll(db)
+                return existingFiles
+            }
 
+            removedCount = try await dbQueue.write { db -> Int in
                 var localRemovedCount = 0
                 for file in existingFiles where !scannedPathSet.contains(file.relativePath) {
                     _ = try VideoFile.deleteOne(db, key: file.id)
@@ -2024,38 +3134,38 @@ extension MediaLibraryManager {
                 if localRemovedCount > 0 {
                     print("🧹 已移除 \(localRemovedCount) 个源内不存在的旧文件记录。")
                 }
-
-                let existingPathSet = Set(existingFiles.map(\.relativePath))
-                var localInsertedCount = 0
-                for item in scannedFiles where !existingPathSet.contains(item.relativePath) {
-                    let relativePath = item.relativePath
-
-                    var fakeMovieId = Int64(relativePath.hashValue)
-                    fakeMovieId = fakeMovieId > 0 ? -fakeMovieId : fakeMovieId
-                    if fakeMovieId == 0 { fakeMovieId = -Int64.random(in: 1...999999) }
-
-                    var displayTitle = (item.fileName as NSString).deletingPathExtension
-                    let comps = relativePath.components(separatedBy: "/")
-                    if let bdmvIndex = comps.firstIndex(of: "BDMV"), bdmvIndex > 0 {
-                        displayTitle = comps[bdmvIndex - 1]
-                    } else if (displayTitle.count <= 2 && displayTitle.allSatisfy { $0.isNumber }) || displayTitle == "00000" {
-                        if comps.count >= 2 { displayTitle = comps[comps.count - 2] }
-                    }
-
-                    let dummyMovie = Movie(id: fakeMovieId, title: displayTitle, releaseDate: nil, overview: "正在排队等待刮削...", posterPath: nil, voteAverage: nil, isLocked: false)
-                    try? dummyMovie.insert(db)
-
-                    let newVideo = VideoFile(id: UUID().uuidString, sourceId: sourceId, relativePath: relativePath, fileName: item.fileName, mediaType: "unmatched", movieId: fakeMovieId, episodeId: nil, playProgress: 0.0, duration: 0.0)
-                    try newVideo.insert(db)
-                    localInsertedCount += 1
-                }
-
-                // 删除失去任何视频关联的影视卡片，避免首页残留“已不存在文件”的旧条目
-                try db.execute(sql: "DELETE FROM movie WHERE id NOT IN (SELECT DISTINCT movieId FROM videoFile WHERE movieId IS NOT NULL)")
-                return (inserted: localInsertedCount, removed: localRemovedCount)
+                return localRemovedCount
             }
-            insertedCount = counts.inserted
-            removedCount = counts.removed
+
+            let existingPathSet = Set(existingFiles.filter { scannedPathSet.contains($0.relativePath) }.map(\.relativePath))
+            let pendingGroups = buildPendingMediaGroups(
+                from: scannedFiles,
+                sourceId: sourceId,
+                existingPathSet: existingPathSet,
+                localSidecarImports: localSidecarImports
+            )
+            let groupsToInsert: [PendingScannedMediaGroup]
+            if deferUnidentifiedGroups {
+                deferredUnidentifiedGroups = pendingGroups.filter { !$0.shouldAttemptAutomaticScrape }
+                groupsToInsert = pendingGroups.filter { $0.shouldAttemptAutomaticScrape }
+            } else {
+                groupsToInsert = pendingGroups
+            }
+
+            for group in groupsToInsert {
+                try Task.checkCancellation()
+                let groupInsertCount = try await insertPendingMediaGroup(group, sourceId: sourceId)
+                guard groupInsertCount > 0 else { continue }
+                insertedCount += groupInsertCount
+                DispatchQueue.main.async { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
+                if group.shouldAttemptAutomaticScrape, let afterGroupIndexed {
+                    await afterGroupIndexed(group.fakeMovieId)
+                }
+            }
+
+            try await dbQueue.write { db in
+                try db.execute(sql: "DELETE FROM movie WHERE id NOT IN (SELECT DISTINCT movieId FROM videoFile WHERE movieId IS NOT NULL)")
+            }
         } catch {
             print("❌ 扫描入库失败：\(error)")
             let category: MediaSourceScanErrorCategory = .unknown
@@ -2089,8 +3199,38 @@ extension MediaLibraryManager {
             removedCount: removedCount,
             errorCategory: nil,
             userMessage: "扫描完成：新增 \(insertedCount)，移除 \(removedCount)，共发现 \(scannedFiles.count) 个文件。",
-            diagnostic: nil
+            diagnostic: nil,
+            deferredUnidentifiedGroups: deferredUnidentifiedGroups
         )
+    }
+
+    func insertDeferredUnidentifiedMedia(from results: [MediaSourceScanResult]) async -> Int {
+        var pendingBatches: [(sourceId: Int64, group: PendingScannedMediaGroup)] = []
+        for result in results where result.isSuccess {
+            guard let sourceId = result.sourceId else { continue }
+            for group in result.deferredUnidentifiedGroups {
+                pendingBatches.append((sourceId: sourceId, group: group))
+            }
+        }
+        guard !pendingBatches.isEmpty else { return 0 }
+
+        var insertedCount = 0
+        for batch in pendingBatches {
+            do {
+                try Task.checkCancellation()
+                let count = try await insertPendingMediaGroup(batch.group, sourceId: batch.sourceId)
+                insertedCount += count
+            } catch is CancellationError {
+                return insertedCount
+            } catch {
+                print("❌ 未识别视频入库失败：\(error)")
+            }
+        }
+
+        if insertedCount > 0 {
+            DispatchQueue.main.async { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
+        }
+        return insertedCount
     }
 
     private func migrateWebDAVCredentialIfNeeded(_ source: MediaSource) async -> MediaSource {
@@ -2127,6 +3267,199 @@ extension MediaLibraryManager {
             print("⚠️ WebDAV 凭据迁移 Keychain 失败，继续使用旧配置：\(error.localizedDescription)")
         }
         return migratedSource
+    }
+
+    private func buildPendingMediaGroups(
+        from scannedFiles: [ScannedMediaFile],
+        sourceId: Int64,
+        existingPathSet: Set<String>,
+        localSidecarImports: [String: LocalSidecarImport]
+    ) -> [PendingScannedMediaGroup] {
+        var seenRelativePaths = existingPathSet
+        var orderedKeys: [String] = []
+        var groups: [String: PendingScannedMediaGroup] = [:]
+
+        for item in scannedFiles {
+            let relativePath = item.relativePath
+            guard !seenRelativePaths.contains(relativePath) else { continue }
+            seenRelativePaths.insert(relativePath)
+
+            let sidecar = localSidecarImports[relativePath]
+            let parsedTitle = MediaNameParser.extractedDisplayTitle(relativePath: relativePath, fileName: item.fileName)
+            let sidecarTitle = sidecar?.metadata?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let importedTitle = sidecarTitle?.isEmpty == false ? sidecarTitle : nil
+            let shouldAttemptAutomaticScrape = importedTitle != nil || parsedTitle != nil
+            let displayTitleBase = importedTitle
+                ?? parsedTitle
+                ?? fallbackDisplayTitle(relativePath: relativePath, fileName: item.fileName)
+            let isEpisode = MediaNameParser.isLikelyTVEpisodePath(relativePath) || MediaNameParser.isLikelyTVEpisodePath(item.fileName)
+            let groupingKey: String
+            if shouldAttemptAutomaticScrape {
+                groupingKey = isEpisode ? "\(sourceId)#tv#\(displayTitleBase.lowercased())" : "\(sourceId)#movie#\(relativePath)"
+            } else {
+                groupingKey = isEpisode ? "\(sourceId)#unidentified-tv#\(displayTitleBase.lowercased())" : "\(sourceId)#unidentified#\(relativePath)"
+                print("📌 无法提取影视名称，待自动刮削完成后显示到首页：\(item.fileName)")
+            }
+            var fakeMovieId = Int64(groupingKey.hashValue)
+            fakeMovieId = fakeMovieId > 0 ? -fakeMovieId : fakeMovieId
+            if fakeMovieId == 0 { fakeMovieId = -Int64.random(in: 1...999999) }
+
+            var displayTitle = displayTitleBase
+            let comps = relativePath.components(separatedBy: "/")
+            if let bdmvIndex = comps.firstIndex(of: "BDMV"), bdmvIndex > 0 {
+                displayTitle = comps[bdmvIndex - 1]
+            } else if (displayTitle.count <= 2 && displayTitle.allSatisfy { $0.isNumber }) || displayTitle == "00000" {
+                if comps.count >= 2 { displayTitle = comps[comps.count - 2] }
+            }
+
+            let pendingItem = PendingScannedMediaItem(file: item, sidecar: sidecar)
+            if var group = groups[groupingKey] {
+                if group.importedMetadata == nil {
+                    group.importedMetadata = sidecar?.metadata
+                }
+                group.items.append(pendingItem)
+                groups[groupingKey] = group
+            } else {
+                orderedKeys.append(groupingKey)
+                groups[groupingKey] = PendingScannedMediaGroup(
+                    fakeMovieId: fakeMovieId,
+                    displayTitle: displayTitle,
+                    importedMetadata: sidecar?.metadata,
+                    shouldAttemptAutomaticScrape: shouldAttemptAutomaticScrape,
+                    items: [pendingItem]
+                )
+            }
+        }
+
+        let orderedGroups = orderedKeys.compactMap { groups[$0] }
+        return orderedGroups.filter { $0.shouldAttemptAutomaticScrape } + orderedGroups.filter { !$0.shouldAttemptAutomaticScrape }
+    }
+
+    private func fallbackDisplayTitle(relativePath: String, fileName: String) -> String {
+        let normalizedPath = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = normalizedPath.split(separator: "/").map(String.init)
+        if let bdmvIndex = components.firstIndex(of: "BDMV"), bdmvIndex > 0 {
+            return sanitizedFallbackTitle(components[bdmvIndex - 1], fallback: fileName)
+        }
+        if let streamIndex = components.firstIndex(of: "STREAM"), streamIndex > 1 {
+            return sanitizedFallbackTitle(components[streamIndex - 2], fallback: fileName)
+        }
+        if MediaNameParser.isLikelyTVEpisodePath(relativePath) || MediaNameParser.isLikelyTVEpisodePath(fileName),
+           let showFolder = fallbackShowFolderTitle(from: components) {
+            return showFolder
+        }
+        let stem = (fileName as NSString).deletingPathExtension
+        return sanitizedFallbackTitle(stem, fallback: normalizedPath.isEmpty ? fileName : normalizedPath)
+    }
+
+    private func fallbackShowFolderTitle(from components: [String]) -> String? {
+        guard components.count >= 2 else { return nil }
+        let parent = components[components.count - 2]
+        if isSeasonFolderName(parent), components.count >= 3 {
+            return sanitizedFallbackTitle(components[components.count - 3], fallback: parent)
+        }
+        return sanitizedFallbackTitle(parent, fallback: components.last ?? parent)
+    }
+
+    private func isSeasonFolderName(_ value: String) -> Bool {
+        value.range(of: #"(?i)^(season|s)\s*[\._-]?\s*\d{1,2}$"#, options: .regularExpression) != nil
+            || value.range(of: #"^第\s*[一二三四五六七八九十零〇两\d]{1,3}\s*季$"#, options: .regularExpression) != nil
+    }
+
+    private func sanitizedFallbackTitle(_ value: String, fallback: String) -> String {
+        let cleaned = value
+            .replacingOccurrences(of: #"[._]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty { return cleaned }
+        let fallbackStem = ((fallback as NSString).lastPathComponent as NSString).deletingPathExtension
+            .replacingOccurrences(of: #"[._]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallbackStem.isEmpty ? "未识别视频" : fallbackStem
+    }
+
+    private func insertPendingMediaGroup(_ group: PendingScannedMediaGroup, sourceId: Int64) async throws -> Int {
+        try await dbQueue.write { db -> Int in
+            let sourceCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM mediaSource WHERE id = ? AND COALESCE(isEnabled, 1) = 1",
+                arguments: [sourceId]
+            ) ?? 0
+            guard sourceCount > 0 else { return 0 }
+
+            let imported = group.importedMetadata
+            let dummyMovie = Movie(
+                id: group.fakeMovieId,
+                title: group.displayTitle,
+                releaseDate: imported?.date,
+                overview: imported?.overview ?? (group.shouldAttemptAutomaticScrape ? "正在排队等待刮削..." : "未能自动识别影视名称，可手动重新匹配。"),
+                posterPath: imported?.posterPath,
+                voteAverage: imported?.voteAverage,
+                isLocked: imported != nil || !group.shouldAttemptAutomaticScrape
+            )
+            try? dummyMovie.insert(db)
+
+            var insertedCount = 0
+            for item in group.items {
+                let newVideo = VideoFile(
+                    id: UUID().uuidString,
+                    sourceId: sourceId,
+                    relativePath: item.file.relativePath,
+                    fileName: item.file.fileName,
+                    mediaType: group.shouldAttemptAutomaticScrape ? "unmatched" : "movie",
+                    movieId: group.fakeMovieId,
+                    episodeId: nil,
+                    playProgress: 0.0,
+                    duration: 0.0
+                )
+                try newVideo.insert(db)
+                if let thumbnailPath = item.sidecar?.episodeMetadata?.thumbnailPath {
+                    let sourceURL = URL(fileURLWithPath: thumbnailPath)
+                    let destinationURL = localEpisodeThumbnailURL(for: newVideo.id)
+                    if FileManager.default.fileExists(atPath: sourceURL.path) {
+                        try? FileManager.default.removeItem(at: destinationURL)
+                        try? FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+                    }
+                }
+                insertedCount += 1
+            }
+            return insertedCount
+        }
+    }
+
+    nonisolated private func localEpisodeThumbnailURL(for fileId: String) -> URL {
+        let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OmniPlayThumbnails")
+        if !FileManager.default.fileExists(atPath: cacheDirectory.path) {
+            try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        }
+        return cacheDirectory.appendingPathComponent("\(fileId).jpg")
+    }
+
+    private func buildLocalSidecarImports(for scannedFiles: [ScannedMediaFile], source: MediaSource) -> [String: LocalSidecarImport] {
+        guard source.protocolKind == .local,
+              UserDefaults.standard.bool(forKey: "enableLocalMetadataImport") else {
+            return [:]
+        }
+
+        let rootURL = URL(fileURLWithPath: MediaSourceProtocol.local.normalizedBaseURL(source.baseUrl))
+        var results: [String: LocalSidecarImport] = [:]
+        for file in scannedFiles {
+            let videoURL = rootURL.appendingPathComponent(file.relativePath)
+            let isEpisode = MediaNameParser.isLikelyTVEpisodePath(file.relativePath)
+            let metadata = isEpisode
+                ? (LocalMetadataSidecarStore.shared.readTVShowMetadata(videoURL: videoURL)
+                   ?? LocalMetadataSidecarStore.shared.readMovieMetadata(videoURL: videoURL))
+                : LocalMetadataSidecarStore.shared.readMovieMetadata(videoURL: videoURL)
+            let episodeMetadata = isEpisode
+                ? LocalMetadataSidecarStore.shared.readEpisodeMetadata(videoURL: videoURL)
+                : nil
+            if metadata != nil || episodeMetadata != nil {
+                results[file.relativePath] = LocalSidecarImport(metadata: metadata, episodeMetadata: episodeMetadata)
+            }
+        }
+        return results
     }
 
     private func classifyScanError(_ error: Error, source: MediaSource) -> MediaSourceScanErrorCategory {

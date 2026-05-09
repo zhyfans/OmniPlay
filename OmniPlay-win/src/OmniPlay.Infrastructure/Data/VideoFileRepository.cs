@@ -7,10 +7,15 @@ using OmniPlay.Infrastructure.Library;
 
 namespace OmniPlay.Infrastructure.Data;
 
-public sealed class VideoFileRepository : IVideoFileRepository
-{
-    private readonly SqliteDatabase database;
-    private readonly IStoragePaths storagePaths;
+    public sealed class VideoFileRepository : IVideoFileRepository
+    {
+        private static readonly HashSet<string> MediaFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m2ts", ".m2t", ".ts", ".m4v", ".flv", ".webm", ".rmvb"
+        };
+
+        private readonly SqliteDatabase database;
+        private readonly IStoragePaths storagePaths;
 
     public VideoFileRepository(SqliteDatabase database, IStoragePaths storagePaths)
     {
@@ -26,6 +31,7 @@ public sealed class VideoFileRepository : IVideoFileRepository
                 """
                 SELECT videoFile.id,
                        videoFile.fileName,
+                       videoFile.metadataPath,
                        videoFile.relativePath,
                        mediaSource.protocolType AS SourceProtocolType,
                        mediaSource.baseUrl AS SourceBasePath,
@@ -62,6 +68,7 @@ public sealed class VideoFileRepository : IVideoFileRepository
                 """
                 SELECT videoFile.id,
                        videoFile.fileName,
+                       videoFile.metadataPath,
                        videoFile.relativePath,
                        mediaSource.protocolType AS SourceProtocolType,
                        mediaSource.baseUrl AS SourceBasePath,
@@ -362,21 +369,24 @@ public sealed class VideoFileRepository : IVideoFileRepository
         var resolvedThumbnailPath = File.Exists(thumbnailPath) ? thumbnailPath : null;
         var customThumbnailPath = ResolveCustomThumbnailPath(row.CustomEpisodeThumbnailPath);
         var authConfig = MediaSourceAuthConfigProtector.UnprotectFromStorage(row.SourceAuthConfig);
+        var playbackRelativePath = ResolveRemoteIsoPlaybackRelativePath(row.SourceProtocolType, row.RelativePath, row.FileName);
 
         return new LibraryVideoItem
         {
             Id = row.Id,
             FileName = row.FileName,
             RelativePath = row.RelativePath,
+            MetadataPath = row.MetadataPath,
             AbsolutePath = MediaSourcePathResolver.ResolvePlaybackPath(
                 row.SourceProtocolType,
                 row.SourceBasePath,
-                row.RelativePath),
+                playbackRelativePath),
             PlaybackPath = MediaSourcePathResolver.ResolveAuthenticatedPlaybackPath(
                 row.SourceProtocolType,
                 row.SourceBasePath,
-                row.RelativePath,
+                playbackRelativePath,
                 authConfig),
+            LocalIsoPlaybackPath = ResolveLocalIsoPlaybackPath(row.SourceProtocolType, row.MetadataPath, row.FileName),
             ThumbnailPath = resolvedThumbnailPath,
             CustomThumbnailPath = customThumbnailPath,
             FallbackImagePath = row.FallbackImagePath,
@@ -401,6 +411,127 @@ public sealed class VideoFileRepository : IVideoFileRepository
         };
     }
 
+    private static string ResolveRemoteIsoPlaybackRelativePath(string protocolType, string relativePath, string fileName)
+    {
+        var protocol = protocolType.Trim().ToLowerInvariant();
+        if (protocol is not ("emby" or "jellyfin") ||
+            !IsRemoteDiscImageOrFolder(fileName, relativePath))
+        {
+            return relativePath;
+        }
+
+        var pathOnly = relativePath.Split('?', 2)[0].Trim('/');
+        var parts = pathOnly.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3)
+        {
+            return relativePath;
+        }
+
+        var isDownloadPath = string.Equals(parts[0], "Items", StringComparison.OrdinalIgnoreCase) &&
+                             string.Equals(parts[2], "Download", StringComparison.OrdinalIgnoreCase);
+        var isHlsPath = string.Equals(parts[0], "Videos", StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(parts[2], "master.m3u8", StringComparison.OrdinalIgnoreCase);
+        if (!isDownloadPath && !isHlsPath)
+        {
+            return relativePath;
+        }
+
+        var itemId = parts[1];
+        var mediaSourceId = ReadQueryParameter(relativePath, "mediaSourceId") ?? itemId;
+        var playSessionId = $"omniplay{new string(itemId.Where(char.IsLetterOrDigit).ToArray())}";
+        return $"Videos/{Uri.EscapeDataString(itemId)}/master.m3u8?{BuildEmbyCompatibleHlsQuery(mediaSourceId, playSessionId, "omniplay-windows", fileName)}";
+    }
+
+    private static string? ReadQueryParameter(string value, string name)
+    {
+        var queryStart = value.IndexOf('?');
+        if (queryStart < 0 || queryStart == value.Length - 1)
+        {
+            return null;
+        }
+
+        foreach (var part in value[(queryStart + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = part.IndexOf('=');
+            var rawName = separator >= 0 ? part[..separator] : part;
+            if (!string.Equals(Uri.UnescapeDataString(rawName), name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var rawValue = separator >= 0 ? part[(separator + 1)..] : string.Empty;
+            var decoded = Uri.UnescapeDataString(rawValue.Replace("+", "%20", StringComparison.Ordinal));
+            return string.IsNullOrWhiteSpace(decoded) ? null : decoded;
+        }
+
+        return null;
+    }
+
+    private static string BuildEmbyCompatibleHlsQuery(string mediaSourceId, string playSessionId, string deviceId, string fileName)
+    {
+        var quality = ResolveEmbyCompatibleHlsQuality(fileName);
+        return string.Join(
+            '&',
+            $"MediaSourceId={Uri.EscapeDataString(mediaSourceId)}",
+            $"PlaySessionId={Uri.EscapeDataString(playSessionId)}",
+            $"DeviceId={Uri.EscapeDataString(deviceId)}",
+            "EnableAutoStreamCopy=true",
+            "AllowVideoStreamCopy=true",
+            "AllowAudioStreamCopy=true",
+            "EnableAdaptiveBitrateStreaming=false",
+            $"VideoCodec={Uri.EscapeDataString("h264,hevc")}",
+            $"AudioCodec={Uri.EscapeDataString("aac,ac3,eac3,dts,flac,truehd,mp3,opus,vorbis")}",
+            "SegmentContainer=ts",
+            "SegmentLength=6",
+            "MinSegments=1",
+            $"VideoBitRate={quality.VideoBitRate}",
+            $"MaxStreamingBitrate={quality.MaxStreamingBitrate}",
+            "AudioBitRate=640000",
+            $"MaxWidth={quality.MaxWidth}",
+            $"MaxHeight={quality.MaxHeight}",
+            "Profile=high",
+            "Level=51",
+            "RequireAvc=false",
+            "TranscodingMaxAudioChannels=6",
+            "BreakOnNonKeyFrames=false",
+            "CopyTimestamps=true",
+            "Context=Streaming");
+    }
+
+    private static (int VideoBitRate, int MaxStreamingBitrate, int MaxWidth, int MaxHeight) ResolveEmbyCompatibleHlsQuality(string fileName)
+    {
+        return fileName.Contains("2160p", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Contains("uhd", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Contains("4k", StringComparison.OrdinalIgnoreCase)
+            ? (60_000_000, 70_000_000, 3840, 2160)
+            : (35_000_000, 45_000_000, 1920, 1080);
+    }
+
+    private static bool IsRemoteDiscImageOrFolder(string fileName, string relativePath)
+    {
+        var extension = Path.GetExtension(fileName);
+        if (string.Equals(extension, ".iso", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (relativePath.Contains("/BDMV", StringComparison.OrdinalIgnoreCase) ||
+            relativePath.Contains("\\BDMV", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (MediaFileExtensions.Contains(extension))
+        {
+            return false;
+        }
+
+        return fileName.Contains("BDMV", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Contains("Blu-ray", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Contains("BluRay", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Contains("UHD", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string? ResolveCustomThumbnailPath(string? path)
     {
         if (string.IsNullOrWhiteSpace(path))
@@ -414,11 +545,38 @@ public sealed class VideoFileRepository : IVideoFileRepository
             : null;
     }
 
+    private static string? ResolveLocalIsoPlaybackPath(string protocolType, string? metadataPath, string fileName)
+    {
+        var protocol = protocolType.Trim().ToLowerInvariant();
+        if (protocol is "emby" or "jellyfin")
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(metadataPath) ||
+            !string.Equals(Path.GetExtension(fileName), ".iso", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var candidate = metadataPath.Trim();
+        if (!Path.IsPathRooted(candidate) ||
+            !string.Equals(Path.GetExtension(candidate), ".iso", StringComparison.OrdinalIgnoreCase) ||
+            !File.Exists(candidate))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(candidate);
+    }
+
     private sealed class VideoFileRow
     {
         public string Id { get; init; } = string.Empty;
 
         public string FileName { get; init; } = string.Empty;
+
+        public string? MetadataPath { get; init; }
 
         public string RelativePath { get; init; } = string.Empty;
 

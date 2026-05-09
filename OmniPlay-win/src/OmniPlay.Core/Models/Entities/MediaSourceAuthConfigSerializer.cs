@@ -38,4 +38,49 @@ public static class MediaSourceAuthConfigSerializer
             return null;
         }
     }
+
+    public static string? SerializeMediaServer(MediaServerAuthConfig? config)
+    {
+        if (config is null)
+        {
+            return null;
+        }
+
+        var normalized = new MediaServerAuthConfig(
+            config.Token?.Trim() ?? string.Empty,
+            config.UserId?.Trim() ?? string.Empty,
+            config.LibraryId?.Trim() ?? string.Empty,
+            config.LibraryName?.Trim() ?? string.Empty,
+            config.LibraryType?.Trim() ?? string.Empty);
+
+        return string.IsNullOrWhiteSpace(normalized.Token) &&
+               string.IsNullOrWhiteSpace(normalized.UserId) &&
+               string.IsNullOrWhiteSpace(normalized.LibraryId)
+            ? null
+            : JsonSerializer.Serialize(normalized, SerializerOptions);
+    }
+
+    public static MediaServerAuthConfig? DeserializeMediaServer(string? authConfig)
+    {
+        if (string.IsNullOrWhiteSpace(authConfig))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<MediaServerAuthConfig>(authConfig, SerializerOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
+
+public sealed record MediaServerAuthConfig(
+    string Token,
+    string? UserId = null,
+    string? LibraryId = null,
+    string? LibraryName = null,
+    string? LibraryType = null);

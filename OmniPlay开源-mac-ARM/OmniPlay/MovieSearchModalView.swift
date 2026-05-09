@@ -237,14 +237,15 @@ struct MovieSearchModalView: View {
                 let file = try await AppDatabase.shared.dbQueue.read { db -> VideoFile? in
                     try VideoFile.fetchVisibleFirstFile(movieId: currentMovieId, in: db)
                 }
-                await MainActor.run {
-                    if let file {
-                        let fileName = file.fileName
-                        let relativePath = file.relativePath
-                        if !relativePath.isEmpty { self.originalFilename = relativePath } else if !fileName.isEmpty { self.originalFilename = fileName } else { self.originalFilename = "未知文件名" }
-                        
-                        let extracted = self.smartExtractMovieTitleAndYear(from: self.originalFilename)
-                        if !extracted.title.isEmpty { self.searchQuery = extracted.title.trimmingCharacters(in: .whitespacesAndNewlines) }
+	                await MainActor.run {
+	                    if let file {
+	                        self.originalFilename = self.originalDisplayName(
+	                            fileName: file.fileName,
+	                            relativePath: file.relativePath
+	                        )
+	                        
+	                        let extracted = self.smartExtractMovieTitleAndYear(from: self.originalFilename)
+	                        if !extracted.title.isEmpty { self.searchQuery = extracted.title.trimmingCharacters(in: .whitespacesAndNewlines) }
                         if let y = extracted.year, !y.isEmpty { self.searchYear = y }
                     } else { self.originalFilename = "未找到关联的视频文件" }
                 }
@@ -252,10 +253,56 @@ struct MovieSearchModalView: View {
                 await MainActor.run { self.originalFilename = "读取文件信息失败" }
             }
         }
+	    }
+	    
+	    private func originalDisplayName(fileName: String, relativePath: String) -> String {
+	        let trimmedFileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+	        let trimmedRelativePath = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+	        if isMediaServerPlaybackEndpointPath(trimmedRelativePath), !trimmedFileName.isEmpty {
+	            return trimmedFileName
+	        }
+	        if !trimmedRelativePath.isEmpty { return trimmedRelativePath }
+	        if !trimmedFileName.isEmpty { return trimmedFileName }
+	        return "未知文件名"
+	    }
+	    
+	    private func isMediaServerPlaybackEndpointPath(_ value: String) -> Bool {
+	        let normalized = value
+	            .trimmingCharacters(in: .whitespacesAndNewlines)
+	            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+	            .lowercased()
+	        let pathOnly = normalized.split(separator: "?", maxSplits: 1).first.map(String.init) ?? normalized
+	        let parts = pathOnly.split(separator: "/").map(String.init)
+	        if parts.count >= 3,
+	           parts[0] == "items",
+	           parts[2] == "download" {
+	            return true
+	        }
+        if parts.count >= 3,
+           parts[0] == "videos",
+           parts[2] == "master.m3u8" {
+            return true
+        }
+        if parts.count >= 3,
+           parts[0] == "videos",
+           parts[2].hasPrefix("stream.") {
+            return true
+        }
+        if parts.count >= 4,
+           parts[0] == "library",
+           parts[1] == "parts" {
+            return true
+        }
+        if parts.count >= 2,
+           parts[0] == "library",
+           parts[1] == "metadata" {
+            return true
+        }
+        return false
     }
-    
-    func smartExtractMovieTitleAndYear(from rawPath: String) -> (title: String, year: String?) {
-        let extracted = MediaNameParser.extractSearchMetadata(from: rawPath)
+	    
+	    func smartExtractMovieTitleAndYear(from rawPath: String) -> (title: String, year: String?) {
+	        let extracted = MediaNameParser.extractSearchMetadata(from: rawPath)
         let parentChinese = MediaNameParser.extractParentFolderChineseTitle(from: rawPath)
         if let cn = extracted.chineseTitle,
            let parentChinese,

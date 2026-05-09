@@ -22,15 +22,156 @@ private struct RecentWebDAVHistoryItem: Identifiable, Codable, Equatable {
 }
 
 private struct WebDAVBrowserStarredFolder: Identifiable, Equatable {
+    let key: String
+    let protocolKind: MediaSourceProtocol
     let url: String
     let name: String
+    let authConfig: String?
 
-    var id: String { url }
+    var id: String { key }
 }
 
 private enum WebDAVCredentialFlow: Sendable {
     case manual
     case discovered
+}
+
+private struct MediaServerSourceDraft {
+    let protocolKind: MediaSourceProtocol
+    let normalizedURL: String
+    let token: String
+    let userId: String
+    let finalName: String
+    let authConfig: String?
+}
+
+private struct PlexPINAuthSession {
+    let id: String
+    let code: String
+    let authorizationURL: URL
+}
+
+private final class PlexPINAuthClient {
+    static let shared = PlexPINAuthClient()
+    private let clientIdentifierKey = "OmniPlayPlexClientIdentifier"
+    private let session: URLSession
+
+    private init() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 12
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        self.session = URLSession(configuration: configuration)
+    }
+
+    func begin() async throws -> PlexPINAuthSession {
+        let pin = try await createPIN()
+        return PlexPINAuthSession(
+            id: pin.id,
+            code: pin.code,
+            authorizationURL: authorizationURL(for: pin.code)
+        )
+    }
+
+    func waitForToken(pinID: String, timeoutSeconds: Int = 120) async throws -> String {
+        for _ in 0..<timeoutSeconds {
+            try Task.checkCancellation()
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            if let token = try await checkPIN(pinID: pinID) {
+                return token
+            }
+        }
+        throw PlexPINAuthError.timeout
+    }
+
+    private func createPIN() async throws -> (id: String, code: String) {
+        guard let url = URL(string: "https://plex.tv/api/v2/pins") else {
+            throw PlexPINAuthError.invalidResponse
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(to: &request)
+
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response)
+        guard let id = value(named: "id", in: data),
+              let code = value(named: "code", in: data),
+              !id.isEmpty,
+              !code.isEmpty else {
+            throw PlexPINAuthError.invalidResponse
+        }
+        return (id, code)
+    }
+
+    private func checkPIN(pinID: String) async throws -> String? {
+        guard let url = URL(string: "https://plex.tv/api/v2/pins/\(pinID)") else {
+            throw PlexPINAuthError.invalidResponse
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyHeaders(to: &request)
+
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response)
+        return value(named: "authToken", in: data)
+    }
+
+    private func authorizationURL(for code: String) -> URL {
+        var components = URLComponents(string: "https://plex.tv/link/")!
+        components.queryItems = [URLQueryItem(name: "pin", value: code)]
+        return components.url!
+    }
+
+    private var clientIdentifier: String {
+        if let existing = UserDefaults.standard.string(forKey: clientIdentifierKey), !existing.isEmpty {
+            return existing
+        }
+        let identifier = "omniplay-mac-\(UUID().uuidString)"
+        UserDefaults.standard.set(identifier, forKey: clientIdentifierKey)
+        return identifier
+    }
+
+    private func applyHeaders(to request: inout URLRequest) {
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Product")
+        request.setValue("1.0", forHTTPHeaderField: "X-Plex-Version")
+        request.setValue(clientIdentifier, forHTTPHeaderField: "X-Plex-Client-Identifier")
+        request.setValue("OmniPlay", forHTTPHeaderField: "X-Plex-Device-Name")
+        request.setValue("macOS", forHTTPHeaderField: "X-Plex-Platform")
+    }
+
+    private func validate(response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw PlexPINAuthError.requestFailed
+        }
+    }
+
+    private func value(named name: String, in data: Data) -> String? {
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return object[name] as? String ?? (object[name] as? NSNumber)?.stringValue
+        }
+        if let document = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
+            return document.rootElement()?.attribute(forName: name)?.stringValue
+        }
+        return nil
+    }
+}
+
+private enum PlexPINAuthError: LocalizedError {
+    case invalidResponse
+    case requestFailed
+    case timeout
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "Plex 授权响应无效。"
+        case .requestFailed:
+            return "无法连接 Plex 授权服务。"
+        case .timeout:
+            return "Plex 授权超时，请重新点击登录。"
+        }
+    }
 }
 
 extension MediaSource: Hashable {
@@ -67,6 +208,7 @@ struct PosterWallView: View {
     let libraryManager = MediaLibraryManager()
     
     @State private var currentScanTask: Task<Void, Never>? = nil
+    @State private var currentScanRunID = UUID()
     @State private var isProcessing = false
     @State private var processingMessage = ""
     @State private var showSettings = false
@@ -87,6 +229,14 @@ struct PosterWallView: View {
     @State private var webDAVValidationIsError: Bool = false
     @State private var webDAVIsTestingConnection: Bool = false
     @State private var webDAVLastPreflight: WebDAVPreflightResult? = nil
+    @State private var isShowingMediaServerSheet = false
+    @State private var mediaServerProtocol: MediaSourceProtocol = .plex
+    @State private var mediaServerName = ""
+    @State private var mediaServerBaseURL = ""
+    @State private var mediaServerToken = ""
+    @State private var mediaServerUserId = ""
+    @State private var mediaServerMessage: String? = nil
+    @State private var mediaServerIsPreScanning = false
     
     @AppStorage("keepLocalPosters") var keepLocalPosters = true
     @AppStorage("autoScanOnStartup") var autoScanOnStartup = true
@@ -124,6 +274,7 @@ struct PosterWallView: View {
     @State private var webDAVBrowserUsername: String = ""
     @State private var webDAVBrowserPassword: String = ""
     @State private var webDAVBrowserCredentialID: String? = nil
+    @State private var webDAVBrowserProtocol: MediaSourceProtocol = .webdav
     @State private var webDAVSharedFolders: [WebDAVDirectoryItem] = []
     @State private var webDAVFolderListMessage: String? = nil
     @State private var webDAVFolderListIsError: Bool = false
@@ -140,9 +291,17 @@ struct PosterWallView: View {
     }
     
     var displayedMovies: [Movie] { var result = movies; if !searchText.isEmpty { result = result.filter { $0.title.localizedCaseInsensitiveContains(searchText) } }; result.sort { m1, m2 in let isLess: Bool; switch selectedSortOption { case .name: isLess = m1.title.localizedStandardCompare(m2.title) == .orderedAscending; case .year: isLess = (m1.releaseDate ?? "") < (m2.releaseDate ?? ""); case .rating: isLess = (m1.voteAverage ?? 0.0) < (m2.voteAverage ?? 0.0) }; return isAscending ? isLess : !isLess }; return result }
-    private var scannableProtocolValues: [String] { [MediaSourceProtocol.local.rawValue, MediaSourceProtocol.webdav.rawValue] }
-    private var discoveredWebDAVDevices: [DiscoveredDevice] {
-        lanScanner.discoveredDevices.filter { $0.type == .webdavHTTP || $0.type == .webdavHTTPS }
+    private var scannableProtocolValues: [String] {
+        [
+            MediaSourceProtocol.local.rawValue,
+            MediaSourceProtocol.webdav.rawValue,
+            MediaSourceProtocol.plex.rawValue,
+            MediaSourceProtocol.emby.rawValue,
+            MediaSourceProtocol.jellyfin.rawValue
+        ]
+    }
+    private var discoveredNetworkDevices: [DiscoveredDevice] {
+        lanScanner.discoveredDevices.filter { $0.type.isWebDAV || $0.type.isMediaServer }
     }
     private var topToolbarInactiveIconColor: Color {
         colorScheme == .dark ? theme.textPrimary.opacity(0.78) : .secondary
@@ -153,8 +312,8 @@ struct PosterWallView: View {
     private var topToolbarStatusTextColor: Color {
         colorScheme == .dark ? theme.textPrimary.opacity(0.86) : theme.textSecondary
     }
-    private var webDAVStarredFolderURLs: Set<String> {
-        Set(webDAVStarredFolders.map(\.url))
+    private var webDAVStarredFolderKeys: Set<String> {
+        Set(webDAVStarredFolders.map(\.key))
     }
     private var unifiedDiagnosticsText: String {
         [lastPreflightDiagnosticsText, lastScanDiagnosticsText]
@@ -249,11 +408,14 @@ struct PosterWallView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity).navigationTitle("我的觅影库")
             .toolbar {
                 ToolbarItemGroup(placement: .navigation) {
-                    if !thumbManager.progressMessage.isEmpty {
+                    if isProcessing || !thumbManager.progressMessage.isEmpty {
+                        let statusMessage = isProcessing
+                            ? (processingMessage.isEmpty ? "正在扫描媒体源..." : processingMessage)
+                            : thumbManager.progressMessage
                         HStack {
                             ProgressView().controlSize(.small)
                                 .tint(topToolbarStatusTextColor)
-                            Text(thumbManager.progressMessage)
+                            Text(statusMessage)
                                 .font(.caption)
                                 .foregroundColor(topToolbarStatusTextColor)
                                 .lineLimit(1)
@@ -262,16 +424,6 @@ struct PosterWallView: View {
                     }
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
-                    if isProcessing {
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                                .tint(topToolbarStatusTextColor)
-                            Text(processingMessage)
-                                .font(.subheadline)
-                                .foregroundColor(topToolbarStatusTextColor)
-                        }
-                        .padding(.trailing, 10)
-                    }
                     if !unifiedDiagnosticsText.isEmpty {
                         Button(action: { copyLastDiagnosticsToPasteboard() }) {
                             Label("复制诊断", systemImage: "doc.on.doc")
@@ -326,6 +478,9 @@ struct PosterWallView: View {
             }
             .sheet(isPresented: $isShowingWebDAVFolderPickerSheet) {
                 webDAVFolderPickerSheet()
+            }
+            .sheet(isPresented: $isShowingMediaServerSheet) {
+                mediaServerSourceSheet()
             }
             .sheet(isPresented: $isShowingRemoveSourceSheet) {
                 removeSourceSheet()
@@ -463,6 +618,16 @@ struct PosterWallView: View {
                         }
                         .accessibilityIdentifier("menu.addWebDAV")
                         .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Button {
+                            isShowingManageSources = false
+                            resetMediaServerForm()
+                            isShowingMediaServerSheet = true
+                        } label: {
+                            Label("添加 Plex/Emby/Jellyfin", systemImage: "server.rack")
+                        }
+                        .accessibilityIdentifier("menu.addMediaServer")
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 
@@ -470,7 +635,7 @@ struct PosterWallView: View {
                 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("预扫描出的 WebDAV 链接")
+                        Text("预扫描出的 WebDAV / 媒体服务器")
                             .font(.subheadline.bold())
                             .foregroundColor(.secondary)
                         Spacer()
@@ -480,22 +645,22 @@ struct PosterWallView: View {
                         .disabled(lanScanner.isScanning)
                     }
                     
-                    if discoveredWebDAVDevices.isEmpty {
-                        Text(lanScanner.isScanning ? "正在扫描局域网 WebDAV 服务..." : "暂未发现 WebDAV 链接。")
+                    if discoveredNetworkDevices.isEmpty {
+                        Text(lanScanner.isScanning ? "正在扫描局域网 WebDAV / Plex / Emby / Jellyfin 服务..." : "暂未发现可连接的 WebDAV 或媒体服务器。")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     } else {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 8) {
-                                ForEach(discoveredWebDAVDevices) { device in
+                                ForEach(discoveredNetworkDevices) { device in
                                     Button {
-                                        openDiscoveredWebDAVLogin(device)
+                                        openDiscoveredNetworkLogin(device)
                                     } label: {
                                         HStack(spacing: 8) {
-                                            Image(systemName: "network")
+                                            Image(systemName: device.type.isMediaServer ? "server.rack" : "network")
                                                 .foregroundColor(.blue)
                                             VStack(alignment: .leading, spacing: 2) {
-                                                Text(device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name)
+                                                Text(discoveredDeviceTitle(device))
                                                     .foregroundColor(.primary)
                                                     .lineLimit(1)
                                                 Text(discoveredWebDAVURLString(for: device))
@@ -528,14 +693,14 @@ struct PosterWallView: View {
 
     private func mountedSourceRow(_ source: MediaSource) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: source.protocolKind == .webdav ? "network" : "folder.fill").foregroundColor(.blue)
+            Image(systemName: sourceIconName(source)).foregroundColor(.blue)
             VStack(alignment: .leading, spacing: 2) {
                 Text(source.name)
                     .font(.body)
                     .fontWeight(.semibold)
                     .foregroundColor(.primary)
                     .lineLimit(1)
-                Text(source.protocolKind == .webdav ? "WebDAV" : "本地目录")
+                Text(sourceProtocolLabel(source))
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 if showMediaSourceRealPath {
@@ -562,6 +727,144 @@ struct PosterWallView: View {
             }) {
                 Image(systemName: "minus.circle.fill").foregroundColor(.red.opacity(0.8))
             }.buttonStyle(.plain)
+        }
+    }
+
+    private func sourceProtocolLabel(_ source: MediaSource) -> String {
+        switch source.protocolKind {
+        case .webdav: return "WebDAV"
+        case .plex: return "Plex"
+        case .emby: return "Emby"
+        case .jellyfin: return "Jellyfin"
+        case .direct: return "直连"
+        case .local, .none: return "本地目录"
+        }
+    }
+
+    private func sourceIconName(_ source: MediaSource) -> String {
+        switch source.protocolKind {
+        case .webdav: return "network"
+        case .plex, .emby, .jellyfin: return "server.rack"
+        default: return "folder.fill"
+        }
+    }
+
+    private func mediaServerProtocolLabel(_ value: MediaSourceProtocol) -> String {
+        switch value {
+        case .plex: return "Plex"
+        case .emby: return "Emby"
+        case .jellyfin: return "Jellyfin"
+        default: return "媒体服务器"
+        }
+    }
+
+    private var mediaServerAddressPlaceholder: String {
+        switch mediaServerProtocol {
+        case .plex:
+            return "Plex 地址，例如 http://127.0.0.1:32400"
+        case .emby:
+            return "Emby 地址，例如 http://127.0.0.1:8096"
+        case .jellyfin:
+            return "Jellyfin 地址，例如 http://127.0.0.1:8096"
+        default:
+            return "服务器地址，例如 http://127.0.0.1:8096"
+        }
+    }
+
+    private var mediaServerTokenPlaceholder: String {
+        mediaServerProtocol == .plex ? "Plex 访问令牌（X-Plex-Token）" : "API Key / 访问令牌"
+    }
+
+    private func defaultMediaServerBaseURL(for protocolKind: MediaSourceProtocol) -> String {
+        switch protocolKind {
+        case .plex:
+            return "http://127.0.0.1:32400"
+        case .emby, .jellyfin:
+            return "http://127.0.0.1:8096"
+        default:
+            return ""
+        }
+    }
+
+    private func isDefaultMediaServerBaseURL(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == defaultMediaServerBaseURL(for: .plex)
+            || trimmed == defaultMediaServerBaseURL(for: .emby)
+            || trimmed == defaultMediaServerBaseURL(for: .jellyfin)
+    }
+
+    private func mediaServerConnectionHint(for protocolKind: MediaSourceProtocol) -> String {
+        switch protocolKind {
+        case .plex:
+            return "Plex 默认地址为 http://127.0.0.1:32400，点击“登录 Plex”会自动获取访问令牌。"
+        case .emby, .jellyfin:
+            return "\(mediaServerProtocolLabel(protocolKind)) 默认地址为 http://127.0.0.1:8096，请填写 API Key 或访问令牌。"
+        default:
+            return "保存后会先预扫描媒体库列表；可给多个库点星标，关闭列表时统一挂载并扫描刮削。"
+        }
+    }
+
+    private func mediaServerMissingTokenMessage(for protocolKind: MediaSourceProtocol) -> String {
+        protocolKind == .plex
+            ? "Plex 需要访问令牌（X-Plex-Token）才能读取媒体库。"
+            : "\(mediaServerProtocolLabel(protocolKind)) 需要 API Key 或访问令牌才能读取媒体列表和生成播放地址。"
+    }
+
+    private func mediaServerProtocolDidChange(_ newValue: MediaSourceProtocol) {
+        let currentBaseURL = mediaServerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if currentBaseURL.isEmpty || isDefaultMediaServerBaseURL(currentBaseURL) {
+            mediaServerBaseURL = defaultMediaServerBaseURL(for: newValue)
+        }
+        if newValue == .plex {
+            mediaServerUserId = ""
+        }
+        mediaServerMessage = mediaServerConnectionHint(for: newValue)
+    }
+
+    private func mediaServerSourceSheet() -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("添加媒体服务器")
+                .font(.title3.bold())
+            Picker("类型", selection: $mediaServerProtocol) {
+                Text("Plex").tag(MediaSourceProtocol.plex)
+                Text("Emby").tag(MediaSourceProtocol.emby)
+                Text("Jellyfin").tag(MediaSourceProtocol.jellyfin)
+            }
+            .pickerStyle(.segmented)
+            TextField("显示名称（可选）", text: $mediaServerName)
+                .textFieldStyle(.roundedBorder)
+            TextField(mediaServerAddressPlaceholder, text: $mediaServerBaseURL)
+                .textFieldStyle(.roundedBorder)
+            if mediaServerProtocol != .plex {
+                TextField("用户名 / 用户 ID（可选）", text: $mediaServerUserId)
+                    .textFieldStyle(.roundedBorder)
+            }
+            if mediaServerProtocol == .plex {
+                Button(mediaServerIsPreScanning ? "等待 Plex 授权..." : "登录 Plex") {
+                    authorizePlex()
+                }
+                .disabled(mediaServerIsPreScanning)
+            }
+            SecureField(mediaServerTokenPlaceholder, text: $mediaServerToken)
+                .textFieldStyle(.roundedBorder)
+            if let mediaServerMessage {
+                Text(mediaServerMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { isShowingMediaServerSheet = false }
+                Button(mediaServerIsPreScanning ? "读取中..." : "保存") { saveMediaServerSource() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(mediaServerIsPreScanning)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .onChange(of: mediaServerProtocol) { _, newValue in
+            mediaServerProtocolDidChange(newValue)
         }
     }
 
@@ -663,6 +966,7 @@ struct PosterWallView: View {
         webDAVIsLoadingFolders = false
         webDAVSharedFolders = []
         webDAVBrowserCredentialID = nil
+        webDAVBrowserProtocol = .webdav
     }
 
     private func applyRecentWebDAVHistory(_ item: RecentWebDAVHistoryItem, shouldBumpUsage: Bool) {
@@ -758,6 +1062,36 @@ struct PosterWallView: View {
         return trimmed.removingPercentEncoding ?? trimmed
     }
 
+    nonisolated private func remoteBrowserProtocolLabel(_ value: MediaSourceProtocol) -> String {
+        switch value {
+        case .webdav: return "WebDAV"
+        case .plex: return "Plex"
+        case .emby: return "Emby"
+        case .jellyfin: return "Jellyfin"
+        default: return "媒体源"
+        }
+    }
+
+    nonisolated private func normalizedRemoteBrowserURL(protocolKind: MediaSourceProtocol, raw: String) -> String {
+        if protocolKind == .webdav {
+            return MediaSourceProtocol.webdav.normalizedBaseURL(raw)
+        }
+        return protocolKind.normalizedBaseURL(raw)
+    }
+
+    nonisolated private func remoteBrowserKey(protocolKind: MediaSourceProtocol, baseURL: String, authConfig: String?) -> String {
+        let normalizedURL = normalizedRemoteBrowserURL(protocolKind: protocolKind, raw: baseURL)
+        if protocolKind == .plex || protocolKind == .emby || protocolKind == .jellyfin {
+            let libraryId = MediaServerAuthConfig.decode(authConfig)?.libraryId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(protocolKind.rawValue):\(normalizedURL):\(libraryId?.isEmpty == false ? libraryId! : "all")"
+        }
+        return "\(protocolKind.rawValue):\(normalizedURL)"
+    }
+
+    nonisolated private func remoteBrowserKey(for folder: WebDAVDirectoryItem) -> String {
+        remoteBrowserKey(protocolKind: folder.protocolKind, baseURL: folder.url.absoluteString, authConfig: folder.authConfig)
+    }
+
     private static func loadRecentWebDAVHistory() -> [RecentWebDAVHistoryItem] {
         guard let data = UserDefaults.standard.data(forKey: recentWebDAVHistoryKey) else { return [] }
         return (try? JSONDecoder().decode([RecentWebDAVHistoryItem].self, from: data)) ?? []
@@ -834,29 +1168,33 @@ struct PosterWallView: View {
     private func applyDiscoveredDevice(_ device: DiscoveredDevice) {
         switch device.type {
         case .webdavHTTP:
-            webDAVBaseURL = "http://\(device.ipAddress):\(device.port)"
+            webDAVBaseURL = discoveredWebDAVURLString(for: device)
             if webDAVName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 webDAVName = device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name
             }
             webDAVValidationMessage = nil
         case .webdavHTTPS:
-            webDAVBaseURL = "https://\(device.ipAddress):\(device.port)"
+            webDAVBaseURL = discoveredWebDAVURLString(for: device)
             if webDAVName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 webDAVName = device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name
             }
             webDAVValidationMessage = nil
+        case .plex, .emby, .jellyfin:
+            prepareMediaServerLogin(for: device)
+            isShowingAddWebDAVSheet = false
+            isShowingMediaServerSheet = true
         case .smb:
             break
         }
     }
 
     private func discoveredWebDAVURLString(for device: DiscoveredDevice) -> String {
-        let scheme = device.type == .webdavHTTPS ? "https" : "http"
+        let scheme = (device.type == .webdavHTTPS || device.port == 443 || device.port == 5006 || device.port == 8920) ? "https" : "http"
         return "\(scheme)://\(device.ipAddress):\(device.port)"
     }
 
     private func startManagedWebDAVScan(force: Bool) {
-        guard force || (!lanScanner.isScanning && discoveredWebDAVDevices.isEmpty) else { return }
+        guard force || (!lanScanner.isScanning && discoveredNetworkDevices.isEmpty) else { return }
         Task {
             await LocalNetworkPermissionRequester.shared.requestIfNeeded()
             await MainActor.run {
@@ -867,7 +1205,15 @@ struct PosterWallView: View {
         }
     }
 
-    private func openDiscoveredWebDAVLogin(_ device: DiscoveredDevice) {
+    private func openDiscoveredNetworkLogin(_ device: DiscoveredDevice) {
+        if device.type.isMediaServer {
+            prepareMediaServerLogin(for: device)
+            lanScanner.stopScanning()
+            isShowingManageSources = false
+            isShowingMediaServerSheet = true
+            return
+        }
+
         let baseURL = discoveredWebDAVURLString(for: device)
         let matchedHistory = recentWebDAVHistory
             .sorted(by: { $0.lastUsed > $1.lastUsed })
@@ -880,6 +1226,7 @@ struct PosterWallView: View {
         webDAVBrowserDisplayName = device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name
         webDAVBrowserUsername = matchedHistory?.username ?? ""
         webDAVBrowserPassword = ""
+        webDAVBrowserProtocol = .webdav
         if let credentialID = matchedHistory?.credentialID,
            let credential = WebDAVCredentialStore.shared.loadCredential(id: credentialID) {
             webDAVBrowserUsername = credential.username
@@ -894,6 +1241,32 @@ struct PosterWallView: View {
         webDAVStarredFolders = []
         isShowingManageSources = false
         isShowingDiscoveredWebDAVLoginSheet = true
+    }
+
+    private func prepareMediaServerLogin(for device: DiscoveredDevice) {
+        switch device.type {
+        case .plex:
+            mediaServerProtocol = .plex
+        case .emby:
+            mediaServerProtocol = .emby
+        case .jellyfin:
+            mediaServerProtocol = .jellyfin
+        default:
+            mediaServerProtocol = .plex
+        }
+        mediaServerName = device.name.isEmpty ? "\(mediaServerProtocolLabel(mediaServerProtocol)) \(device.ipAddress)" : device.name
+        mediaServerBaseURL = discoveredWebDAVURLString(for: device)
+        mediaServerToken = ""
+        mediaServerUserId = ""
+        mediaServerIsPreScanning = false
+        mediaServerMessage = mediaServerConnectionHint(for: mediaServerProtocol)
+    }
+
+    private func discoveredDeviceTitle(_ device: DiscoveredDevice) -> String {
+        if !device.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return device.name
+        }
+        return "\(device.type.rawValue) \(device.ipAddress)"
     }
 
     private func discoveredWebDAVLoginSheet() -> some View {
@@ -952,7 +1325,7 @@ struct PosterWallView: View {
     private func webDAVFolderPickerSheet() -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("选择 WebDAV 共享文件夹")
+                Text("选择 \(remoteBrowserProtocolLabel(webDAVBrowserProtocol)) 共享文件夹")
                     .font(.title3.bold())
                 Spacer()
                 if webDAVIsLoadingFolders || webDAVIsBatchMountingFolders {
@@ -994,7 +1367,7 @@ struct PosterWallView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(webDAVSharedFolders) { folder in
                             HStack(spacing: 10) {
-                                Image(systemName: "folder.fill")
+                                Image(systemName: folder.protocolKind == .webdav ? "folder.fill" : "rectangle.stack.fill")
                                     .foregroundColor(.blue)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(folder.name)
@@ -1007,12 +1380,12 @@ struct PosterWallView: View {
                                         .truncationMode(.middle)
                                 }
                                 Spacer()
-                                let mounted = isWebDAVFolderMounted(folder)
-                                let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
-                                let starred = webDAVStarredFolderURLs.contains(normalizedURL)
+                                let mounted = isRemoteFolderMounted(folder)
+                                let key = remoteBrowserKey(for: folder)
+                                let starred = webDAVStarredFolderKeys.contains(key)
                                 let isBusy = webDAVIsLoadingFolders || webDAVIsBatchMountingFolders
                                 Button {
-                                    toggleWebDAVFolderStar(folder)
+                                    toggleRemoteFolderStar(folder)
                                 } label: {
                                     Image(systemName: (mounted || starred) ? "star.fill" : "star")
                                         .foregroundColor((mounted || starred) ? .yellow : .secondary)
@@ -1055,6 +1428,7 @@ struct PosterWallView: View {
         webDAVBrowserUsername = webDAVUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         webDAVBrowserPassword = webDAVPassword
         webDAVBrowserCredentialID = nil
+        webDAVBrowserProtocol = .webdav
         webDAVSharedFolders = []
         webDAVStarredFolders = []
         webDAVValidationMessage = nil
@@ -1098,6 +1472,7 @@ struct PosterWallView: View {
 
                 await MainActor.run {
                     webDAVBrowserCredentialID = credentialID
+                    webDAVBrowserProtocol = .webdav
                     webDAVSharedFolders = folders
                     webDAVStarredFolders = []
                     webDAVFolderListMessage = folders.isEmpty ? "连接成功，但服务端没有返回共享文件夹。" : "连接成功，请选择要挂载的文件夹。"
@@ -1121,29 +1496,37 @@ struct PosterWallView: View {
         }
     }
 
-    private func isWebDAVFolderMounted(_ folder: WebDAVDirectoryItem) -> Bool {
-        let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
+    private func isRemoteFolderMounted(_ folder: WebDAVDirectoryItem) -> Bool {
+        let key = remoteBrowserKey(for: folder)
         return mediaSources.contains { source in
-            source.protocolKind == .webdav && source.normalizedBaseURL() == normalizedURL
+            guard let protocolKind = source.protocolKind else { return false }
+            return remoteBrowserKey(protocolKind: protocolKind, baseURL: source.baseUrl, authConfig: source.authConfig) == key
         }
     }
 
-    private func toggleWebDAVFolderStar(_ folder: WebDAVDirectoryItem) {
-        let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(folder.url.absoluteString)
-        guard MediaSourceProtocol.webdav.isValidBaseURL(normalizedURL) else {
-            webDAVFolderListMessage = "该 WebDAV 文件夹地址无效，无法挂载。"
+    private func toggleRemoteFolderStar(_ folder: WebDAVDirectoryItem) {
+        let normalizedURL = normalizedRemoteBrowserURL(protocolKind: folder.protocolKind, raw: folder.url.absoluteString)
+        guard folder.protocolKind.isValidBaseURL(normalizedURL) else {
+            webDAVFolderListMessage = "该文件夹地址无效，无法挂载。"
             webDAVFolderListIsError = true
             return
         }
-        guard !isWebDAVFolderMounted(folder) else { return }
-        if let index = webDAVStarredFolders.firstIndex(where: { $0.url == normalizedURL }) {
+        guard !isRemoteFolderMounted(folder) else { return }
+        let key = remoteBrowserKey(for: folder)
+        if let index = webDAVStarredFolders.firstIndex(where: { $0.key == key }) {
             webDAVStarredFolders.remove(at: index)
         } else {
-            let name = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawName = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = folder.protocolKind == .webdav || rawName.isEmpty
+                ? rawName
+                : "\(remoteBrowserProtocolLabel(folder.protocolKind)) · \(rawName)"
             webDAVStarredFolders.append(
                 WebDAVBrowserStarredFolder(
+                    key: key,
+                    protocolKind: folder.protocolKind,
                     url: normalizedURL,
-                    name: name.isEmpty ? "WebDAV 媒体源" : name
+                    name: name.isEmpty ? "\(remoteBrowserProtocolLabel(folder.protocolKind)) 媒体源" : name,
+                    authConfig: folder.authConfig
                 )
             )
         }
@@ -1174,14 +1557,28 @@ struct PosterWallView: View {
                 let mountedSourceIDs = try await AppDatabase.shared.dbQueue.write { db -> [Int64] in
                     var sourceIDs: [Int64] = []
                     for folder in folders {
-                        if let existing = try MediaSource.fetchOne(
-                            db,
-                            sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ? LIMIT 1",
-                            arguments: [MediaSourceProtocol.webdav.rawValue, folder.url]
-                        ) {
+                        let protocolValue = folder.protocolKind.rawValue
+                        let folderAuthConfig = folder.protocolKind == .webdav ? authConfig : folder.authConfig
+                        let existing: MediaSource?
+                        if folder.protocolKind == .webdav {
+                            existing = try MediaSource.fetchOne(
+                                db,
+                                sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ? LIMIT 1",
+                                arguments: [protocolValue, folder.url]
+                            )
+                        } else {
+                            existing = try MediaSource.fetchAll(
+                                db,
+                                sql: "SELECT * FROM mediaSource WHERE protocolType = ? AND baseUrl = ?",
+                                arguments: [protocolValue, folder.url]
+                            ).first { source in
+                                remoteBrowserKey(protocolKind: folder.protocolKind, baseURL: source.baseUrl, authConfig: source.authConfig) == folder.key
+                            }
+                        }
+                        if let existing {
                             try db.execute(
                                 sql: "UPDATE mediaSource SET name = ?, authConfig = COALESCE(?, authConfig), isEnabled = 1, disabledAt = NULL WHERE id = ?",
-                                arguments: [folder.name, authConfig, existing.id]
+                                arguments: [folder.name, folderAuthConfig, existing.id]
                             )
                             if let id = existing.id {
                                 sourceIDs.append(id)
@@ -1192,9 +1589,9 @@ struct PosterWallView: View {
                         let source = MediaSource(
                             id: nil,
                             name: folder.name,
-                            protocolType: MediaSourceProtocol.webdav.rawValue,
+                            protocolType: protocolValue,
                             baseUrl: folder.url,
-                            authConfig: authConfig
+                            authConfig: folderAuthConfig
                         )
                         try source.insert(db)
                         sourceIDs.append(db.lastInsertedRowID)
@@ -1204,12 +1601,14 @@ struct PosterWallView: View {
 
                 await MainActor.run {
                     for folder in folders {
-                        recordRecentWebDAVHistory(
-                            name: folder.name,
-                            baseURL: folder.url,
-                            username: username,
-                            credentialID: webDAVBrowserCredentialID
-                        )
+                        if folder.protocolKind == .webdav {
+                            recordRecentWebDAVHistory(
+                                name: folder.name,
+                                baseURL: folder.url,
+                                username: username,
+                                credentialID: webDAVBrowserCredentialID
+                            )
+                        }
                     }
                     webDAVIsBatchMountingFolders = false
                     webDAVStarredFolders = []
@@ -1219,7 +1618,7 @@ struct PosterWallView: View {
                     isShowingWebDAVFolderPickerSheet = false
                     if isProcessing {
                         needsRescanAfterCurrentRun = true
-                        processingMessage = "扫描中，标星的 WebDAV 文件夹已加入下一轮队列..."
+                        processingMessage = "扫描中，标星的媒体源已加入下一轮队列..."
                     } else {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                             triggerScanAndScrape(sourceIDs: mountedSourceIDs)
@@ -1309,6 +1708,141 @@ struct PosterWallView: View {
         saveManualWebDAVCredentialAndLoadFolders()
     }
 
+    private func resetMediaServerForm() {
+        mediaServerProtocol = .plex
+        mediaServerName = ""
+        mediaServerBaseURL = defaultMediaServerBaseURL(for: .plex)
+        mediaServerToken = ""
+        mediaServerUserId = ""
+        mediaServerIsPreScanning = false
+        mediaServerMessage = mediaServerConnectionHint(for: .plex)
+    }
+
+    private func authorizePlex() {
+        guard mediaServerProtocol == .plex else { return }
+        if mediaServerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            mediaServerBaseURL = defaultMediaServerBaseURL(for: .plex)
+        }
+        mediaServerIsPreScanning = true
+        mediaServerMessage = "正在创建 Plex 授权请求..."
+
+        Task {
+            do {
+                let authSession = try await PlexPINAuthClient.shared.begin()
+                await MainActor.run {
+                    NSWorkspace.shared.open(authSession.authorizationURL)
+                    mediaServerMessage = "已打开 Plex Link 页面，请确认 PIN：\(authSession.code)"
+                }
+                let token = try await PlexPINAuthClient.shared.waitForToken(pinID: authSession.id)
+                await MainActor.run {
+                    mediaServerToken = token
+                    mediaServerIsPreScanning = false
+                    mediaServerMessage = "Plex 授权成功，已自动填入访问令牌。"
+                }
+            } catch {
+                await MainActor.run {
+                    mediaServerIsPreScanning = false
+                    mediaServerMessage = "Plex 授权失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func currentMediaServerDraft() -> MediaServerSourceDraft? {
+        let normalizedURL = mediaServerProtocol.normalizedBaseURL(mediaServerBaseURL)
+        guard mediaServerProtocol.isValidBaseURL(normalizedURL) else {
+            mediaServerMessage = "服务器地址无效，请输入 http(s):// 开头且包含主机名的地址。"
+            return nil
+        }
+
+        let token = mediaServerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            mediaServerMessage = mediaServerMissingTokenMessage(for: mediaServerProtocol)
+            return nil
+        }
+
+        let finalName: String = {
+            let trimmed = mediaServerName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+            let host = URL(string: normalizedURL)?.host ?? "媒体服务器"
+            return "\(mediaServerProtocolLabel(mediaServerProtocol)) · \(host)"
+        }()
+        let userId = mediaServerProtocol == .plex ? "" : mediaServerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authConfig = MediaServerAuthConfig.encode(token: token, userId: userId)
+        return MediaServerSourceDraft(
+            protocolKind: mediaServerProtocol,
+            normalizedURL: normalizedURL,
+            token: token,
+            userId: userId,
+            finalName: finalName,
+            authConfig: authConfig
+        )
+    }
+
+    private func preScanMediaServerSource() {
+        guard let draft = currentMediaServerDraft() else { return }
+        Task {
+            _ = await performMediaServerPreScan(draft: draft)
+        }
+    }
+
+    private func performMediaServerPreScan(draft: MediaServerSourceDraft) async -> Bool {
+        await MainActor.run {
+            mediaServerIsPreScanning = true
+            mediaServerMessage = "正在预扫描 \(mediaServerProtocolLabel(draft.protocolKind)) 媒体列表..."
+        }
+        let result = await MediaServerPreflightChecker().check(
+            protocolKind: draft.protocolKind,
+            baseURL: draft.normalizedURL,
+            token: draft.token,
+            userId: draft.userId
+        )
+        await MainActor.run {
+            mediaServerIsPreScanning = false
+            mediaServerMessage = result.message
+        }
+        return result.isReachable
+    }
+
+    private func saveMediaServerSource() {
+        guard let draft = currentMediaServerDraft() else { return }
+
+        Task {
+            do {
+                await MainActor.run {
+                    mediaServerIsPreScanning = true
+                    mediaServerMessage = "正在预扫描 \(mediaServerProtocolLabel(draft.protocolKind)) 共享文件夹..."
+                }
+                let folders = try await MediaServerLibraryBrowser().listLibraries(
+                    protocolKind: draft.protocolKind,
+                    baseURL: draft.normalizedURL,
+                    token: draft.token,
+                    userId: draft.userId
+                )
+                await MainActor.run {
+                    mediaServerIsPreScanning = false
+                    isShowingMediaServerSheet = false
+                    webDAVBrowserProtocol = draft.protocolKind
+                    webDAVBrowserBaseURL = draft.normalizedURL
+                    webDAVBrowserDisplayName = draft.finalName
+                    webDAVBrowserUsername = ""
+                    webDAVBrowserPassword = ""
+                    webDAVBrowserCredentialID = nil
+                    webDAVSharedFolders = folders
+                    webDAVStarredFolders = []
+                    webDAVFolderListMessage = folders.isEmpty ? "连接成功，但当前服务器没有可挂载的媒体库。" : "预扫描成功：选择要挂载的媒体库并点星标。"
+                    webDAVFolderListIsError = false
+                    isShowingWebDAVFolderPickerSheet = true
+                }
+            } catch {
+                await MainActor.run {
+                    mediaServerIsPreScanning = false
+                    mediaServerMessage = "媒体服务器预扫描失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     private func performWebDAVPreflight(showSuccessMessage: Bool) async -> Bool {
         let normalizedURL = MediaSourceProtocol.webdav.normalizedBaseURL(webDAVBaseURL)
         guard MediaSourceProtocol.webdav.isValidBaseURL(normalizedURL) else {
@@ -1389,8 +1923,8 @@ struct PosterWallView: View {
                 let fetchedSources = try AppDatabase.shared.dbQueue.read { db in
                     try MediaSource.fetchAll(
                         db,
-                        sql: "SELECT * FROM mediaSource WHERE protocolType IN (?, ?) ORDER BY id DESC",
-                        arguments: [MediaSourceProtocol.local.rawValue, MediaSourceProtocol.webdav.rawValue]
+                        sql: "SELECT * FROM mediaSource WHERE protocolType IN (?, ?, ?, ?, ?) ORDER BY id DESC",
+                        arguments: StatementArguments(scannableProtocolValues)
                     )
                 }
                 let fetchedContinueWatching = try AppDatabase.shared.dbQueue.read { db in
@@ -1400,6 +1934,7 @@ struct PosterWallView: View {
                     JOIN videoFile ON videoFile.movieId = movie.id
                     JOIN mediaSource ON mediaSource.id = videoFile.sourceId
                     WHERE videoFile.playProgress > 5
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
                       AND (videoFile.duration = 0 OR (videoFile.playProgress / videoFile.duration) < 0.95)
                     GROUP BY movie.id
                     ORDER BY MAX(COALESCE(videoFile.lastPlayedAt, 0)) DESC
@@ -1423,15 +1958,29 @@ struct PosterWallView: View {
             await MainActor.run { loadData() }
         }
     }
+
+    private func cancelCurrentScanRunForSource(_ sourceID: Int64) {
+        removedSourceIDsDuringRun.insert(sourceID)
+        ThumbnailManager.shared.cancelTasks(forSourceID: sourceID)
+        currentScanTask?.cancel()
+        currentScanTask = nil
+        currentScanRunID = UUID()
+        activeScanningSourceID = nil
+        needsRescanAfterCurrentRun = false
+        withAnimation {
+            isProcessing = false
+            processingMessage = ""
+        }
+    }
     
     private func removeMediaSource(_ source: MediaSource, removeCredential: Bool) {
         let removingSourceID = source.id
         if let sid = removingSourceID {
-            removedSourceIDsDuringRun.insert(sid)
-            ThumbnailManager.shared.cancelTasks(forSourceID: sid)
-            if activeScanningSourceID == sid {
-                currentScanTask?.cancel()
-                needsRescanAfterCurrentRun = true
+            if isProcessing {
+                cancelCurrentScanRunForSource(sid)
+            } else {
+                removedSourceIDsDuringRun.insert(sid)
+                ThumbnailManager.shared.cancelTasks(forSourceID: sid)
             }
         }
         if source.protocolKind == .webdav,
@@ -1483,6 +2032,9 @@ struct PosterWallView: View {
     
     private func triggerScanAndScrape(onlySourceID: Int64? = nil, sourceIDs: [Int64]? = nil) {
         guard !isProcessing else { return }
+        currentScanTask?.cancel()
+        let runID = UUID()
+        currentScanRunID = runID
         withAnimation {
             isProcessing = true
             processingMessage = "准备扫描..."
@@ -1494,25 +2046,24 @@ struct PosterWallView: View {
         removedSourceIDsDuringRun = []
         activeScanningSourceID = nil
         
-        currentScanTask?.cancel()
         currentScanTask = Task(priority: .utility) {
             do {
                 if Task.isCancelled {
                     await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
                         activeScanningSourceID = nil
                         removedSourceIDsDuringRun = []
+                        currentScanTask = nil
                         isProcessing = false
                     }
                     return
                 }
                 let scanProtocols = scannableProtocolValues
                 let validSources = try await AppDatabase.shared.dbQueue.read { db in
-                    let p1 = scanProtocols[0]
-                    let p2 = scanProtocols[1]
                     let allSources = try MediaSource.fetchAll(
                         db,
-                        sql: "SELECT * FROM mediaSource WHERE protocolType IN (?, ?) ORDER BY id ASC",
-                        arguments: [p1, p2]
+                        sql: "SELECT * FROM mediaSource WHERE protocolType IN (?, ?, ?, ?, ?) AND COALESCE(isEnabled, 1) = 1 ORDER BY id ASC",
+                        arguments: StatementArguments(scanProtocols)
                     )
                     if let sourceIDs, !sourceIDs.isEmpty {
                         let targetIDs = Set(sourceIDs)
@@ -1531,74 +2082,143 @@ struct PosterWallView: View {
                 
                 if validSources.isEmpty {
                     await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
                         activeScanningSourceID = nil
                         removedSourceIDsDuringRun = []
+                        currentScanTask = nil
                         isProcessing = false
                         loadData()
                     }
                     return
                 }
                 
-                await MainActor.run { withAnimation { self.processingMessage = "扫描目录中..." } }
+                await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
+                    withAnimation { self.processingMessage = "扫描目录中..." }
+                }
                 var sourceResults: [MediaSourceScanResult] = []
                 for (index, source) in validSources.enumerated() {
                     if Task.isCancelled {
                         await MainActor.run {
+                            guard self.currentScanRunID == runID else { return }
                             activeScanningSourceID = nil
                             removedSourceIDsDuringRun = []
+                            currentScanTask = nil
                             isProcessing = false
                         }
                         return
                     }
                     if let sid = source.id, removedSourceIDsDuringRun.contains(sid) { continue }
-                    await MainActor.run { activeScanningSourceID = source.id }
                     await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        activeScanningSourceID = source.id
+                    }
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
                         withAnimation {
                             self.processingMessage = "扫描中 (\(index + 1)/\(validSources.count))：\(source.name)"
                         }
                     }
-                    let result = await libraryManager.scanLocalSourceWithResult(source)
+                    let result = await libraryManager.scanLocalSourceWithResult(source, deferUnidentifiedGroups: true) { placeholderMovieID in
+                        guard let sid = source.id, !Task.isCancelled else { return }
+                        let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
+                        guard isCurrentRun else { return }
+                        await MainActor.run {
+                            withAnimation {
+                                self.processingMessage = "刮削元数据和海报：\(source.name)"
+                            }
+                        }
+                        try? await libraryManager.processUnmatchedFiles(sourceID: sid, placeholderMovieID: placeholderMovieID)
+                        await MainActor.run {
+                            guard self.currentScanRunID == runID else { return }
+                            loadData()
+                        }
+                    }
+                    let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
+                    guard isCurrentRun else { return }
                     await MainActor.run { activeScanningSourceID = nil }
                     sourceResults.append(result)
                     await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
                         withAnimation {
                             self.processingMessage = result.isSuccess
                                 ? "完成：\(source.name)（新增\(result.insertedCount) 移除\(result.removedCount)）"
                                 : "失败：\(source.name)（\(result.errorCategory?.displayName ?? "未知错误")）"
                         }
                     }
+                    if result.isSuccess, let sid = source.id, !removedSourceIDsDuringRun.contains(sid) {
+                        try Task.checkCancellation()
+                        await MainActor.run {
+                            guard self.currentScanRunID == runID else { return }
+                            withAnimation {
+                                self.processingMessage = "检查未完成刮削：\(source.name)"
+                            }
+                        }
+                        try await libraryManager.processUnmatchedFiles(sourceID: sid)
+                        await MainActor.run {
+                            guard self.currentScanRunID == runID else { return }
+                            loadData()
+                        }
+                    }
                 }
                 await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
                     self.lastScanResults = sourceResults
                     self.lastScanDiagnosticsText = MediaSourceScanDiagnosticsFormatter.diagnosticsReport(results: sourceResults)
                 }
                 
                 if Task.isCancelled {
                     await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
                         activeScanningSourceID = nil
                         removedSourceIDsDuringRun = []
-                        isProcessing = false
-                    }
-                    return
-                }
-                await MainActor.run { withAnimation { self.processingMessage = "全网刮削中..." } }
-                try Task.checkCancellation()
-                try await libraryManager.processUnmatchedFiles(sourceID: onlySourceID)
-                try Task.checkCancellation()
-                await MainActor.run { withAnimation { self.processingMessage = "批量补抓分集剧照中..." } }
-                thumbManager.enqueueMissingEpisodeThumbnailsForLibrary(retryFailed: true)
-                
-                if Task.isCancelled {
-                    await MainActor.run {
-                        activeScanningSourceID = nil
-                        removedSourceIDsDuringRun = []
+                        currentScanTask = nil
                         isProcessing = false
                     }
                     return
                 }
                 await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
+                    withAnimation { self.processingMessage = "显示未识别视频..." }
+                }
+                let unidentifiedInsertedCount = await libraryManager.insertDeferredUnidentifiedMedia(from: sourceResults)
+                if unidentifiedInsertedCount > 0 {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        loadData()
+                    }
+                }
+                if Task.isCancelled {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        activeScanningSourceID = nil
+                        removedSourceIDsDuringRun = []
+                        currentScanTask = nil
+                        isProcessing = false
+                    }
+                    return
+                }
+                await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
+                    withAnimation { self.processingMessage = "批量补抓分集剧照中..." }
+                }
+                thumbManager.enqueueMissingEpisodeThumbnailsForLibrary(retryFailed: true)
+                
+                if Task.isCancelled {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        activeScanningSourceID = nil
+                        removedSourceIDsDuringRun = []
+                        currentScanTask = nil
+                        isProcessing = false
+                    }
+                    return
+                }
+                await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
                     activeScanningSourceID = nil
                     removedSourceIDsDuringRun = []
+                    currentScanTask = nil
                     loadData()
                     let failedResults = self.lastScanResults.filter { !$0.isSuccess }
                     if !failedResults.isEmpty {
@@ -1618,8 +2238,10 @@ struct PosterWallView: View {
                 }
             } catch {
                 await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
                     activeScanningSourceID = nil
                     removedSourceIDsDuringRun = []
+                    currentScanTask = nil
                     isProcessing = false
                 }
             }

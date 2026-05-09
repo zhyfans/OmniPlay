@@ -13,9 +13,12 @@ public static class MediaSourceNormalizer
         return protocol.Value switch
         {
             MediaSourceProtocol.Local => NormalizeLocalPath(trimmed),
-            MediaSourceProtocol.WebDav => NormalizeWebDavUrl(trimmed),
+            MediaSourceProtocol.WebDav => NormalizeHttpUrl(trimmed),
             MediaSourceProtocol.Smb => NormalizeLocalPath(trimmed),
             MediaSourceProtocol.Direct => "/",
+            MediaSourceProtocol.Plex => NormalizeHttpUrl(trimmed, 32400),
+            MediaSourceProtocol.Emby => NormalizeHttpUrl(trimmed, 8096),
+            MediaSourceProtocol.Jellyfin => NormalizeHttpUrl(trimmed, 8096),
             _ => trimmed
         };
     }
@@ -37,6 +40,10 @@ public static class MediaSourceNormalizer
             MediaSourceProtocol.Smb => normalized.StartsWith(@"\\", StringComparison.Ordinal)
                                        && normalized.Trim('\\').Length > 0,
             MediaSourceProtocol.Direct => normalized == "/",
+            MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin =>
+                Uri.TryCreate(normalized, UriKind.Absolute, out var serverUri)
+                && (serverUri.Scheme == Uri.UriSchemeHttp || serverUri.Scheme == Uri.UriSchemeHttps)
+                && !string.IsNullOrWhiteSpace(serverUri.Host),
             _ => false
         };
     }
@@ -61,14 +68,26 @@ public static class MediaSourceNormalizer
         return value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
-    private static string NormalizeWebDavUrl(string value)
+    private static string NormalizeHttpUrl(string value, int? defaultHttpPort = null)
     {
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
         {
             return value;
         }
 
-        var normalized = uri.ToString().TrimEnd('/');
+        var builder = new UriBuilder(uri);
+        if (string.Equals(builder.Host, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Host = "127.0.0.1";
+        }
+        if (defaultHttpPort.HasValue &&
+            string.Equals(builder.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+            uri.IsDefaultPort)
+        {
+            builder.Port = defaultHttpPort.Value;
+        }
+
+        var normalized = builder.Uri.ToString().TrimEnd('/');
         return normalized;
     }
 }

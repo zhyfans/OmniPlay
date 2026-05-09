@@ -205,6 +205,10 @@ class ThumbnailManager: ObservableObject {
             
             let localFileURL = thumbDirectory.appendingPathComponent("\(task.fileId).jpg")
             try imageData.write(to: localFileURL, options: .atomic)
+
+            if UserDefaults.standard.bool(forKey: "enableLocalMetadataExport") {
+                await exportLocalSidecarThumbnail(task: task, thumbnailURL: localFileURL)
+            }
             
             await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
             return true
@@ -212,6 +216,21 @@ class ThumbnailManager: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    private func exportLocalSidecarThumbnail(task: WebFetchTask, thumbnailURL: URL) async {
+        guard let queue = AppDatabase.shared.dbQueue else { return }
+        let snapshot = try? await queue.read { db -> (VideoFile, MediaSource)? in
+            guard let file = try VideoFile.fetchOne(db, key: task.fileId),
+                  let source = try MediaSource.fetchOne(db, key: file.sourceId) else {
+                return nil
+            }
+            return (file, source)
+        }
+        guard let (file, source) = snapshot, source.protocolKind == .local else { return }
+        let videoURL = URL(fileURLWithPath: MediaSourceProtocol.local.normalizedBaseURL(source.baseUrl))
+            .appendingPathComponent(file.relativePath)
+        LocalMetadataSidecarStore.shared.exportEpisodeThumbnail(sourceURL: thumbnailURL, videoURL: videoURL)
     }
 
     private func tmdbData(urlString: String, apiKey: String) async throws -> Data {
@@ -363,6 +382,10 @@ class ThumbnailManager: ObservableObject {
         guard failedTMDBFileIDs.contains(fileId) else { return }
         failedTMDBFileIDs.remove(fileId)
         UserDefaults.standard.set(Array(failedTMDBFileIDs), forKey: failedTMDBStoreKey)
+    }
+
+    func thumbnailURL(for fileId: String) -> URL {
+        thumbDirectory.appendingPathComponent("\(fileId).jpg")
     }
 
     private func sourceExists(_ sourceID: Int64) async -> Bool {

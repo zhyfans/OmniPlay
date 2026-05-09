@@ -10,6 +10,8 @@ struct SettingsView: View {
     @AppStorage("enableFastTooltip") var enableFastTooltip = true
     @AppStorage("showMediaSourceRealPath") var showMediaSourceRealPath = true
     @AppStorage("removeWebDAVCredentialsOnDelete") var removeWebDAVCredentialsOnDelete = false
+    @AppStorage("enableLocalMetadataImport") var enableLocalMetadataImport = false
+    @AppStorage("enableLocalMetadataExport") var enableLocalMetadataExport = false
     @AppStorage("tmdbApiKey") var tmdbApiKey = ""
     @AppStorage("tmdbUsePublicSource") var tmdbUsePublicSource = true
     
@@ -47,6 +49,14 @@ struct SettingsView: View {
                     Toggle("媒体源显示真实路径", isOn: $showMediaSourceRealPath)
                     Toggle("移除 WebDAV 源时同时删除保存的登录凭据", isOn: $removeWebDAVCredentialsOnDelete)
                         .help("若开启，删除 WebDAV 源会连同钥匙串里的账号密码一并清理。关闭则保留以便下次自动填充。")
+                }
+
+                Section(header: Text("本地刮削文件").font(.headline).padding(.top, 10)) {
+                    Toggle("读取本地 NFO、海报和剧照", isOn: $enableLocalMetadataImport)
+                    Toggle("刮削完成后保存 NFO、海报和剧照到本地", isOn: $enableLocalMetadataExport)
+                    Text("默认关闭。仅对本地文件夹源生效，支持 movie.nfo、tvshow.nfo、同名 .nfo、poster/fanart 与同名 -thumb 图片。")
+                        .font(.caption)
+                        .foregroundColor(theme.textSecondary)
                 }
                 
                 Section(header: Text("离线缓存").font(.headline).padding(.top, 10)) {

@@ -27,6 +27,9 @@ class PosterManager {
     // 获取本地海报路径
     func getLocalPosterURL(for path: String?) -> URL? {
         guard let path = path, !path.isEmpty else { return nil }
+        if path.hasPrefix("/"), FileManager.default.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
         let safeName = cacheFileName(for: path)
         let fileURL = cacheDirectory.appendingPathComponent(safeName)
         return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : nil
@@ -34,6 +37,9 @@ class PosterManager {
     
     // 异步下载海报
     func downloadPoster(posterPath: String) {
+        if posterPath.hasPrefix("/"), FileManager.default.fileExists(atPath: posterPath) {
+            return
+        }
         let safeName = cacheFileName(for: posterPath)
         let destinationURL = cacheDirectory.appendingPathComponent(safeName)
         

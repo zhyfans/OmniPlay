@@ -155,7 +155,73 @@ class MPVPlayerManager: ObservableObject {
         }
         components.user = nil
         components.password = nil
+        redactSensitiveQueryItems(in: &components)
         return components.string ?? url.absoluteString
+    }
+
+    private func redactSensitiveQueryItems(in components: inout URLComponents) {
+        guard let queryItems = components.queryItems else { return }
+        components.queryItems = queryItems.map { item in
+            let name = item.name.lowercased()
+            if name == "x-plex-token" || name == "api_key" {
+                return URLQueryItem(name: item.name, value: "<redacted>")
+            }
+            return item
+        }
+    }
+
+    private func plexToken(from urls: [URL]) -> String? {
+        for url in urls where !url.isFileURL {
+            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { continue }
+            guard let token = components.queryItems?.first(where: {
+                $0.name.caseInsensitiveCompare("X-Plex-Token") == .orderedSame
+            })?.value?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+                continue
+            }
+            return token
+        }
+        return nil
+    }
+
+    private func embyCompatibleToken(from urls: [URL]) -> String? {
+        for url in urls where !url.isFileURL {
+            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { continue }
+            guard let token = components.queryItems?.first(where: {
+                $0.name.caseInsensitiveCompare("api_key") == .orderedSame
+            })?.value?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+                continue
+            }
+            return token
+        }
+        return nil
+    }
+
+    private func applyRemotePlaybackHeaders(for urls: [URL]) {
+        if let token = plexToken(from: urls) {
+            let headers = [
+                "X-Plex-Product: OmniPlay",
+                "X-Plex-Version: 1.0",
+                "X-Plex-Client-Identifier: omniplay-mac",
+                "X-Plex-Device-Name: OmniPlay",
+                "X-Plex-Platform: macOS",
+                "X-Plex-Token: \(token)"
+            ].joined(separator: ",")
+            mpv_set_property_string(mpv, "http-header-fields", headers)
+            log("applied Plex HTTP headers for remote playback")
+            return
+        }
+
+        if let token = embyCompatibleToken(from: urls) {
+            let headers = [
+                "X-Emby-Token: \(token)",
+                "X-MediaBrowser-Token: \(token)"
+            ].joined(separator: ",")
+            mpv_set_property_string(mpv, "http-header-fields", headers)
+            log("applied Jellyfin/Emby HTTP headers for remote playback")
+            return
+        }
+
+        mpv_set_property_string(mpv, "http-header-fields", "")
     }
 
     private func applyPlaybackQualityModeAsOption() {
@@ -315,9 +381,10 @@ class MPVPlayerManager: ObservableObject {
             self.applyPlaybackQualityModeAtRuntime()
             mpv_set_property_string(self.mpv, "vd-lavc-o", isDolbyVisionLike ? "enable_dovi=0" : "")
             mpv_set_property_string(self.mpv, "hwdec", "videotoolbox")
+            self.applyRemotePlaybackHeaders(for: urls)
             self.log("decode profile isDVLike=\(isDolbyVisionLike) hwdec=videotoolbox")
             self.pendingInitialSeekPosition = startPosition > 5.0 ? startPosition : nil
-            self.pendingInitialSeekFilename = startPosition > 5.0 ? urls[0].lastPathComponent : nil
+            self.pendingInitialSeekFilename = (startPosition > 5.0 && urls[0].isFileURL) ? urls[0].lastPathComponent : nil
             self.pendingInitialSeekAttempts = 0
             mpv_set_property_string(self.mpv, "start", "0")
             
@@ -350,6 +417,7 @@ class MPVPlayerManager: ObservableObject {
                    var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
                     components.user = nil
                     components.password = nil
+                    self.redactSensitiveQueryItems(in: &components)
                     var masked = cmd
                     masked[1] = components.string ?? cmd[1]
                     self.log("executeMpvCommand \(masked.joined(separator: " "))")
@@ -457,21 +525,14 @@ class MPVPlayerManager: ObservableObject {
             }
             return
         }
-        guard duration.isFinite && duration > 0 else {
-            pendingInitialSeekAttempts += 1
-            if pendingInitialSeekAttempts > 40 {
-                clearPendingInitialSeek()
-            }
-            return
-        }
 
-        let clampedTarget = min(max(target, 0), max(duration - 2.0, 0))
-        guard clampedTarget > 0 else {
+        let requestedTarget = max(target, 0)
+        guard requestedTarget > 0 else {
             clearPendingInitialSeek()
             return
         }
 
-        if timePos.isFinite && abs(timePos - clampedTarget) <= 1.5 {
+        if timePos.isFinite && abs(timePos - requestedTarget) <= 1.5 {
             clearPendingInitialSeek()
             return
         }
@@ -481,8 +542,19 @@ class MPVPlayerManager: ObservableObject {
             clearPendingInitialSeek()
             return
         }
-        log(String(format: "apply initial resume seek %.2f / %.2f attempt=%d", clampedTarget, duration, pendingInitialSeekAttempts))
-        mpv_command_string(mpv, String(format: "seek %.2f absolute", clampedTarget))
+
+        let targetForSeek: Double
+        if duration.isFinite && duration > 0 {
+            targetForSeek = min(requestedTarget, max(duration - 2.0, 0))
+        } else {
+            targetForSeek = requestedTarget
+        }
+        guard targetForSeek > 0 else {
+            clearPendingInitialSeek()
+            return
+        }
+        log(String(format: "apply initial resume seek %.2f / %.2f attempt=%d", targetForSeek, duration, pendingInitialSeekAttempts))
+        mpv_command_string(mpv, String(format: "seek %.2f absolute", targetForSeek))
     }
 
     func setSubtitleSize(_ size: Int) {

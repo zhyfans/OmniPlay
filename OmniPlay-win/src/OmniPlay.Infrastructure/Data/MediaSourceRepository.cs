@@ -41,15 +41,11 @@ public sealed class MediaSourceRepository : IMediaSourceRepository
         var protectedAuthConfig = MediaSourceAuthConfigProtector.ProtectForStorage(source.AuthConfig);
 
         using var connection = database.OpenConnection();
-        var existingId = await connection.ExecuteScalarAsync<long?>(
-            new CommandDefinition(
-                "SELECT id FROM mediaSource WHERE protocolType = @ProtocolType AND baseUrl = @BaseUrl LIMIT 1",
-                new
-                {
-                    source.ProtocolType,
-                    BaseUrl = normalizedBaseUrl
-                },
-                cancellationToken: cancellationToken));
+        var existingId = await FindExistingSourceIdAsync(
+            connection,
+            source,
+            normalizedBaseUrl,
+            cancellationToken);
 
         if (existingId.HasValue)
         {
@@ -239,6 +235,50 @@ public sealed class MediaSourceRepository : IMediaSourceRepository
         return affected > 0;
     }
 
+    private static async Task<long?> FindExistingSourceIdAsync(
+        System.Data.IDbConnection connection,
+        MediaSource source,
+        string normalizedBaseUrl,
+        CancellationToken cancellationToken)
+    {
+        if (source.ProtocolKind is not (MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin))
+        {
+            return await connection.ExecuteScalarAsync<long?>(
+                new CommandDefinition(
+                    "SELECT id FROM mediaSource WHERE protocolType = @ProtocolType AND baseUrl = @BaseUrl LIMIT 1",
+                    new
+                    {
+                        source.ProtocolType,
+                        BaseUrl = normalizedBaseUrl
+                    },
+                    cancellationToken: cancellationToken));
+        }
+
+        var libraryKey = MediaServerLibraryKey(source.AuthConfig);
+        var candidates = await connection.QueryAsync<MediaSourceAuthCandidate>(
+            new CommandDefinition(
+                "SELECT id, authConfig FROM mediaSource WHERE protocolType = @ProtocolType AND baseUrl = @BaseUrl",
+                new
+                {
+                    source.ProtocolType,
+                    BaseUrl = normalizedBaseUrl
+                },
+                cancellationToken: cancellationToken));
+
+        return candidates
+            .FirstOrDefault(candidate => string.Equals(
+                MediaServerLibraryKey(MediaSourceAuthConfigProtector.UnprotectFromStorage(candidate.AuthConfig)),
+                libraryKey,
+                StringComparison.OrdinalIgnoreCase))
+            ?.Id;
+    }
+
+    private static string MediaServerLibraryKey(string? authConfig)
+    {
+        var libraryId = MediaSourceAuthConfigSerializer.DeserializeMediaServer(authConfig)?.LibraryId;
+        return string.IsNullOrWhiteSpace(libraryId) ? "all" : libraryId.Trim();
+    }
+
     private static async Task PruneOrphanEntitiesAsync(
         System.Data.IDbConnection connection,
         System.Data.IDbTransaction transaction,
@@ -259,5 +299,12 @@ public sealed class MediaSourceRepository : IMediaSourceRepository
     private static string FormatTimestamp(DateTimeOffset value)
     {
         return value.UtcDateTime.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private sealed class MediaSourceAuthCandidate
+    {
+        public long Id { get; set; }
+
+        public string? AuthConfig { get; set; }
     }
 }

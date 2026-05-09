@@ -8,5 +8,7 @@ public sealed record AppSettings
 
     public TmdbSettings Tmdb { get; init; } = new();
 
+    public LocalMetadataSettings LocalMetadata { get; init; } = new();
+
     public PlaybackPreferenceSettings Playback { get; init; } = new();
 }

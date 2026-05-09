@@ -103,6 +103,26 @@ public sealed class PlaceholderTests
     }
 
     [Fact]
+    public void ExtractedDisplayTitle_RejectsReleaseMetadataOnlyNames()
+    {
+        var title = MediaNameParser.ExtractedDisplayTitle(
+            "movies/2160p.BluRay.HEVC.mkv",
+            "2160p.BluRay.HEVC.mkv");
+
+        Assert.Null(title);
+    }
+
+    [Fact]
+    public void ExtractedDisplayTitle_UsesFileNameForMediaServerDownloadPaths()
+    {
+        var title = MediaNameParser.ExtractedDisplayTitle(
+            "items/abc123/download",
+            "The.Glory.S01E01.2160p.NF.WEB-DL.HEVC.mkv");
+
+        Assert.Equal("The Glory", title);
+    }
+
+    [Fact]
     public void CleanedTitleSource_UsesFolderBeforeBdmv()
     {
         var title = MediaNameParser.CleanedTitleSource(@"D:\Movies\Interstellar\BDMV\STREAM\00001.m2ts");
@@ -227,6 +247,22 @@ public sealed class PlaceholderTests
 
         Assert.Contains("American Beauty", titles);
         Assert.DoesNotContain("American Beauty Paramount", titles);
+    }
+
+    [Fact]
+    public void LibraryLookupTitleBuilder_Build_UsesMediaServerFileNameInsteadOfDownloadEndpoint()
+    {
+        var titles = LibraryLookupTitleBuilder.Build(
+            "[勇士]Warrior.2011.2160p.UHD.Blu-ray.HEVC.TrueHD.Atmos.mkv",
+            "emby",
+            "http://127.0.0.1:8096",
+            "Items/abc123/Download",
+            fileName: "[勇士]Warrior.2011.2160p.UHD.Blu-ray.HEVC.TrueHD.Atmos.mkv");
+
+        Assert.Contains("勇士", titles);
+        Assert.Contains("Warrior", titles);
+        Assert.DoesNotContain("Download", titles);
+        Assert.DoesNotContain(titles, static title => title.Contains("2160p", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
