@@ -129,6 +129,20 @@
     </Style>
     <Style Selector="StackPanel.posterQuickActions"><Setter Property="Opacity" Value="0" /><Setter Property="IsHitTestVisible" Value="False" /></Style>
     <Style Selector="Grid.posterInteractive:pointerover StackPanel.posterQuickActions"><Setter Property="Opacity" Value="1" /><Setter Property="IsHitTestVisible" Value="True" /></Style>
+
+    <Style Selector="Button.offlineCacheAction">
+      <Setter Property="Background" Value="#B3000000" />
+      <Setter Property="BorderBrush" Value="#66FFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Width" Value="64" />
+      <Setter Property="Height" Value="64" />
+      <Setter Property="CornerRadius" Value="32" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Template"><ControlTemplate><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{TemplateBinding CornerRadius}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}" /></Border></ControlTemplate></Setter>
+    </Style>
+    <Style Selector="Button.offlineCacheAction:pointerover"><Setter Property="Background" Value="#CC000000" /><Setter Property="BorderBrush" Value="#FFFFFFFF" /></Style>
+    <Style Selector="TextBlock.offlineCacheGlyph"><Setter Property="Foreground" Value="#FFFFFF" /><Setter Property="FontSize" Value="30" /><Setter Property="FontWeight" Value="Bold" /><Setter Property="HorizontalAlignment" Value="Center" /><Setter Property="VerticalAlignment" Value="Center" /></Style>
+    <Style Selector="ProgressBar.offlineCacheProgress"><Setter Property="Height" Value="5" /><Setter Property="Minimum" Value="0" /><Setter Property="Maximum" Value="1" /></Style>
     
     <Style Selector="Button.cardButton">
       <Setter Property="Background" Value="#00000000" /><Setter Property="BorderBrush" Value="#00000000" /><Setter Property="BorderThickness" Value="0" /><Setter Property="Padding" Value="0" /><Setter Property="HorizontalContentAlignment" Value="Left" /><Setter Property="VerticalContentAlignment" Value="Top" />
@@ -230,6 +244,9 @@
                 <Button Classes="flatIcon" Command="{Binding ScanCommand}" ToolTip.Tip="扫描媒体库">
                   <Path Classes="iconStroke" Width="20" Height="20" Data="M21 3v5h-5 M3 21v-5h5 M3.5 9a9 9 0 0 1 14.5-3.5L21 8 M20.5 15a9 9 0 0 1-14.5 3.5L3 16" />
                 </Button>
+                <Button Classes="flatIcon" Command="{Binding ToggleOfflineCacheModeCommand}" ToolTip.Tip="离线缓存">
+                  <Path Classes="iconStroke" Width="20" Height="20" Data="M12 3v12m0 0l-5-5m5 5l5-5 M5 21h14" />
+                </Button>
                 <Button x:Name="SettingsButton" Classes="flatIcon" Command="{Binding ToggleSettingsPopupCommand}" ToolTip.Tip="设置">
                   <Path Classes="iconStroke" Width="20" Height="20" Data="M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6z M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
                 </Button>
@@ -300,55 +317,6 @@
                   </StackPanel>
                   <Border Height="1" Background="#E5E5E5" />
 
-                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16" IsVisible="{Binding IsNetworkLoginPanelOpen}">
-                    <StackPanel Spacing="12">
-                      <Grid ColumnDefinitions="*,Auto">
-                        <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="{Binding NetworkLoginTitle}" />
-                        <Button Grid.Column="1" Classes="dangerAction" Command="{Binding CloseNetworkLoginCommand}" Content="取消" />
-                      </Grid>
-                      <TextBox Classes="popupSearchBox" Watermark="SMB 路径或 WebDAV 地址" Text="{Binding PendingNetworkBaseUrl}" />
-                      <Grid ColumnDefinitions="*,*">
-                        <TextBox Classes="popupSearchBox" Watermark="用户名（可选）" Text="{Binding PendingNetworkUsername}" />
-                        <TextBox Grid.Column="1" Margin="10,0,0,0" Classes="popupSearchBox" Watermark="密码（可选）" Text="{Binding PendingNetworkPassword}" />
-                      </Grid>
-                      <Button Classes="sourceAction" HorizontalAlignment="Left" Command="{Binding SaveNetworkLoginCommand}" Content="保存并读取共享文件夹" />
-                      <ItemsControl ItemsSource="{Binding NetworkShareFolders}">
-                        <ItemsControl.ItemTemplate>
-                          <DataTemplate>
-                            <Border Background="#FFFFFF" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,8">
-                              <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto">
-                                <TextBlock FontSize="14" FontWeight="SemiBold" Foreground="#1A1A1A" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
-                                <Button Grid.Column="1" Classes="sourceAction" Command="{Binding $parent[UserControl].DataContext.ToggleNetworkFolderStarCommand}" CommandParameter="{Binding}" Content="{Binding StarGlyph}" ToolTip.Tip="标星此文件夹" />
-                              </Grid>
-                            </Border>
-                          </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                      </ItemsControl>
-                      <Button Classes="sourceAction" HorizontalAlignment="Right" Command="{Binding MountStarredNetworkFoldersCommand}" Content="{Binding MountStarredNetworkFoldersActionText}" IsVisible="{Binding HasNetworkShareFolders}" />
-                    </StackPanel>
-                  </Border>
-
-                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16" IsVisible="{Binding IsMediaServerPanelOpen}">
-                    <StackPanel Spacing="12">
-                      <Grid ColumnDefinitions="*,Auto">
-                        <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="添加媒体服务器" />
-                        <Button Grid.Column="1" Classes="dangerAction" Command="{Binding CloseMediaServerPanelCommand}" Content="取消" />
-                      </Grid>
-                      <ComboBox Classes="popupSelect" HorizontalAlignment="Stretch" ItemsSource="{Binding MediaServerProtocolOptions}" SelectedItem="{Binding SelectedMediaServerProtocolOption, Mode=TwoWay}">
-                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
-                      </ComboBox>
-                      <TextBox Classes="popupSearchBox" Watermark="显示名称（可选）" Text="{Binding PendingMediaServerName}" />
-                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerAddressWatermark}" Text="{Binding PendingMediaServerBaseUrl}" />
-                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerUserWatermark}" Text="{Binding PendingMediaServerUserId}" IsVisible="{Binding PendingMediaServerUsesUserId}" />
-                      <Button Classes="sourceAction" Command="{Binding AuthorizePlexCommand}" Content="{Binding PlexAuthorizeButtonText}" IsVisible="{Binding PendingMediaServerUsesPlex}" />
-                      <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerTokenWatermark}" Text="{Binding PendingMediaServerToken}" />
-                      <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Classes="sourceAction" Command="{Binding AddMediaServerSourceCommand}" Content="保存" />
-                      </StackPanel>
-                      <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding MediaServerStatus}" />
-                    </StackPanel>
-                  </Border>
-
                   <StackPanel Spacing="10">
                     <Grid ColumnDefinitions="*,Auto">
                       <TextBlock FontSize="16" FontWeight="SemiBold" Foreground="#1A1A1A" Text="预扫描 SMB / WebDAV / 媒体服务器" />
@@ -399,6 +367,14 @@
                   </Border>
 
                   <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
+                    <StackPanel Spacing="12">
+                      <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="离线缓存" />
+                      <TextBlock Opacity="0.72" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding Settings.OfflineCacheDirectory}" />
+                      <Button Classes="sourceAction" Command="{Binding ChooseOfflineCacheDirectoryCommand}" Content="选择缓存位置" />
+                    </StackPanel>
+                  </Border>
+
+                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
                     <StackPanel Spacing="14">
                       <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="本地刮削文件" />
                       <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataImport}" Content="读取本地 NFO、海报和剧照" />
@@ -413,6 +389,7 @@
                       <StackPanel Spacing="8">
                         <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="自定义 TMDB API" />
                         <TextBox Classes="popupSearchBox" Watermark="API Key 或 Read Access Token" Text="{Binding Settings.CustomTmdbCredential}" />
+                        <Button Classes="linkAction" HorizontalAlignment="Left" Command="{Binding Settings.OpenTmdbWebsiteCommand}" Content="请往TMDB官网注册获取api：https://www.themoviedb.org" />
                       </StackPanel>
                       <StackPanel Spacing="10">
                         <TextBlock Opacity="0.72" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding Settings.TmdbConnectionStatusMessage}" />
@@ -424,6 +401,22 @@
                           <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
                         </ComboBox>
                       </StackPanel>
+                    </StackPanel>
+                  </Border>
+
+                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
+                    <StackPanel Spacing="12">
+                      <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="软件更新" />
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Foreground="#323130" Text="当前版本" />
+                        <TextBlock Opacity="0.72" Foreground="#605E5C" Text="{Binding Settings.AppVersionText}" TextTrimming="CharacterEllipsis" />
+                      </StackPanel>
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Classes="sourceAction" Command="{Binding Settings.CheckForUpdatesCommand}" Content="检查更新" />
+                        <Button Classes="sourceAction" Command="{Binding Settings.InstallLatestUpdateCommand}" Content="直接更新" />
+                        <Button Classes="sourceAction" Command="{Binding Settings.OpenGitHubRepositoryCommand}" Content="GitHub 仓库" />
+                      </StackPanel>
+                      <TextBlock Opacity="0.72" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding Settings.UpdateStatusMessage}" />
                     </StackPanel>
                   </Border>
 
@@ -566,7 +559,7 @@
                     <Grid Width="204" Margin="0,0,20,0">
                       <StackPanel Width="204" Spacing="0">
                         <Grid Classes="posterInteractive" Width="204" Height="306" ClipToBounds="True">
-                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                             <Grid Width="204" Height="306">
                               <Border Classes="posterShell" />
                               <Rectangle RadiusX="6" RadiusY="6">
@@ -585,13 +578,22 @@
                               <Path Width="15" Height="15" Data="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
                             </Button>
                           </StackPanel>
+                          <Button Classes="offlineCacheAction" HorizontalAlignment="Center" VerticalAlignment="Center" Command="{Binding $parent[UserControl].DataContext.CachePosterItemCommand}" CommandParameter="{Binding}" IsVisible="{Binding $parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}" ToolTip.Tip="{Binding OfflineCacheTip}">
+                            <Grid Width="58" Height="58">
+                              <TextBlock Classes="offlineCacheGlyph" Text="{Binding OfflineCacheGlyph}" IsVisible="{Binding ShowOfflineCacheIcon}" />
+                              <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Width="46" Spacing="4" IsVisible="{Binding ShowOfflineCacheProgress}">
+                                <TextBlock Foreground="#FFFFFF" FontSize="13" FontWeight="Bold" HorizontalAlignment="Center" Text="{Binding OfflineCachePercentText}" />
+                                <ProgressBar Classes="offlineCacheProgress" Value="{Binding OfflineCacheProgress}" />
+                              </StackPanel>
+                            </Grid>
+                          </Button>
                         </Grid>
                         <StackPanel Width="204" Spacing="0">
-                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                             <TextBlock Margin="0,10,0,0" Width="204" MinHeight="34" FontSize="16" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
                           </Button>
                           <Grid Margin="0,2,0,0" ColumnDefinitions="*,Auto" VerticalAlignment="Center">
-                            <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                            <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                               <TextBlock Width="166" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
                             </Button>
                             <Button Grid.Column="1" Classes="watchStateButton" Margin="8,0,0,0" Command="{Binding $parent[UserControl].DataContext.OpenPosterWatchStateConfirmationCommand}" CommandParameter="{Binding}" ToolTip.Tip="{Binding WatchStateText}">
@@ -641,7 +643,7 @@
                     <Grid Width="204">
                       <StackPanel Width="204" Margin="0,0,0,22" Spacing="0">
                         <Grid Classes="posterInteractive" Width="204" Height="306" ClipToBounds="True">
-                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                             <Grid Width="204" Height="306">
                               <Border Classes="posterShell" />
                               <Rectangle RadiusX="6" RadiusY="6">
@@ -660,13 +662,22 @@
                               <Path Width="15" Height="15" Data="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
                             </Button>
                           </StackPanel>
+                          <Button Classes="offlineCacheAction" HorizontalAlignment="Center" VerticalAlignment="Center" Command="{Binding $parent[UserControl].DataContext.CachePosterItemCommand}" CommandParameter="{Binding}" IsVisible="{Binding $parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}" ToolTip.Tip="{Binding OfflineCacheTip}">
+                            <Grid Width="58" Height="58">
+                              <TextBlock Classes="offlineCacheGlyph" Text="{Binding OfflineCacheGlyph}" IsVisible="{Binding ShowOfflineCacheIcon}" />
+                              <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Width="46" Spacing="4" IsVisible="{Binding ShowOfflineCacheProgress}">
+                                <TextBlock Foreground="#FFFFFF" FontSize="13" FontWeight="Bold" HorizontalAlignment="Center" Text="{Binding OfflineCachePercentText}" />
+                                <ProgressBar Classes="offlineCacheProgress" Value="{Binding OfflineCacheProgress}" />
+                              </StackPanel>
+                            </Grid>
+                          </Button>
                         </Grid>
                         <StackPanel Width="204" Spacing="0">
-                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                          <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                             <TextBlock Margin="0,10,0,0" Width="204" MinHeight="34" FontSize="16" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
                           </Button>
                           <Grid Margin="0,2,0,0" ColumnDefinitions="*,Auto" VerticalAlignment="Center">
-                            <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}">
+                            <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                               <TextBlock Width="166" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
                             </Button>
                             <Button Grid.Column="1" Classes="watchStateButton" Margin="8,0,0,0" Command="{Binding $parent[UserControl].DataContext.OpenPosterWatchStateConfirmationCommand}" CommandParameter="{Binding}" ToolTip.Tip="{Binding WatchStateText}">
@@ -694,9 +705,12 @@
         <StackPanel Margin="58,44,58,48" Spacing="42">
           
           <!-- ====== 重绘详情页精美返回按钮 ====== -->
-          <Grid ColumnDefinitions="Auto,*">
+          <Grid ColumnDefinitions="Auto,*,Auto">
             <Button Classes="iconCircle" Command="{Binding CloseDetailCommand}">
               <Path Data="M19 12H5 M12 19l-7-7 7-7" Stroke="#1A1A1A" StrokeThickness="2" StrokeLineCap="Round" StrokeJoin="Round" Width="18" Height="18" Stretch="Uniform" />
+            </Button>
+            <Button Grid.Column="2" Classes="iconCircle" Command="{Binding ToggleDetailOfflineCacheModeCommand}" ToolTip.Tip="离线缓存">
+              <Path Data="M12 3v12m0 0l-5-5m5 5l5-5 M5 21h14" Stroke="#1A1A1A" StrokeThickness="2" StrokeLineCap="Round" StrokeJoin="Round" Width="18" Height="18" Stretch="Uniform" />
             </Button>
           </Grid>
 
@@ -706,6 +720,15 @@
               <Rectangle RadiusX="12" RadiusY="12">
                 <Rectangle.Fill><ImageBrush Source="{Binding DetailPosterPath, Converter={StaticResource ImagePathToBitmapConverter}, TargetNullValue={x:Null}, FallbackValue={x:Null}}" Stretch="UniformToFill" /></Rectangle.Fill>
               </Rectangle>
+              <Button Classes="offlineCacheAction" HorizontalAlignment="Center" VerticalAlignment="Center" Command="{Binding CacheDetailPosterCommand}" IsVisible="{Binding IsDetailOfflineCacheModeActive}" ToolTip.Tip="{Binding DetailPosterOfflineCacheTip}">
+                <Grid Width="58" Height="58">
+                  <TextBlock Classes="offlineCacheGlyph" Text="{Binding DetailPosterOfflineCacheGlyph}" IsVisible="{Binding !ShowDetailPosterOfflineCacheProgress}" />
+                  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Width="46" Spacing="4" IsVisible="{Binding ShowDetailPosterOfflineCacheProgress}">
+                    <TextBlock Foreground="#FFFFFF" FontSize="13" FontWeight="Bold" HorizontalAlignment="Center" Text="{Binding DetailPosterOfflineCacheProgress, StringFormat={}{0:P0}}" />
+                    <ProgressBar Classes="offlineCacheProgress" Value="{Binding DetailPosterOfflineCacheProgress}" />
+                  </StackPanel>
+                </Grid>
+              </Button>
             </Grid>
 
             <StackPanel Grid.Column="1" Margin="54,0,0,0" Spacing="20" VerticalAlignment="Top">
@@ -756,6 +779,10 @@
               <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center" IsVisible="{Binding !HasSeasonTabs}">
                 <TextBlock FontSize="24" FontWeight="Bold" Foreground="#1A1A1A" Text="{Binding StringFormat=第 {0} 季, Path=SelectedSeason}" />
               </StackPanel>
+              <Button Classes="posterQuickAction" Command="{Binding CacheSelectedSeasonCommand}" IsVisible="{Binding IsDetailOfflineCacheModeActive}" ToolTip.Tip="缓存当前季">
+                <TextBlock FontSize="20" FontWeight="Bold" Foreground="#1A1A1A" Text="↓" />
+              </Button>
+              <ProgressBar Classes="libraryProgress" Width="160" Height="5" Minimum="0" Maximum="1" Value="{Binding SelectedSeasonOfflineCacheProgress}" IsVisible="{Binding ShowSelectedSeasonOfflineCacheProgress}" />
             </StackPanel>
 
             <ItemsControl ItemsSource="{Binding DetailFiles}">
@@ -779,6 +806,15 @@
                             <Path Width="15" Height="15" Data="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
                           </Button>
                         </StackPanel>
+                        <Button Classes="offlineCacheAction" HorizontalAlignment="Center" VerticalAlignment="Center" Command="{Binding $parent[UserControl].DataContext.CacheDetailEpisodeCommand}" CommandParameter="{Binding}" IsVisible="{Binding $parent[UserControl].DataContext.IsDetailOfflineCacheModeActive}" ToolTip.Tip="{Binding OfflineCacheTip}">
+                          <Grid Width="58" Height="58">
+                            <TextBlock Classes="offlineCacheGlyph" Text="{Binding OfflineCacheGlyph}" IsVisible="{Binding ShowOfflineCacheIcon}" />
+                            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Width="46" Spacing="4" IsVisible="{Binding ShowOfflineCacheProgress}">
+                              <TextBlock Foreground="#FFFFFF" FontSize="13" FontWeight="Bold" HorizontalAlignment="Center" Text="{Binding OfflineCachePercentText}" />
+                              <ProgressBar Classes="offlineCacheProgress" Value="{Binding OfflineCacheProgress}" />
+                            </StackPanel>
+                          </Grid>
+                        </Button>
                       </Grid>
                       <StackPanel Spacing="6" MinHeight="58">
                         <TextBlock FontSize="18" FontWeight="SemiBold" MinHeight="26" HorizontalAlignment="Center" TextAlignment="Center" Foreground="#1A1A1A" Text="{Binding EpisodeDisplayTitle}" TextWrapping="NoWrap" />
@@ -800,6 +836,104 @@
           </Border>
         </StackPanel>
       </ScrollViewer>
+    </Border>
+
+    <Border Grid.RowSpan="2" ZIndex="92" Background="#66000000" IsVisible="{Binding IsStartupTmdbAlertOpen}">
+      <Grid>
+        <Border Classes="popupPanel" Width="520" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+          <StackPanel Spacing="16">
+            <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1A1A1A" Text="TMDB API 无法连接" />
+            <TextBlock Foreground="#323130" TextWrapping="Wrap" Text="{Binding StartupTmdbAlertMessage}" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
+              <Button Classes="sourceAction" Command="{Binding ContinueWithoutTmdbStartupScanCommand}" Content="不添加直接扫描" />
+              <Button Classes="dangerAction" Command="{Binding OpenTmdbSettingsFromStartupAlertCommand}" Content="关闭" />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+
+    <Border Grid.RowSpan="2" ZIndex="86" Background="#66000000" IsVisible="{Binding IsNetworkLoginPanelOpen}">
+      <Grid>
+        <Border Classes="popupPanel" Width="560" MaxHeight="720" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+          <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Spacing="14">
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBlock FontSize="18" FontWeight="SemiBold" Foreground="#1A1A1A" Text="{Binding NetworkLoginTitle}" />
+                <Button Grid.Column="1" Classes="dangerAction" Command="{Binding CloseNetworkLoginCommand}" Content="取消" />
+              </Grid>
+              <TextBox Classes="popupSearchBox" Watermark="SMB 路径或 WebDAV 地址" Text="{Binding PendingNetworkBaseUrl}" IsVisible="{Binding IsNetworkCredentialFormVisible}" />
+              <Grid ColumnDefinitions="*,*" IsVisible="{Binding IsNetworkCredentialFormVisible}">
+                <TextBox Classes="popupSearchBox" Watermark="用户名（可选）" Text="{Binding PendingNetworkUsername}" />
+                <Grid Grid.Column="1" Margin="10,0,0,0" ColumnDefinitions="*,Auto">
+                  <TextBox Classes="popupSearchBox" Watermark="密码（可选）" PasswordChar="●" Text="{Binding PendingNetworkPassword}" IsVisible="{Binding !IsNetworkPasswordVisible}" />
+                  <TextBox Classes="popupSearchBox" Watermark="密码（可选）" Text="{Binding PendingNetworkPassword}" IsVisible="{Binding IsNetworkPasswordVisible}" />
+                  <Button Grid.Column="1" Classes="sourceAction" Margin="8,0,0,0" Command="{Binding ToggleNetworkPasswordVisibilityCommand}" Content="{Binding NetworkPasswordVisibilityGlyph}" ToolTip.Tip="显示/隐藏密码" />
+                </Grid>
+              </Grid>
+              <TextBlock Opacity="0.58" Foreground="#605E5C" TextWrapping="Wrap" Text="连接成功后会保存此 SMB/WebDAV 登录信息；移除媒体源后再次添加同一地址会自动预填。" IsVisible="{Binding IsNetworkCredentialFormVisible}" />
+              <Button Classes="sourceAction" HorizontalAlignment="Left" Command="{Binding SaveNetworkLoginCommand}" Content="保存并读取共享文件夹" IsVisible="{Binding IsNetworkCredentialFormVisible}" />
+              <ItemsControl ItemsSource="{Binding NetworkShareFolders}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border Background="#FFFFFF" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,8">
+                      <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Foreground="#1A1A1A" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                        <Button Grid.Column="1" Classes="sourceAction" Command="{Binding $parent[UserControl].DataContext.ToggleNetworkFolderStarCommand}" CommandParameter="{Binding}" Content="{Binding StarGlyph}" ToolTip.Tip="标星此文件夹" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <Button Classes="sourceAction" HorizontalAlignment="Right" Command="{Binding MountStarredNetworkFoldersCommand}" Content="{Binding MountStarredNetworkFoldersActionText}" IsVisible="{Binding HasNetworkShareFolders}" />
+              <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding NetworkSourceStatus}" />
+            </StackPanel>
+          </ScrollViewer>
+        </Border>
+      </Grid>
+    </Border>
+
+    <Border Grid.RowSpan="2" ZIndex="86" Background="#66000000" IsVisible="{Binding IsMediaServerPanelOpen}">
+      <Grid>
+        <Border Classes="popupPanel" Width="520" MaxHeight="680" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+          <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Spacing="14">
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBlock FontSize="18" FontWeight="SemiBold" Foreground="#1A1A1A" Text="添加媒体服务器" />
+                <Button Grid.Column="1" Classes="dangerAction" Command="{Binding CloseMediaServerPanelCommand}" Content="取消" />
+              </Grid>
+              <ComboBox Classes="popupSelect" HorizontalAlignment="Stretch" ItemsSource="{Binding MediaServerProtocolOptions}" SelectedItem="{Binding SelectedMediaServerProtocolOption, Mode=TwoWay}">
+                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+              <TextBox Classes="popupSearchBox" Watermark="显示名称（可选）" Text="{Binding PendingMediaServerName}" />
+              <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerAddressWatermark}" Text="{Binding PendingMediaServerBaseUrl}" />
+              <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerUserWatermark}" Text="{Binding PendingMediaServerUserId}" IsVisible="{Binding PendingMediaServerUsesUserId}" />
+              <Button Classes="sourceAction" Command="{Binding AuthorizePlexCommand}" Content="{Binding PlexAuthorizeButtonText}" IsVisible="{Binding PendingMediaServerUsesPlex}" />
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerTokenWatermark}" PasswordChar="●" Text="{Binding PendingMediaServerToken}" IsVisible="{Binding !IsMediaServerTokenVisible}" />
+                <TextBox Classes="popupSearchBox" Watermark="{Binding PendingMediaServerTokenWatermark}" Text="{Binding PendingMediaServerToken}" IsVisible="{Binding IsMediaServerTokenVisible}" />
+                <Button Grid.Column="1" Classes="sourceAction" Margin="8,0,0,0" Command="{Binding ToggleMediaServerTokenVisibilityCommand}" Content="{Binding MediaServerTokenVisibilityGlyph}" ToolTip.Tip="显示/隐藏令牌" />
+              </Grid>
+              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+                <Button Classes="sourceAction" Command="{Binding AddMediaServerSourceCommand}" Content="保存" />
+              </StackPanel>
+              <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding MediaServerStatus}" />
+            </StackPanel>
+          </ScrollViewer>
+        </Border>
+      </Grid>
+    </Border>
+
+    <Border Grid.RowSpan="2" ZIndex="90" Background="#88000000" IsVisible="{Binding IsOfflineCacheAlertOpen}">
+      <Grid>
+        <Border Classes="popupPanel" Width="460" Padding="24" HorizontalAlignment="Center" VerticalAlignment="Center">
+          <StackPanel Spacing="16">
+            <TextBlock FontSize="22" FontWeight="Bold" Foreground="#1A1A1A" Text="{Binding OfflineCacheAlertTitle}" />
+            <TextBlock FontSize="15" LineHeight="24" Foreground="#605E5C" Text="{Binding OfflineCacheAlertMessage}" TextWrapping="Wrap" />
+            <Button Classes="heroAction" HorizontalAlignment="Right" Command="{Binding CloseOfflineCacheAlertCommand}" Content="知道了" Padding="20,10" />
+          </StackPanel>
+        </Border>
+      </Grid>
     </Border>
 
     <Border Grid.RowSpan="2" ZIndex="85" Background="#88000000" IsVisible="{Binding IsPosterWatchStateConfirmationOpen}">

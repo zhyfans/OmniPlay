@@ -6,6 +6,7 @@ using Microsoft.Data.Sqlite;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
 using OmniPlay.Core.Models.Entities;
+using OmniPlay.Core.Models.Network;
 using OmniPlay.Core.Settings;
 using OmniPlay.Infrastructure.Data;
 using OmniPlay.Infrastructure.Library;
@@ -440,6 +441,50 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task ScanAllAsync_GroupsMediaServerEpisodesUsingSoftwareParsedMetadataPath()
+    {
+        var mediaServerScanner = new LibraryScanner(
+            database,
+            mediaSourceRepository,
+            mediaServerDiscoveryClient: new FakeMediaServerDiscoveryClient(
+            [
+                new MediaServerFileEntry(
+                    "Dark/Season 1/Dark.S01E01.mkv",
+                    "Items/ep1/Download",
+                    "opaque-episode-one.mkv",
+                    123,
+                    "tv"),
+                new MediaServerFileEntry(
+                    "Dark/Season 1/Dark.S01E02.mkv",
+                    "Items/ep2/Download",
+                    "opaque-episode-two.mkv",
+                    124,
+                    "tv")
+            ]));
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Jellyfin",
+            ProtocolType = "jellyfin",
+            BaseUrl = "http://jellyfin.local:8096"
+        });
+
+        var summary = await mediaServerScanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewTvShowCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM tvShow"));
+        Assert.Equal("Dark", await connection.ExecuteScalarAsync<string>("SELECT title FROM tvShow"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT episodeId) FROM videoFile WHERE mediaType = 'tv'"));
+        var relativePaths = (await connection.QueryAsync<string>(
+            "SELECT relativePath FROM videoFile ORDER BY relativePath")).ToList();
+        Assert.Equal(["Items/ep1/Download", "Items/ep2/Download"], relativePaths);
+    }
+
+    [Fact]
     public async Task ScanAllAsync_MissingLocalSource_ReturnsDiagnosticInsteadOfThrowing()
     {
         await mediaSourceRepository.AddAsync(new MediaSource
@@ -627,6 +672,23 @@ public sealed class LibraryScannerTests : IDisposable
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             throw new TaskCanceledException("timeout");
+        }
+    }
+
+    private sealed class FakeMediaServerDiscoveryClient(IReadOnlyList<MediaServerFileEntry> files) : IMediaServerDiscoveryClient
+    {
+        public Task<IReadOnlyList<MediaServerFileEntry>> EnumerateFilesAsync(
+            MediaSource source,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(files);
+        }
+
+        public Task<IReadOnlyList<NetworkShareFolderItem>> ListLibrariesAsync(
+            MediaSource source,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<NetworkShareFolderItem>>([]);
         }
     }
 

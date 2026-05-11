@@ -55,10 +55,19 @@ struct BusinessLogicIntegrationTests {
         #expect(bdmvMetadata.foreignTitle?.localizedCaseInsensitiveContains("Gone with the Wind") == true)
         #expect(!(bdmvMetadata.foreignTitle ?? "").localizedCaseInsensitiveContains("Bonus"))
 
+        let goneWindMovieDisc = "Gone.with.the.Wind.1939.1080p.75th.Anniversary.Edition.Blu-ray.AVC.DTS-HD.MA5.1-DiY@HDHome/Disc 1 - Gone with the Wind - The Movie/BDMV/STREAM/00003.m2ts"
+        let goneWindMovieDiscMetadata = MediaNameParser.extractSearchMetadata(from: goneWindMovieDisc)
+        #expect(goneWindMovieDiscMetadata.foreignTitle == "Gone with the Wind")
+
         let plainDiscSample = "Gone.with.the.Wind.1939/Disc - Gone with the Wind/BDMV/STREAM/00027.m2ts"
         let plainDiscMetadata = MediaNameParser.extractSearchMetadata(from: plainDiscSample)
         #expect(plainDiscMetadata.foreignTitle?.localizedCaseInsensitiveContains("Gone with the Wind") == true)
         #expect(!(plainDiscMetadata.foreignTitle ?? "").localizedCaseInsensitiveContains("Disc"))
+
+        let judgementSample = "Judgement at Nuremberg 1961 GER Blu-ray 1080p AVC DTS-HD MA 5.1-pt520@HDSky/BDMV/STREAM/00004.m2ts"
+        let judgementMetadata = MediaNameParser.extractSearchMetadata(from: judgementSample)
+        #expect(judgementMetadata.foreignTitle == "Judgement at Nuremberg")
+        #expect(judgementMetadata.year == "1961")
 
         let jagtenSample = "/电影/Jagten.AKA.The.Hunt.2012.1080p.USA.Repack.Blu-ray.AVC.DTS-HD.MA.5.1-bb@HDSky.iso"
         let jagtenMetadata = MediaNameParser.extractSearchMetadata(from: jagtenSample)
@@ -88,7 +97,7 @@ struct BusinessLogicIntegrationTests {
 
         let seoulSpringSample = "/电影/12.12.The.Day.2023.HKG.Blu-ray.1080p.AVC.TrueHD.5.1-Breeze@Sunny/BDMV/STREAM/00003.m2ts"
         let seoulSpringMetadata = MediaNameParser.extractSearchMetadata(from: seoulSpringSample)
-        #expect(seoulSpringMetadata.foreignTitle?.localizedCaseInsensitiveContains("The Day") == true)
+        #expect(seoulSpringMetadata.foreignTitle == "12 12 The Day")
         #expect(seoulSpringMetadata.year == "2023")
 
         let yuruCampSample = "/动画/映画 ゆるキャン△ 2022 2160P ULTRA-HD Blu-ray HEVC Atmos 7.1-SweetDreamDay/BDMV/STREAM/00004.m2ts"
@@ -102,6 +111,10 @@ struct BusinessLogicIntegrationTests {
         #expect(!(fateMetadata.fullCleanTitle ?? "").contains("剧场版"))
         #expect(!(fateMetadata.fullCleanTitle ?? "").contains("劇場版"))
         #expect(fateMetadata.year == "2019")
+
+        let fateZeroSpecial = "命运之夜前传特典：拜托了！爱因兹贝伦咨询室.Fate ∕ Zero.Einzbern.Counseling.Room.S00.2012.1080p.Blu-ray.Remux.LPCM 2.0-LuckAni/命运之夜前传特典：拜托了！爱因兹贝伦咨询室.Fate ∕ Zero.Einzbern.Counseling.Room.S00E01.2012.1080p.Blu-ray.Remux.LPCM 2.0-LuckAni.mkv"
+        let fateZeroSpecialMetadata = MediaNameParser.extractSearchMetadata(from: fateZeroSpecial)
+        #expect(fateZeroSpecialMetadata.chineseTitle == "命运之夜前传")
 
         let killBillDiscSample = "/电影/杀死比尔.Kill.Bill.Vol.1-2.2003-2004.Blu-ray.1080p.AVC.LPCM5.1-CMCT/VOL_2/BDMV/STREAM/00001.m2ts"
         let killBillDiscMetadata = MediaNameParser.extractSearchMetadata(from: killBillDiscSample)
@@ -134,6 +147,23 @@ struct BusinessLogicIntegrationTests {
 
     }
 
+    @Test("Blu-ray stream selection should prefer main feature by size")
+    func bluRayStreamSelectionPrefersMainFeature() {
+        let singleMain = [
+            MediaNameParser.BluRayStreamCandidate(fileName: "00013.m2ts", fileSize: 1_000, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00000.m2ts", fileSize: 10_000, duration: 0)
+        ]
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: singleMain, includeExtras: false) == [1])
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: singleMain, includeExtras: true) == [1, 0])
+
+        let splitMain = [
+            MediaNameParser.BluRayStreamCandidate(fileName: "00000.m2ts", fileSize: 10_000, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00001.m2ts", fileSize: 9_200, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00020.m2ts", fileSize: 1_000, duration: 0)
+        ]
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: splitMain, includeExtras: false) == [0, 1])
+    }
+
     @Test("Episode parsing and season detection should match common release names")
     func mediaNameParserEpisodeInfo() {
         let parsed = MediaNameParser.parseEpisodeInfo(from: "The.Show.S02E11.2160p.mkv", fallbackIndex: 0)
@@ -161,12 +191,17 @@ struct BusinessLogicIntegrationTests {
         #expect(seasonFromPath == 3)
         #expect(MediaNameParser.isLikelyTVEpisodePath("/TV/The.Show.S02E11.2160p.mkv"))
 
-        let gintamaPath = "Gintama.S01-11.2006.1080p.Hami.WEB-DL.H264.AAC-HHWEB/Season 11/Gintama.S11E01.2018.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv"
+        let gintamaPath = "Gintama.S01-11.2006.1080p.Hami.WEB-DL.H264.AAC-HHWEB/Season 02/Gintama.S02E45.2007.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv"
         let resolvedSeason = MediaNameParser.resolvePreferredSeason(
             from: gintamaPath,
-            fileName: "Gintama.S11E01.2018.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv"
+            fileName: "Gintama.S02E45.2007.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv"
         )
-        #expect(resolvedSeason == 11)
+        #expect(resolvedSeason == 1)
+        let gintamaMetadata = MediaNameParser.extractSearchMetadata(from: gintamaPath)
+        #expect(gintamaMetadata.foreignTitle == "Gintama")
+        #expect(gintamaMetadata.year == "2006")
+        let gintamaSeasonFileMetadata = MediaNameParser.extractSearchMetadata(from: "Gintama.S02E45.2007.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv")
+        #expect(gintamaSeasonFileMetadata.year == "2007")
 
         let orderedNames = [
             "Show.S01E01.Part1.2160p.WEB-DL.mkv",
@@ -222,6 +257,15 @@ struct BusinessLogicIntegrationTests {
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "chi", subtitleTracks: tracks) == 1)
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "eng", subtitleTracks: tracks) == 3)
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "no", subtitleTracks: tracks) == nil)
+
+        let unknownTracks: [(id: Int64, lang: String, title: String)] = [
+            (10, "", ""),
+            (11, "und", ""),
+            (12, "", "PGS")
+        ]
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "chi", subtitleTracks: unknownTracks) == 12)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "eng", subtitleTracks: unknownTracks) == 12)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "no", subtitleTracks: unknownTracks) == nil)
     }
 
     @Test("MediaLibraryManager DB integration: fetch filters direct + rematch cleans fake movie")
@@ -575,6 +619,7 @@ struct BusinessLogicIntegrationTests {
                 t.column("episodeId", .integer).references("tvShow", onDelete: .setNull)
                 t.column("playProgress", .double).notNull().defaults(to: 0.0)
                 t.column("duration", .double).notNull().defaults(to: 0.0)
+                t.column("fileSize", .integer).notNull().defaults(to: 0)
                 t.column("lastPlayedAt", .double)
             }
         }

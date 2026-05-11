@@ -454,20 +454,41 @@ class ThumbnailManager: ObservableObject {
         }
     }
 
-    func enqueueMissingEpisodeThumbnailsForLibrary(retryFailed: Bool = false) {
+    func enqueueMissingEpisodeThumbnailsForLibrary(retryFailed: Bool = false, orderedMovieIDs: [Int64] = []) {
         DispatchQueue.global(qos: .background).async {
             guard let queue = AppDatabase.shared.dbQueue else { return }
             do {
                 let tasks = try queue.read { db -> [WebFetchTask] in
-                    let allMovies = try Movie.fetchAll(
-                        db,
-                        sql: """
-                        SELECT DISTINCT movie.*
-                        FROM movie
-                        JOIN videoFile ON videoFile.movieId = movie.id
-                        JOIN mediaSource ON mediaSource.id = videoFile.sourceId
-                        """
-                    )
+                    var order: [Int64: Int] = [:]
+                    for (index, movieID) in orderedMovieIDs.enumerated() where order[movieID] == nil {
+                        order[movieID] = index
+                    }
+                    let allMovies: [Movie]
+                    if !orderedMovieIDs.isEmpty {
+                        var seenMovieIDs = Set<Int64>()
+                        var orderedMovies: [Movie] = []
+                        for movieID in orderedMovieIDs where seenMovieIDs.insert(movieID).inserted {
+                            if let movie = try Movie.fetchOne(db, key: movieID) {
+                                orderedMovies.append(movie)
+                            }
+                        }
+                        allMovies = orderedMovies
+                    } else {
+                        allMovies = try Movie.fetchAll(
+                            db,
+                            sql: """
+                            SELECT DISTINCT movie.*
+                            FROM movie
+                            JOIN videoFile ON videoFile.movieId = movie.id
+                            JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                            """
+                        ).sorted { lhs, rhs in
+                            let lhsRank = lhs.id.flatMap { order[$0] } ?? Int.max
+                            let rhsRank = rhs.id.flatMap { order[$0] } ?? Int.max
+                            if lhsRank != rhsRank { return lhsRank < rhsRank }
+                            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+                        }
+                    }
                     var collected: [WebFetchTask] = []
                     
                     for movie in allMovies {

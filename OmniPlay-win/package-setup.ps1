@@ -26,7 +26,7 @@ $PayloadDir = Join-Path $PackageRoot 'payload'
 $PayloadZip = Join-Path $PayloadDir 'OmniPlayPayload.zip'
 $SetupStage = Join-Path $PackageRoot 'setup'
 $DistDir = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { Join-Path $WindowsRoot 'dist' } else { $OutputDirectory }
-$SetupExeName = "$([char]0x89C8)$([char]0x5F71)-OmniPlay-x64-setup.exe"
+$SetupExeName = "$([char]0x89C5)$([char]0x5F71)-x64-setup.exe"
 $SetupExe = Join-Path $DistDir $SetupExeName
 
 function Get-FullPath([string]$Path)

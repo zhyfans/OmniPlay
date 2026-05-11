@@ -166,6 +166,11 @@ public static partial class MediaNameParser
 
     public static int? ParsePreferredSeason(string rawPath)
     {
+        if (ParseMultiSeasonRangeStart(rawPath) is { } rangeStart && rangeStart > 0)
+        {
+            return rangeStart;
+        }
+
         var match = Regex.Match(rawPath, @"[sS](\d{1,2})(?!\d)");
         if (match.Success)
         {
@@ -183,8 +188,47 @@ public static partial class MediaNameParser
 
     public static int? ResolvePreferredSeason(string rawPath, string fileName, int fallbackIndex = 0)
     {
+        if (ParseMultiSeasonRangeStart(rawPath) is { } rangeStart && rangeStart > 0)
+        {
+            return rangeStart;
+        }
+
         var parsed = ParseEpisodeInfo(fileName, fallbackIndex);
         return parsed.IsTvShow && parsed.Season > 0 ? parsed.Season : ParsePreferredSeason(rawPath);
+    }
+
+    public static int? ParseMultiSeasonRangeStart(string rawPath)
+    {
+        var components = rawPath
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var searchable = components.Length > 1 ? components.Take(components.Length - 1) : components;
+        foreach (var component in searchable.Reverse())
+        {
+            if (SeasonRangeStart(component) is { } value && value > 0)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static int? SeasonRangeStart(string text)
+    {
+        var match = Regex.Match(text, @"(?i)\bS(?<start>\d{1,2})\s*[-–~]\s*(?:S)?\d{1,2}\b");
+        if (match.Success)
+        {
+            return ParseOrDefault(match.Groups["start"].Value, 0);
+        }
+
+        match = Regex.Match(text, @"(?i)\bseason\s*(?<start>\d{1,2})\s*[-–~]\s*(?:season\s*)?\d{1,2}\b");
+        if (match.Success)
+        {
+            return ParseOrDefault(match.Groups["start"].Value, 0);
+        }
+
+        return null;
     }
 
     public static bool IsLikelyTvEpisodePath(string rawPath)
@@ -218,7 +262,9 @@ public static partial class MediaNameParser
 
     private static readonly string[] CleanupPatterns =
     [
-        @"\b(1080p|2160p|4k|720p|480p|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|aac|dts|hdr|dv)\b",
+        @"\b(1080p|2160p|4k|720p|480p|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|vc[- ]?1|aac|dts[- ]?hd|dts|lpcm|truehd|hdr|dv)\b",
+        @"\b[sS]\d{1,2}\s*[-–~]\s*(?:[sS])?\d{1,2}\b",
+        @"\bseason\s*\d{1,2}\s*[-–~]\s*(?:season\s*)?\d{1,2}\b",
         @"\b[sS]\d{1,2}[eE][pP]?\d{1,3}\b",
         @"\b[sS]\d{1,2}\b",
         @"\b[eE][pP]?\d{1,3}\b",
@@ -228,7 +274,9 @@ public static partial class MediaNameParser
         @"\bcomplete\b",
         @"\b(cctv4k|cctv)\b",
         @"\b\d{1,2}bit\b",
-        @"\b(aac|ac3|eac3|ddp|dts|truehd|flac|mp3)\d*(\.\d+)?\b",
+        @"\b(aac|ac3|eac3|ddp|dts|dts[- ]?hd|truehd|lpcm|flac|mp3)\d*(\.\d+)?\b",
+        @"\b(ma|hi10p|10bit|8bit)\b",
+        @"\b(usa|ger|gbr|uk|jpn|jap|kor|chn|hkg|tw|fr|fra|ita|esp|rus|can|aus)\b",
         @"\b(bonus|extras?|featurette|behind[- ]?the[- ]?scenes|trailer|sample)\b",
         @"\b(disc|disk|cd|dvd)\b",
         @"\b(disc|disk|cd|dvd)\s*[-_ ]?\d{1,2}\b",
@@ -273,7 +321,29 @@ public static partial class MediaNameParser
         return groups
             .OrderByDescending(static x => string.Concat(x).Length)
             .Select(static x => string.Concat(x).Trim())
+            .Select(TrimChineseSupplementTitle)
             .FirstOrDefault(static x => x.Length > 0);
+    }
+
+    private static string TrimChineseSupplementTitle(string input)
+    {
+        string[] markers = ["特典", "特別收錄", "特别收录", "特別收录", "花絮", "幕后", "幕後", "附赠", "附贈", "预告片", "預告片", "样片", "樣片"];
+        foreach (var marker in markers)
+        {
+            var index = input.IndexOf(marker, StringComparison.Ordinal);
+            if (index <= 0)
+            {
+                continue;
+            }
+
+            var prefix = input[..index].Trim();
+            if (prefix.Length >= 2)
+            {
+                return prefix;
+            }
+        }
+
+        return input;
     }
 
     private static string? UsableDisplayTitle(string? value)
@@ -418,6 +488,11 @@ public static partial class MediaNameParser
     {
         var normalized = Regex.Replace(input, @"[._]+", " ");
         normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
+        var supplementTrimmed = TrimChineseSupplementTitle(normalized);
+        if (!string.Equals(supplementTrimmed, normalized, StringComparison.Ordinal))
+        {
+            return supplementTrimmed;
+        }
 
         normalized = Regex.Replace(
             normalized,
@@ -592,7 +667,7 @@ public static partial class MediaNameParser
             return null;
         }
 
-        var normalized = Regex.Replace(tail, @"[._]+", " ");
+        var normalized = Regex.Replace(tail, @"[._-]+", " ");
         normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
         var tokens = Tokenize(normalized);
         if (tokens.Count == 0 || tokens.All(static token => IsReleaseMetadataToken(token) || IsEpisodeYearToken(token)))
@@ -600,15 +675,13 @@ public static partial class MediaNameParser
             return null;
         }
 
+        tokens = tokens
+            .SkipWhile(static token => IsEpisodeYearToken(token))
+            .ToList();
+
         var keptTokens = tokens
             .TakeWhile(static token => !IsReleaseMetadataToken(token) && !IsEpisodeYearToken(token))
             .ToList();
-        if (keptTokens.Count == 0)
-        {
-            keptTokens = tokens
-                .Where(static token => !IsReleaseMetadataToken(token) && !IsEpisodeYearToken(token))
-                .ToList();
-        }
 
         var subtitle = string.Join(' ', keptTokens).Trim();
         return subtitle.Length == 0 ? null : subtitle;

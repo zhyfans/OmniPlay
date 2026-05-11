@@ -12,6 +12,7 @@ using OmniPlay.Core.ViewModels.Settings;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -20,6 +21,8 @@ namespace OmniPlay.Core.ViewModels.Library;
 
 public partial class PosterWallViewModel : ObservableObject
 {
+    private const long MinimumFreeSpaceAfterOfflineCache = 256L * 1024L * 1024L;
+
     private readonly IMovieRepository movieRepository;
     private readonly ITvShowRepository tvShowRepository;
     private readonly IMediaSourceRepository mediaSourceRepository;
@@ -31,7 +34,9 @@ public partial class PosterWallViewModel : ObservableObject
     private readonly IFolderPickerService folderPickerService;
     private readonly IPosterImagePickerService posterImagePickerService;
     private readonly IWebDavConnectionTester webDavConnectionTester;
+    private readonly ITmdbConnectionTester? tmdbConnectionTester;
     private readonly INetworkShareDiscoveryService networkShareDiscoveryService;
+    private readonly INetworkCredentialStore networkCredentialStore;
     private readonly IMediaServerPreflightService? mediaServerPreflightService;
     private readonly IPlaybackLauncher playbackLauncher;
     private readonly List<Movie> allMovies = [];
@@ -54,6 +59,12 @@ public partial class PosterWallViewModel : ObservableObject
     private bool startupScanAttempted;
     private bool startupScanInProgress;
     private bool networkDiscoveryInProgress;
+    private readonly Dictionary<string, double> offlineCacheProgressByFileId = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> offlineCachedFileIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> offlineUnavailableFileIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> offlinePosterProgressByItemId = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> offlineCachedPosterIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> offlineUnavailablePosterIds = new(StringComparer.OrdinalIgnoreCase);
     private PlaybackMode currentPlaybackMode;
     private double lastSyncedPlaybackPositionSeconds = double.NaN;
     private double lastSyncedPlaybackDurationSeconds = double.NaN;
@@ -71,10 +82,12 @@ public partial class PosterWallViewModel : ObservableObject
         IPosterImagePickerService posterImagePickerService,
         IWebDavConnectionTester webDavConnectionTester,
         INetworkShareDiscoveryService networkShareDiscoveryService,
+        INetworkCredentialStore networkCredentialStore,
         IPlaybackLauncher playbackLauncher,
         SettingsViewModel settings,
         PlayerViewModel player,
-        IMediaServerPreflightService? mediaServerPreflightService = null)
+        IMediaServerPreflightService? mediaServerPreflightService = null,
+        ITmdbConnectionTester? tmdbConnectionTester = null)
     {
         this.movieRepository = movieRepository;
         this.tvShowRepository = tvShowRepository;
@@ -87,7 +100,9 @@ public partial class PosterWallViewModel : ObservableObject
         this.folderPickerService = folderPickerService;
         this.posterImagePickerService = posterImagePickerService;
         this.webDavConnectionTester = webDavConnectionTester;
+        this.tmdbConnectionTester = tmdbConnectionTester;
         this.networkShareDiscoveryService = networkShareDiscoveryService;
+        this.networkCredentialStore = networkCredentialStore;
         this.mediaServerPreflightService = mediaServerPreflightService;
         this.playbackLauncher = playbackLauncher;
 
@@ -129,6 +144,17 @@ public partial class PosterWallViewModel : ObservableObject
         ClearDetailMetadataCandidatesCommand = new RelayCommand(ClearDetailMetadataCandidates);
         SelectDetailFileCommand = new RelayCommand<LibraryVideoItem?>(SelectDetailFile);
         ToggleDetailWatchedCommand = new AsyncRelayCommand<LibraryVideoItem?>(ToggleDetailWatchedAsync, video => video is not null && !IsBusy);
+        ToggleOfflineCacheModeCommand = new RelayCommand(ToggleHomeOfflineCacheMode);
+        ToggleDetailOfflineCacheModeCommand = new RelayCommand(ToggleDetailOfflineCacheMode);
+        ChooseOfflineCacheDirectoryCommand = new AsyncRelayCommand(ChooseOfflineCacheDirectoryAsync, () => !IsBusy);
+        CachePosterItemCommand = new AsyncRelayCommand<LibraryPosterItem?>(CachePosterItemAsync, item => item is not null);
+        CacheDetailPosterCommand = new AsyncRelayCommand(CacheDetailPosterAsync, () => DetailFiles.Count > 0);
+        CacheSelectedSeasonCommand = new AsyncRelayCommand(CacheSelectedSeasonAsync, () => DetailFiles.Count > 0);
+        CacheDetailEpisodeCommand = new AsyncRelayCommand<LibraryVideoItem?>(CacheDetailEpisodeAsync, video => video is not null);
+        CloseOfflineCacheAlertCommand = new RelayCommand(CloseOfflineCacheAlert, () => IsOfflineCacheAlertOpen);
+        ContinueWithoutTmdbStartupScanCommand = new AsyncRelayCommand(ContinueWithoutTmdbStartupScanAsync, () => IsStartupTmdbAlertOpen && !startupScanInProgress);
+        OpenTmdbSettingsFromStartupAlertCommand = new RelayCommand(OpenTmdbSettingsFromStartupAlert);
+        CloseStartupTmdbAlertCommand = new RelayCommand(CloseStartupTmdbAlert);
         OpenPosterWatchStateConfirmationCommand = new RelayCommand<LibraryPosterItem?>(
             OpenPosterWatchStateConfirmation,
             item => item is not null && !IsBusy);
@@ -163,6 +189,8 @@ public partial class PosterWallViewModel : ObservableObject
         OpenManualNetworkLoginCommand = new RelayCommand(OpenManualNetworkLogin, () => !IsBusy);
         CloseNetworkLoginCommand = new RelayCommand(CloseNetworkLogin);
         SaveNetworkLoginCommand = new AsyncRelayCommand(SaveNetworkLoginAsync, () => IsNetworkLoginPanelOpen && !IsBusy);
+        ToggleNetworkPasswordVisibilityCommand = new RelayCommand(ToggleNetworkPasswordVisibility);
+        ToggleMediaServerTokenVisibilityCommand = new RelayCommand(ToggleMediaServerTokenVisibility);
         MountNetworkFolderCommand = new AsyncRelayCommand<NetworkShareFolderItem?>(MountNetworkFolderAsync, folder => folder is not null && !IsBusy);
         ToggleNetworkFolderStarCommand = new RelayCommand<NetworkShareFolderItem?>(ToggleNetworkFolderStar, folder => folder is not null && !IsBusy);
         MountStarredNetworkFoldersCommand = new AsyncRelayCommand(MountStarredNetworkFoldersAsync, () => HasStarredNetworkShareFolders && !IsBusy);
@@ -284,6 +312,28 @@ public partial class PosterWallViewModel : ObservableObject
 
     public IAsyncRelayCommand<LibraryVideoItem?> ToggleDetailWatchedCommand { get; }
 
+    public IRelayCommand ToggleOfflineCacheModeCommand { get; }
+
+    public IRelayCommand ToggleDetailOfflineCacheModeCommand { get; }
+
+    public IAsyncRelayCommand ChooseOfflineCacheDirectoryCommand { get; }
+
+    public IAsyncRelayCommand<LibraryPosterItem?> CachePosterItemCommand { get; }
+
+    public IAsyncRelayCommand CacheDetailPosterCommand { get; }
+
+    public IAsyncRelayCommand CacheSelectedSeasonCommand { get; }
+
+    public IAsyncRelayCommand<LibraryVideoItem?> CacheDetailEpisodeCommand { get; }
+
+    public IRelayCommand CloseOfflineCacheAlertCommand { get; }
+
+    public IAsyncRelayCommand ContinueWithoutTmdbStartupScanCommand { get; }
+
+    public IRelayCommand OpenTmdbSettingsFromStartupAlertCommand { get; }
+
+    public IRelayCommand CloseStartupTmdbAlertCommand { get; }
+
     public IRelayCommand<LibraryPosterItem?> OpenPosterWatchStateConfirmationCommand { get; }
 
     public IRelayCommand CancelPosterWatchStateConfirmationCommand { get; }
@@ -331,6 +381,10 @@ public partial class PosterWallViewModel : ObservableObject
     public IRelayCommand CloseNetworkLoginCommand { get; }
 
     public IAsyncRelayCommand SaveNetworkLoginCommand { get; }
+
+    public IRelayCommand ToggleNetworkPasswordVisibilityCommand { get; }
+
+    public IRelayCommand ToggleMediaServerTokenVisibilityCommand { get; }
 
     public IAsyncRelayCommand<NetworkShareFolderItem?> MountNetworkFolderCommand { get; }
 
@@ -399,6 +453,9 @@ public partial class PosterWallViewModel : ObservableObject
     private string pendingNetworkPassword = string.Empty;
 
     [ObservableProperty]
+    private bool isNetworkPasswordVisible;
+
+    [ObservableProperty]
     private string networkSourceStatus = string.Empty;
 
     [ObservableProperty]
@@ -420,6 +477,9 @@ public partial class PosterWallViewModel : ObservableObject
     private string pendingMediaServerToken = string.Empty;
 
     [ObservableProperty]
+    private bool isMediaServerTokenVisible;
+
+    [ObservableProperty]
     private string pendingMediaServerUserId = string.Empty;
 
     [ObservableProperty]
@@ -430,6 +490,48 @@ public partial class PosterWallViewModel : ObservableObject
 
     [ObservableProperty]
     private bool isSettingsPopupOpen;
+
+    [ObservableProperty]
+    private bool isOfflineCacheModeActive;
+
+    [ObservableProperty]
+    private bool isHomeOfflineCacheModeActive;
+
+    [ObservableProperty]
+    private bool isDetailOfflineCacheModeActive;
+
+    [ObservableProperty]
+    private bool isStartupTmdbAlertOpen;
+
+    [ObservableProperty]
+    private string startupTmdbAlertMessage = string.Empty;
+
+    [ObservableProperty]
+    private bool isOfflineCacheAlertOpen;
+
+    [ObservableProperty]
+    private string offlineCacheAlertTitle = string.Empty;
+
+    [ObservableProperty]
+    private string offlineCacheAlertMessage = string.Empty;
+
+    [ObservableProperty]
+    private double selectedSeasonOfflineCacheProgress;
+
+    [ObservableProperty]
+    private bool showSelectedSeasonOfflineCacheProgress;
+
+    [ObservableProperty]
+    private double detailPosterOfflineCacheProgress;
+
+    [ObservableProperty]
+    private bool showDetailPosterOfflineCacheProgress;
+
+    [ObservableProperty]
+    private string detailPosterOfflineCacheGlyph = "\u2193";
+
+    [ObservableProperty]
+    private string detailPosterOfflineCacheTip = "\u79BB\u7EBF\u7F13\u5B58\u6574\u90E8\u5F71\u7247\u6216\u5267\u96C6";
 
     [ObservableProperty]
     private bool isSearchPopupOpen;
@@ -638,7 +740,7 @@ public partial class PosterWallViewModel : ObservableObject
     public bool CanShowDetailPrimaryProgress =>
         DetailPrimaryFile is { Duration: > 0, PlayProgress: > 0 } file && !file.IsWatched;
 
-    public bool HasStatusMessage => IsLibraryScanInProgress && ShouldShowHomeStatusMessage(HomeStatusMessage);
+    public bool HasStatusMessage => ShouldShowHomeStatusMessage(HomeStatusMessage);
 
     public string HomeStatusMessage =>
         string.IsNullOrWhiteSpace(StatusMessage) && IsLibraryScanInProgress
@@ -663,6 +765,8 @@ public partial class PosterWallViewModel : ObservableObject
 
     public bool HasNetworkShareFolders => NetworkShareFolders.Count > 0;
 
+    public bool IsNetworkCredentialFormVisible => !HasNetworkShareFolders;
+
     public int StarredNetworkShareFolderCount => NetworkShareFolders.Count(static folder => folder.IsStarred);
 
     public bool HasStarredNetworkShareFolders => StarredNetworkShareFolderCount > 0;
@@ -670,6 +774,10 @@ public partial class PosterWallViewModel : ObservableObject
     public string MountStarredNetworkFoldersActionText => HasStarredNetworkShareFolders
         ? $"关闭并挂载 {StarredNetworkShareFolderCount} 个文件夹"
         : "关闭";
+
+    public string NetworkPasswordVisibilityGlyph => IsNetworkPasswordVisible ? "🙈" : "👁";
+
+    public string MediaServerTokenVisibilityGlyph => IsMediaServerTokenVisible ? "🙈" : "👁";
 
     public bool IsEditingWebDavSource => EditingWebDavSourceId.HasValue;
 
@@ -765,7 +873,8 @@ public partial class PosterWallViewModel : ObservableObject
         bool isExplicitRequest,
         bool forceThumbnails,
         CancellationToken cancellationToken,
-        IReadOnlyCollection<long>? sourceIds = null)
+        IReadOnlyCollection<long>? sourceIds = null,
+        bool skipTmdbArtwork = false)
     {
         var targetSourceIds = sourceIds is null ? null : sourceIds.ToHashSet();
         var sources = (await mediaSourceRepository.GetAllAsync(cancellationToken))
@@ -791,21 +900,26 @@ public partial class PosterWallViewModel : ObservableObject
                 var sourceSummary = await libraryScanner.ScanSourceAsync(
                     source.Id!.Value,
                     cancellationToken,
-                    async (item, token) =>
-                    {
-                        StatusMessage = item.IsTvShow
-                            ? $"正在刮削剧集元数据和海报：{item.Title}..."
-                            : $"正在刮削电影元数据和海报：{item.Title}...";
-                        await RefreshIndexedScanItemArtworkAsync(item, token);
-                    },
+                    skipTmdbArtwork
+                        ? null
+                        : async (item, token) =>
+                        {
+                            StatusMessage = item.IsTvShow
+                                ? $"正在刮削剧集元数据和海报：{item.Title}..."
+                                : $"正在刮削电影元数据和海报：{item.Title}...";
+                            await RefreshIndexedScanItemArtworkAsync(item, token);
+                        },
                     deferUnidentifiedGroups: true);
                 aggregate.Add(sourceSummary);
                 LastScanSummary = aggregate.ToSummary();
 
                 await ReloadLibraryAsync();
                 cancellationToken.ThrowIfCancellationRequested();
-                StatusMessage = $"正在刮削元数据和海报：{source.Name}...";
-                await RefreshLibraryArtworkAsync(isExplicitRequest, forceThumbnails: false, cancellationToken);
+                if (!skipTmdbArtwork)
+                {
+                    StatusMessage = $"正在刮削元数据和海报：{source.Name}...";
+                    await RefreshLibraryArtworkAsync(isExplicitRequest, forceThumbnails: false, cancellationToken);
+                }
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -822,12 +936,16 @@ public partial class PosterWallViewModel : ObservableObject
                 await ReloadLibraryAsync();
             }
 
-            if (forceThumbnails)
+            if (forceThumbnails && !skipTmdbArtwork)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 await ReloadLibraryAsync();
                 StatusMessage = "正在刮削分集剧照...";
                 await RefreshLibraryArtworkAsync(isExplicitRequest, forceThumbnails: true, cancellationToken);
+            }
+            else if (skipTmdbArtwork)
+            {
+                StatusMessage = "已完成本地扫描，等待 TMDB API 连通后再刮削。";
             }
         }
         catch
@@ -1045,7 +1163,7 @@ public partial class PosterWallViewModel : ObservableObject
         allTvShows.AddRange(tvShows);
         ReplaceItems(MediaSources, sources);
         OnPropertyChanged(nameof(HasMediaSources));
-        ReplaceItems(ContinueWatchingItems, continueWatching);
+        ReplaceItems(ContinueWatchingItems, continueWatching.Select(ApplyOfflineCacheState).ToList());
         OnPropertyChanged(nameof(HasContinueWatching));
 
         var continuingIds = continueWatching
@@ -1070,10 +1188,14 @@ public partial class PosterWallViewModel : ObservableObject
                 MovieId = movie.Id
             };
         }));
-        allLibraryItems.AddRange(tvShows.Select(show =>
+        allLibraryItems.AddRange(GroupTvShowsForHome(tvShows).Select(group =>
         {
+            var show = group.Representative;
             var itemId = $"tv-{show.Id}";
-            var watchState = ResolvePosterWatchState(playbackStates, itemId);
+            var groupIds = group.Shows
+                .Select(static groupedShow => $"tv-{groupedShow.Id}")
+                .ToList();
+            var watchState = ResolvePosterWatchState(playbackStates, groupIds);
             return new LibraryPosterItem
             {
                 Id = itemId,
@@ -1082,7 +1204,7 @@ public partial class PosterWallViewModel : ObservableObject
                 PosterPath = show.PosterPath,
                 VoteAverage = show.VoteAverage,
                 MediaKind = "\u5267\u96C6",
-                IsContinuing = continuingIds.Contains(itemId),
+                IsContinuing = groupIds.Any(continuingIds.Contains),
                 WatchState = watchState,
                 TvShowId = show.Id
             };
@@ -1191,8 +1313,8 @@ public partial class PosterWallViewModel : ObservableObject
         RefreshDetailHeaderState();
         UpdatePlayerNextEpisodeAction();
 
-        var files = await fileLoader();
-        allDetailFiles.AddRange(files);
+        var files = ApplyEpisodeDisplayDisambiguation(await fileLoader());
+        allDetailFiles.AddRange(files.Select(ApplyOfflineCacheState));
         BuildSeasonState(files, isSeries);
         ApplyDetailFilter();
 
@@ -1277,6 +1399,19 @@ public partial class PosterWallViewModel : ObservableObject
         try
         {
             await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken);
+            if (tmdbConnectionTester is not null)
+            {
+                StatusMessage = "正在检测 TMDB API 连通性...";
+                var connection = await tmdbConnectionTester.TestConnectionAsync(Settings.BuildTmdbSettings(), cancellationToken);
+                if (!connection.Success)
+                {
+                    StartupTmdbAlertMessage = $"建议添加自己的 TMDB API 后再刮削海报与影视信息。\n{connection.Message}";
+                    IsStartupTmdbAlertOpen = true;
+                    StatusMessage = "TMDB API 无法连接。";
+                    return;
+                }
+            }
+
             StatusMessage = "正在后台扫描媒体源...";
             LastScanSummary = await RunLibraryScanAndArtworkAsync(
                 isExplicitRequest: false,
@@ -1307,6 +1442,60 @@ public partial class PosterWallViewModel : ObservableObject
             CompleteLibraryAutomation(automationCancellationTokenSource);
             OnCommandStateChanged();
         }
+    }
+
+    private async Task ContinueWithoutTmdbStartupScanAsync()
+    {
+        if (startupScanInProgress)
+        {
+            return;
+        }
+
+        IsStartupTmdbAlertOpen = false;
+        var automationCancellationTokenSource = BeginLibraryAutomation();
+        var cancellationToken = automationCancellationTokenSource.Token;
+        startupScanInProgress = true;
+        OnCommandStateChanged();
+
+        try
+        {
+            StatusMessage = "正在本地扫描媒体源...";
+            LastScanSummary = await RunLibraryScanAndArtworkAsync(
+                isExplicitRequest: false,
+                forceThumbnails: false,
+                cancellationToken,
+                skipTmdbArtwork: true);
+            StatusMessage = "本地扫描完成，未刮削条目已显示；TMDB API 连通后可重新同步刮削。";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            StatusMessage = "已停止后台扫描任务。";
+        }
+        catch
+        {
+            StatusMessage = "本地扫描媒体源时发生异常。";
+        }
+        finally
+        {
+            startupScanInProgress = false;
+            CompleteLibraryAutomation(automationCancellationTokenSource);
+            OnCommandStateChanged();
+        }
+    }
+
+    private void OpenTmdbSettingsFromStartupAlert()
+    {
+        IsStartupTmdbAlertOpen = false;
+        IsSearchPopupOpen = false;
+        IsSortPopupOpen = false;
+        IsSourcePopupOpen = false;
+        IsSettingsPopupOpen = true;
+        StatusMessage = "请在设置中填写 TMDB API。";
+    }
+
+    private void CloseStartupTmdbAlert()
+    {
+        IsStartupTmdbAlertOpen = false;
     }
 
     private async Task SearchDetailMetadataCandidatesAsync()
@@ -1691,6 +1880,560 @@ public partial class PosterWallViewModel : ObservableObject
             : $"\u5DF2\u5C06 {video.FileName} \u6807\u8BB0\u4E3A\u5DF2\u770B\u3002";
     }
 
+    private void ToggleHomeOfflineCacheMode()
+    {
+        IsHomeOfflineCacheModeActive = !IsHomeOfflineCacheModeActive;
+        IsOfflineCacheModeActive = IsHomeOfflineCacheModeActive;
+        IsSearchPopupOpen = false;
+        IsSortPopupOpen = false;
+        IsSourcePopupOpen = false;
+        IsSettingsPopupOpen = false;
+        RefreshOfflineCachePresentation();
+        StatusMessage = IsHomeOfflineCacheModeActive ? "首页已进入离线缓存模式。" : "首页已退出离线缓存模式。";
+    }
+
+    private void ToggleDetailOfflineCacheMode()
+    {
+        IsDetailOfflineCacheModeActive = !IsDetailOfflineCacheModeActive;
+        IsSearchPopupOpen = false;
+        IsSortPopupOpen = false;
+        IsSourcePopupOpen = false;
+        IsSettingsPopupOpen = false;
+        RefreshOfflineCachePresentation();
+        StatusMessage = IsDetailOfflineCacheModeActive ? "详情页已进入离线缓存模式。" : "详情页已退出离线缓存模式。";
+    }
+
+    private async Task ChooseOfflineCacheDirectoryAsync()
+    {
+        var selectedPath = await folderPickerService.PickFolderAsync();
+        if (string.IsNullOrWhiteSpace(selectedPath))
+        {
+            StatusMessage = "已取消选择离线缓存目录。";
+            return;
+        }
+
+        Directory.CreateDirectory(selectedPath);
+        Settings.OfflineCacheDirectory = selectedPath;
+        await Settings.SaveCommand.ExecuteAsync(null);
+        RefreshOfflineCachePresentation();
+        StatusMessage = $"已设置离线缓存目录：{selectedPath}";
+    }
+
+    private async Task CachePosterItemAsync(LibraryPosterItem? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        var files = await LoadPosterTargetFilesAsync(item);
+        await StartOfflineCacheAsync(files, item.Id, item.Title);
+    }
+
+    private Task CacheDetailPosterAsync()
+    {
+        return StartOfflineCacheAsync(allDetailFiles, CurrentDetailOfflineGroupId(), DetailTitle);
+    }
+
+    private Task CacheSelectedSeasonAsync()
+    {
+        var files = allDetailFiles.Where(file => !file.IsTvEpisode || file.SeasonNumber == SelectedSeason).ToList();
+        var seasonTitle = SelectedSeason == 0 ? $"{DetailTitle} 特别篇" : $"{DetailTitle} 第 {SelectedSeason} 季";
+        return StartOfflineCacheAsync(files, null, seasonTitle);
+    }
+
+    private Task CacheDetailEpisodeAsync(LibraryVideoItem? video)
+    {
+        return video is null
+            ? Task.CompletedTask
+            : StartOfflineCacheAsync(new[] { video }, null, video.FileName);
+    }
+
+    private async Task StartOfflineCacheAsync(
+        IEnumerable<LibraryVideoItem> requestedFiles,
+        string? posterGroupId,
+        string groupTitle)
+    {
+        var cacheDirectory = ResolveOfflineCacheDirectory();
+        if (string.IsNullOrWhiteSpace(cacheDirectory))
+        {
+            ShowOfflineCacheAlert("离线缓存", "请先在设置中选择离线缓存保存位置。");
+            return;
+        }
+
+        Directory.CreateDirectory(cacheDirectory);
+        var uniqueFiles = requestedFiles
+            .Where(file => !string.IsNullOrWhiteSpace(file.Id))
+            .GroupBy(file => file.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+        if (uniqueFiles.Count == 0)
+        {
+            StatusMessage = "所选内容没有可缓存的视频文件。";
+            return;
+        }
+
+        var plans = new List<OfflineCacheFilePlan>();
+        var unsupportedCount = 0;
+        foreach (var file in uniqueFiles)
+        {
+            var destinationPath = GetOfflineCachePath(file, cacheDirectory);
+            if (File.Exists(destinationPath))
+            {
+                offlineCachedFileIds.Add(file.Id);
+                continue;
+            }
+
+            var sourcePath = ResolveOfflineCacheSourcePath(file);
+            var remoteUri = ResolveOfflineCacheRemoteUri(file, out var remoteAuthorization);
+            if ((string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath)) && remoteUri is null)
+            {
+                offlineUnavailableFileIds.Add(file.Id);
+                unsupportedCount++;
+                continue;
+            }
+
+            var fileSize = sourcePath is not null && File.Exists(sourcePath)
+                ? new FileInfo(sourcePath).Length
+                : await GetRemoteContentLengthAsync(remoteUri!, remoteAuthorization);
+            plans.Add(new OfflineCacheFilePlan(file, sourcePath, remoteUri, remoteAuthorization, destinationPath, fileSize));
+        }
+
+        if (plans.Count == 0)
+        {
+            if (!string.IsNullOrWhiteSpace(posterGroupId) && unsupportedCount > 0)
+            {
+                offlineUnavailablePosterIds.Add(posterGroupId);
+            }
+
+            RefreshOfflineCachePresentation();
+            var message = unsupportedCount > 0
+                ? "远程源或不可访问文件暂不支持离线缓存。"
+                : "所选内容已在本地缓存中。";
+            StatusMessage = message;
+            return;
+        }
+
+        var totalBytes = plans.Sum(static plan => Math.Max(0, plan.FileSize));
+        var availableBytes = GetAvailableFreeBytes(cacheDirectory);
+        if (availableBytes < totalBytes + MinimumFreeSpaceAfterOfflineCache)
+        {
+            ShowOfflineCacheAlert(
+                "硬盘存储空间不够",
+                $"《{groupTitle}》需要 {FormatBytes(totalBytes)}，当前缓存磁盘可用 {FormatBytes(availableBytes)}，空间不足，已取消离线缓存。");
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(posterGroupId))
+        {
+            offlinePosterProgressByItemId[posterGroupId] = 0.01;
+        }
+
+        foreach (var plan in plans)
+        {
+            offlineCacheProgressByFileId[plan.File.Id] = 0.01;
+        }
+
+        RefreshOfflineCachePresentation();
+        StatusMessage = $"正在离线缓存：{groupTitle}";
+
+        var copiedBytesForGroup = 0L;
+        try
+        {
+            foreach (var plan in plans)
+            {
+                await CopyOfflineCacheFileAsync(
+                    plan,
+                    totalBytes,
+                    () => copiedBytesForGroup,
+                    copied => copiedBytesForGroup += copied,
+                    posterGroupId);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException)
+        {
+            foreach (var plan in plans)
+            {
+                offlineCacheProgressByFileId.Remove(plan.File.Id);
+            }
+
+            if (!string.IsNullOrWhiteSpace(posterGroupId))
+            {
+                offlinePosterProgressByItemId.Remove(posterGroupId);
+            }
+
+            RefreshOfflineCachePresentation();
+            ShowOfflineCacheAlert("离线缓存失败", ex.Message);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(posterGroupId))
+        {
+            offlinePosterProgressByItemId.Remove(posterGroupId);
+            offlineCachedPosterIds.Add(posterGroupId);
+        }
+
+        RefreshOfflineCachePresentation();
+        StatusMessage = unsupportedCount > 0
+            ? $"《{groupTitle}》已缓存完成，部分远程源或不可访问文件已跳过。"
+            : $"《{groupTitle}》已缓存完成。";
+    }
+
+    private async Task CopyOfflineCacheFileAsync(
+        OfflineCacheFilePlan plan,
+        long groupTotalBytes,
+        Func<long> groupCopiedBytes,
+        Action<long> addGroupCopiedBytes,
+        string? posterGroupId)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(plan.DestinationPath) ?? ResolveOfflineCacheDirectory() ?? string.Empty);
+        var tempPath = $"{plan.DestinationPath}.tmp";
+        if (File.Exists(tempPath))
+        {
+            File.Delete(tempPath);
+        }
+
+        var buffer = new byte[1024 * 1024];
+        long copiedForFile = 0;
+        await using var destination = File.Create(tempPath);
+        if (plan.RemoteUri is not null)
+        {
+            await DownloadRemoteOfflineCacheFileAsync(plan, destination, groupTotalBytes, groupCopiedBytes, posterGroupId);
+            copiedForFile = plan.FileSize;
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(plan.SourcePath))
+            {
+                throw new FileNotFoundException("源文件不存在。");
+            }
+
+            await using var source = File.OpenRead(plan.SourcePath);
+            while (true)
+            {
+                var read = await source.ReadAsync(buffer);
+                if (read <= 0)
+                {
+                    break;
+                }
+
+                await destination.WriteAsync(buffer.AsMemory(0, read));
+                copiedForFile += read;
+                var fileProgress = plan.FileSize > 0 ? Math.Clamp((double)copiedForFile / plan.FileSize, 0.01, 0.999) : 0.5;
+                offlineCacheProgressByFileId[plan.File.Id] = fileProgress;
+
+                if (!string.IsNullOrWhiteSpace(posterGroupId) && groupTotalBytes > 0)
+                {
+                    var groupProgress = Math.Clamp((double)(groupCopiedBytes() + copiedForFile) / groupTotalBytes, 0.01, 0.999);
+                    offlinePosterProgressByItemId[posterGroupId] = groupProgress;
+                }
+
+                RefreshOfflineCachePresentation();
+            }
+        }
+
+        await destination.FlushAsync();
+        if (File.Exists(plan.DestinationPath))
+        {
+            File.Delete(plan.DestinationPath);
+        }
+
+        File.Move(tempPath, plan.DestinationPath);
+        offlineCacheProgressByFileId.Remove(plan.File.Id);
+        offlineCachedFileIds.Add(plan.File.Id);
+        addGroupCopiedBytes(copiedForFile);
+        RefreshOfflineCachePresentation();
+    }
+
+    private async Task DownloadRemoteOfflineCacheFileAsync(
+        OfflineCacheFilePlan plan,
+        FileStream destination,
+        long groupTotalBytes,
+        Func<long> groupCopiedBytes,
+        string? posterGroupId)
+    {
+        if (plan.RemoteUri is null)
+        {
+            return;
+        }
+
+        using var client = new HttpClient { Timeout = TimeSpan.FromHours(6) };
+        using var request = new HttpRequestMessage(HttpMethod.Get, plan.RemoteUri);
+        if (!string.IsNullOrWhiteSpace(plan.RemoteAuthorization))
+        {
+            request.Headers.TryAddWithoutValidation("Authorization", plan.RemoteAuthorization);
+        }
+
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        var expectedBytes = response.Content.Headers.ContentLength ?? plan.FileSize;
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        var buffer = new byte[1024 * 1024];
+        long copiedForFile = 0;
+        while (true)
+        {
+            var read = await stream.ReadAsync(buffer);
+            if (read <= 0)
+            {
+                break;
+            }
+
+            await destination.WriteAsync(buffer.AsMemory(0, read));
+            copiedForFile += read;
+            var fileProgress = expectedBytes > 0 ? Math.Clamp((double)copiedForFile / expectedBytes, 0.01, 0.999) : 0.5;
+            offlineCacheProgressByFileId[plan.File.Id] = fileProgress;
+
+            if (!string.IsNullOrWhiteSpace(posterGroupId) && groupTotalBytes > 0)
+            {
+                var groupProgress = Math.Clamp((double)(groupCopiedBytes() + copiedForFile) / groupTotalBytes, 0.01, 0.999);
+                offlinePosterProgressByItemId[posterGroupId] = groupProgress;
+            }
+
+            RefreshOfflineCachePresentation();
+        }
+    }
+
+    private string? ResolveOfflineCacheDirectory()
+    {
+        var configuredPath = Settings.OfflineCacheDirectory.Trim();
+        return string.IsNullOrWhiteSpace(configuredPath) ? null : configuredPath;
+    }
+
+    private static string? ResolveOfflineCacheSourcePath(LibraryVideoItem file)
+    {
+        if (!string.IsNullOrWhiteSpace(file.AbsolutePath) && File.Exists(file.AbsolutePath))
+        {
+            return file.AbsolutePath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(file.PlaybackPath) &&
+            !Uri.TryCreate(file.PlaybackPath, UriKind.Absolute, out var playbackUri) &&
+            File.Exists(file.PlaybackPath))
+        {
+            return file.PlaybackPath;
+        }
+
+        return null;
+    }
+
+    private static Uri? ResolveOfflineCacheRemoteUri(LibraryVideoItem file, out string? authorization)
+    {
+        authorization = null;
+        if (!string.Equals(file.SourceProtocolType, "webdav", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var candidate = !string.IsNullOrWhiteSpace(file.PlaybackPath) ? file.PlaybackPath : file.AbsolutePath;
+        if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(uri.UserInfo))
+        {
+            var rawUserInfo = Uri.UnescapeDataString(uri.UserInfo);
+            var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(rawUserInfo));
+            authorization = $"Basic {encoded}";
+            var builder = new UriBuilder(uri)
+            {
+                UserName = string.Empty,
+                Password = string.Empty
+            };
+            uri = builder.Uri;
+        }
+        else if (MediaSourceAuthConfigSerializer.DeserializeWebDav(file.SourceAuthConfig) is { } auth &&
+                 !string.IsNullOrWhiteSpace(auth.Username))
+        {
+            var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{auth.Username}:{auth.Password}"));
+            authorization = $"Basic {encoded}";
+        }
+
+        return uri;
+    }
+
+    private static async Task<long> GetRemoteContentLengthAsync(Uri remoteUri, string? authorization)
+    {
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            using var request = new HttpRequestMessage(HttpMethod.Head, remoteUri);
+            if (!string.IsNullOrWhiteSpace(authorization))
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", authorization);
+            }
+
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+            {
+                return 0;
+            }
+
+            return response.Content.Headers.ContentLength ?? 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private string? CurrentDetailOfflineGroupId()
+    {
+        if (currentDetailMovieId.HasValue)
+        {
+            return $"movie-{currentDetailMovieId.Value}";
+        }
+
+        return currentDetailTvShowId.HasValue ? $"tv-{currentDetailTvShowId.Value}" : null;
+    }
+
+    private string GetOfflineCachePath(LibraryVideoItem file, string cacheDirectory)
+    {
+        return Path.Combine(
+            cacheDirectory,
+            SanitizePathSegment(file.Id),
+            SanitizePathSegment(string.IsNullOrWhiteSpace(file.FileName) ? $"{file.Id}.mp4" : file.FileName));
+    }
+
+    private bool IsOfflineCached(LibraryVideoItem file, out string? cachePath)
+    {
+        var cacheDirectory = ResolveOfflineCacheDirectory();
+        if (string.IsNullOrWhiteSpace(cacheDirectory))
+        {
+            cachePath = null;
+            return offlineCachedFileIds.Contains(file.Id);
+        }
+
+        cachePath = GetOfflineCachePath(file, cacheDirectory);
+        var exists = File.Exists(cachePath);
+        if (exists)
+        {
+            offlineCachedFileIds.Add(file.Id);
+        }
+
+        return exists || offlineCachedFileIds.Contains(file.Id);
+    }
+
+    private LibraryVideoItem ApplyOfflineCacheState(LibraryVideoItem file)
+    {
+        var isCached = IsOfflineCached(file, out var cachePath);
+        var isDownloading = offlineCacheProgressByFileId.TryGetValue(file.Id, out var progress);
+        return CopyVideoItem(
+            file,
+            isCached && cachePath is not null ? cachePath : file.OfflineCachePath,
+            isDownloading,
+            isCached,
+            offlineUnavailableFileIds.Contains(file.Id),
+            isDownloading ? progress : (isCached ? 1 : 0));
+    }
+
+    private LibraryPosterItem ApplyOfflineCacheState(LibraryPosterItem item)
+    {
+        var isDownloading = offlinePosterProgressByItemId.TryGetValue(item.Id, out var progress);
+        return CopyPosterItem(
+            item,
+            item.WatchState,
+            item.IsContinuing,
+            isDownloading,
+            offlineCachedPosterIds.Contains(item.Id),
+            offlineUnavailablePosterIds.Contains(item.Id),
+            isDownloading ? progress : (offlineCachedPosterIds.Contains(item.Id) ? 1 : 0));
+    }
+
+    private void RefreshOfflineCachePresentation()
+    {
+        ApplyFilters();
+        if (IsDetailOpen)
+        {
+            var selectedId = DetailPrimaryFile?.Id;
+            if (!string.IsNullOrWhiteSpace(selectedId))
+            {
+                preferredDetailVideoId = selectedId;
+            }
+
+            ApplyDetailFilter();
+        }
+        else
+        {
+            UpdateSelectedSeasonOfflineProgress();
+        }
+    }
+
+    private void UpdateSelectedSeasonOfflineProgress()
+    {
+        var selectedFiles = allDetailFiles
+            .Where(file => !IsDetailSeries || file.SeasonNumber == SelectedSeason)
+            .ToList();
+        if (selectedFiles.Count == 0 || !selectedFiles.Any(file => offlineCacheProgressByFileId.ContainsKey(file.Id)))
+        {
+            ShowSelectedSeasonOfflineCacheProgress = false;
+            SelectedSeasonOfflineCacheProgress = 0;
+            UpdateDetailPosterOfflineState();
+            return;
+        }
+
+        var total = selectedFiles.Sum(file =>
+        {
+            if (IsOfflineCached(file, out _))
+            {
+                return 1.0;
+            }
+
+            return offlineCacheProgressByFileId.TryGetValue(file.Id, out var progress)
+                ? Math.Clamp(progress, 0, 1)
+                : 0;
+        });
+        SelectedSeasonOfflineCacheProgress = total / selectedFiles.Count;
+        ShowSelectedSeasonOfflineCacheProgress = true;
+        UpdateDetailPosterOfflineState();
+    }
+
+    private void UpdateDetailPosterOfflineState()
+    {
+        var groupId = CurrentDetailOfflineGroupId();
+        if (string.IsNullOrWhiteSpace(groupId))
+        {
+            ShowDetailPosterOfflineCacheProgress = false;
+            DetailPosterOfflineCacheProgress = 0;
+            DetailPosterOfflineCacheGlyph = "\u2193";
+            DetailPosterOfflineCacheTip = "\u79BB\u7EBF\u7F13\u5B58\u6574\u90E8\u5F71\u7247\u6216\u5267\u96C6";
+            return;
+        }
+
+        if (offlinePosterProgressByItemId.TryGetValue(groupId, out var progress))
+        {
+            ShowDetailPosterOfflineCacheProgress = true;
+            DetailPosterOfflineCacheProgress = Math.Clamp(progress, 0, 1);
+            DetailPosterOfflineCacheTip = "\u6B63\u5728\u79BB\u7EBF\u7F13\u5B58";
+            return;
+        }
+
+        ShowDetailPosterOfflineCacheProgress = false;
+        DetailPosterOfflineCacheProgress = offlineCachedPosterIds.Contains(groupId) ? 1 : 0;
+        DetailPosterOfflineCacheGlyph = offlineCachedPosterIds.Contains(groupId) ? "\u2713" : "\u2193";
+        DetailPosterOfflineCacheTip = offlineCachedPosterIds.Contains(groupId)
+            ? "\u5DF2\u7F13\u5B58\u5230\u672C\u5730"
+            : "\u79BB\u7EBF\u7F13\u5B58\u6574\u90E8\u5F71\u7247\u6216\u5267\u96C6";
+    }
+
+    private void ShowOfflineCacheAlert(string title, string message)
+    {
+        OfflineCacheAlertTitle = title;
+        OfflineCacheAlertMessage = message;
+        IsOfflineCacheAlertOpen = true;
+        StatusMessage = title;
+        CloseOfflineCacheAlertCommand.NotifyCanExecuteChanged();
+    }
+
+    private void CloseOfflineCacheAlert()
+    {
+        IsOfflineCacheAlertOpen = false;
+        OfflineCacheAlertTitle = string.Empty;
+        OfflineCacheAlertMessage = string.Empty;
+        CloseOfflineCacheAlertCommand.NotifyCanExecuteChanged();
+    }
+
     private void OpenPosterWatchStateConfirmation(LibraryPosterItem? item)
     {
         if (item is null)
@@ -2027,7 +2770,7 @@ public partial class PosterWallViewModel : ObservableObject
                     year,
                     EpisodeEditSubtitle,
                     EpisodeEditThumbnailPath));
-            await RefreshDetailFilesAsync();
+            await RefreshDetailFilesAsync(SelectedSeason);
             CloseEpisodeEdit();
             StatusMessage = "已保存分集自定义信息。";
         }
@@ -2598,10 +3341,21 @@ public partial class PosterWallViewModel : ObservableObject
     private void NotifyNetworkShareFolderStateChanged()
     {
         OnPropertyChanged(nameof(HasNetworkShareFolders));
+        OnPropertyChanged(nameof(IsNetworkCredentialFormVisible));
         OnPropertyChanged(nameof(StarredNetworkShareFolderCount));
         OnPropertyChanged(nameof(HasStarredNetworkShareFolders));
         OnPropertyChanged(nameof(MountStarredNetworkFoldersActionText));
         MountStarredNetworkFoldersCommand.NotifyCanExecuteChanged();
+    }
+
+    private void ToggleNetworkPasswordVisibility()
+    {
+        IsNetworkPasswordVisible = !IsNetworkPasswordVisible;
+    }
+
+    private void ToggleMediaServerTokenVisibility()
+    {
+        IsMediaServerTokenVisible = !IsMediaServerTokenVisible;
     }
 
     private async Task RefreshNetworkSourcesAsync(bool updateBusyState)
@@ -2655,7 +3409,10 @@ public partial class PosterWallViewModel : ObservableObject
         PendingNetworkDisplayName = item.Name;
         PendingNetworkUsername = string.Empty;
         PendingNetworkPassword = string.Empty;
+        ApplySavedNetworkCredential(item.ProtocolKind, item.BaseUrl, allowBaseUrlPrefill: false);
         NetworkLoginTitle = $"登录 {item.ProtocolLabel}";
+        IsSourcePopupOpen = false;
+        IsMediaServerPanelOpen = false;
         ReplaceItems(NetworkShareFolders, []);
         NotifyNetworkShareFolderStateChanged();
         IsNetworkLoginPanelOpen = true;
@@ -2666,6 +3423,7 @@ public partial class PosterWallViewModel : ObservableObject
     private void OpenDiscoveredMediaServer(NetworkSourceDiscoveryItem item)
     {
         IsNetworkLoginPanelOpen = false;
+        IsSourcePopupOpen = false;
         IsMediaServerPanelOpen = true;
         var option = MediaServerProtocolOptions.FirstOrDefault(option =>
             string.Equals(option.Value, item.ProtocolType, StringComparison.OrdinalIgnoreCase)) ?? MediaServerProtocolOptions[0];
@@ -2689,7 +3447,10 @@ public partial class PosterWallViewModel : ObservableObject
         PendingNetworkDisplayName = string.Empty;
         PendingNetworkUsername = string.Empty;
         PendingNetworkPassword = string.Empty;
+        ApplyLatestSavedNetworkCredential();
         NetworkLoginTitle = "添加局域网媒体源";
+        IsSourcePopupOpen = false;
+        IsMediaServerPanelOpen = false;
         ReplaceItems(NetworkShareFolders, []);
         NotifyNetworkShareFolderStateChanged();
         IsNetworkLoginPanelOpen = true;
@@ -2697,9 +3458,49 @@ public partial class PosterWallViewModel : ObservableObject
         OnCommandStateChanged();
     }
 
+    private void ApplySavedNetworkCredential(MediaSourceProtocol? protocol, string baseUrl, bool allowBaseUrlPrefill)
+    {
+        if (protocol is null ||
+            protocol.Value != MediaSourceProtocol.WebDav && protocol.Value != MediaSourceProtocol.Smb)
+        {
+            return;
+        }
+
+        var credential = networkCredentialStore.FindBest(protocol.Value, baseUrl);
+        if (credential is null)
+        {
+            return;
+        }
+
+        PendingNetworkUsername = credential.Username;
+        PendingNetworkPassword = credential.Password;
+        if (allowBaseUrlPrefill && string.IsNullOrWhiteSpace(PendingNetworkBaseUrl))
+        {
+            PendingNetworkProtocolType = credential.ProtocolType;
+            PendingNetworkBaseUrl = credential.BaseUrl;
+            PendingNetworkDisplayName = credential.BaseUrl;
+        }
+    }
+
+    private void ApplyLatestSavedNetworkCredential()
+    {
+        var credential = networkCredentialStore.FindLatest();
+        if (credential is null)
+        {
+            return;
+        }
+
+        PendingNetworkProtocolType = credential.ProtocolType;
+        PendingNetworkBaseUrl = credential.BaseUrl;
+        PendingNetworkDisplayName = credential.BaseUrl;
+        PendingNetworkUsername = credential.Username;
+        PendingNetworkPassword = credential.Password;
+    }
+
     private void OpenMediaServerPanel()
     {
         IsNetworkLoginPanelOpen = false;
+        IsSourcePopupOpen = false;
         IsMediaServerPanelOpen = true;
         if (SelectedMediaServerProtocolOption is null)
         {
@@ -2851,6 +3652,7 @@ public partial class PosterWallViewModel : ObservableObject
     private void ClearNetworkLoginPanel(bool clearStatus)
     {
         IsNetworkLoginPanelOpen = false;
+        IsNetworkPasswordVisible = false;
         PendingNetworkProtocolType = string.Empty;
         PendingNetworkBaseUrl = string.Empty;
         PendingNetworkDisplayName = string.Empty;
@@ -2872,6 +3674,7 @@ public partial class PosterWallViewModel : ObservableObject
         SelectedMediaServerProtocolOption = MediaServerProtocolOptions[0];
         PendingMediaServerBaseUrl = DefaultMediaServerBaseUrl("plex");
         PendingMediaServerToken = string.Empty;
+        IsMediaServerTokenVisible = false;
         PendingMediaServerUserId = string.Empty;
         if (clearStatus)
         {
@@ -2883,6 +3686,11 @@ public partial class PosterWallViewModel : ObservableObject
     {
         var normalizedBaseUrl = NormalizePendingNetworkBaseUrl(PendingNetworkBaseUrl.Trim());
         var protocolType = ResolvePendingNetworkProtocolType(PendingNetworkProtocolType, normalizedBaseUrl);
+        if (string.Equals(protocolType, "webdav", StringComparison.OrdinalIgnoreCase))
+        {
+            normalizedBaseUrl = MediaSourceNormalizer.NormalizeBaseUrl(MediaSourceProtocol.WebDav, normalizedBaseUrl);
+        }
+
         PendingNetworkBaseUrl = normalizedBaseUrl;
         var source = new NetworkSourceDiscoveryItem
         {
@@ -2908,6 +3716,15 @@ public partial class PosterWallViewModel : ObservableObject
                 source,
                 PendingNetworkUsername,
                 PendingNetworkPassword);
+            var sourceProtocol = source.ProtocolKind;
+            if (sourceProtocol is MediaSourceProtocol.WebDav or MediaSourceProtocol.Smb)
+            {
+                networkCredentialStore.Save(
+                    sourceProtocol.GetValueOrDefault(),
+                    source.BaseUrl,
+                    PendingNetworkUsername,
+                    PendingNetworkPassword);
+            }
             ReplaceItems(NetworkShareFolders, folders);
             NotifyNetworkShareFolderStateChanged();
             NetworkSourceStatus = folders.Count == 0
@@ -3063,6 +3880,11 @@ public partial class PosterWallViewModel : ObservableObject
         {
             StatusMessage = "\u5DF2\u505C\u6B62\u65B0\u6302\u8F7D\u5A92\u4F53\u6E90\u7684\u626B\u63CF\u548C\u522E\u524A\u4EFB\u52A1\u3002";
         }
+        catch (Exception ex)
+        {
+            NetworkSourceStatus = $"挂载媒体源失败：{ex.Message}";
+            StatusMessage = NetworkSourceStatus;
+        }
         finally
         {
             IsBusy = false;
@@ -3194,6 +4016,13 @@ public partial class PosterWallViewModel : ObservableObject
         ShowDetailMetadataCandidatesPanelCommand.NotifyCanExecuteChanged();
         HideDetailMetadataCandidatesPanelCommand.NotifyCanExecuteChanged();
         ToggleDetailWatchedCommand.NotifyCanExecuteChanged();
+        ChooseOfflineCacheDirectoryCommand.NotifyCanExecuteChanged();
+        CachePosterItemCommand.NotifyCanExecuteChanged();
+        CacheDetailPosterCommand.NotifyCanExecuteChanged();
+        CacheSelectedSeasonCommand.NotifyCanExecuteChanged();
+        CacheDetailEpisodeCommand.NotifyCanExecuteChanged();
+        CloseOfflineCacheAlertCommand.NotifyCanExecuteChanged();
+        ContinueWithoutTmdbStartupScanCommand.NotifyCanExecuteChanged();
         OpenPosterWatchStateConfirmationCommand.NotifyCanExecuteChanged();
         CancelPosterWatchStateConfirmationCommand.NotifyCanExecuteChanged();
         ConfirmPosterWatchStateCommand.NotifyCanExecuteChanged();
@@ -3260,7 +4089,7 @@ public partial class PosterWallViewModel : ObservableObject
 
     private MediaSource? BuildPendingWebDavSource()
     {
-        var normalizedUrl = PendingWebDavUrl.Trim();
+        var normalizedUrl = MediaSourceNormalizer.NormalizeBaseUrl(MediaSourceProtocol.WebDav, PendingWebDavUrl.Trim());
         if (string.IsNullOrWhiteSpace(normalizedUrl))
         {
             StatusMessage = "请输入 WebDAV 地址。";
@@ -3416,6 +4245,16 @@ public partial class PosterWallViewModel : ObservableObject
         OnPropertyChanged(nameof(PlexAuthorizeButtonText));
         AuthorizePlexCommand.NotifyCanExecuteChanged();
     }
+
+    private sealed record OfflineCacheFilePlan(
+        LibraryVideoItem File,
+        string? SourcePath,
+        Uri? RemoteUri,
+        string? RemoteAuthorization,
+        string DestinationPath,
+        long FileSize);
+
+    private sealed record TvShowHomeGroup(TvShow Representative, IReadOnlyList<TvShow> Shows);
 
     private sealed record PlexPinSession(string Id, string Code, string AuthorizationUrl);
 
@@ -3694,7 +4533,7 @@ public partial class PosterWallViewModel : ObservableObject
             }
 
             StatusMessage = removed
-                ? $"已移除媒体源：{source.Name}。已停止对应扫描、刮削和分集剧照刮削任务；首页已隐藏对应海报，扫描和刮削数据保留 30 天；重新挂载需要再次登录并标星。"
+                ? $"已移除媒体源：{source.Name}。已停止对应扫描、刮削和分集剧照刮削任务；首页已隐藏对应海报，扫描和刮削数据保留 30 天；重新挂载时会优先预填已保存的 SMB/WebDAV 登录信息。"
                 : $"\u672A\u627E\u5230\u8981\u79FB\u9664\u7684\u5A92\u4F53\u6E90\uFF1A{source.Name}";
         }
         finally
@@ -3873,6 +4712,16 @@ public partial class PosterWallViewModel : ObservableObject
         AuthorizePlexCommand.NotifyCanExecuteChanged();
     }
 
+    partial void OnIsNetworkPasswordVisibleChanged(bool value)
+    {
+        OnPropertyChanged(nameof(NetworkPasswordVisibilityGlyph));
+    }
+
+    partial void OnIsMediaServerTokenVisibleChanged(bool value)
+    {
+        OnPropertyChanged(nameof(MediaServerTokenVisibilityGlyph));
+    }
+
     partial void OnDetailPrimaryFileChanged(LibraryVideoItem? value)
     {
         RefreshDetailHeaderState();
@@ -3934,7 +4783,7 @@ public partial class PosterWallViewModel : ObservableObject
             items = items.Where(x => x.Title.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
         }
 
-        items = SortLibraryItems(items);
+        items = SortLibraryItems(items).Select(ApplyOfflineCacheState);
 
         ReplaceItems(LibraryItems, items.ToList());
     }
@@ -3982,7 +4831,7 @@ public partial class PosterWallViewModel : ObservableObject
         return item.VoteAverage.HasValue ? 0 : 1;
     }
 
-    private async Task RefreshDetailFilesAsync()
+    private async Task RefreshDetailFilesAsync(int? preservedSelectedSeason = null)
     {
         IReadOnlyList<LibraryVideoItem> files = [];
 
@@ -3995,16 +4844,17 @@ public partial class PosterWallViewModel : ObservableObject
             files = await videoFileRepository.GetByTvShowAsync(currentDetailTvShowId.Value);
         }
 
+        files = ApplyEpisodeDisplayDisambiguation(files);
         allDetailFiles.Clear();
-        allDetailFiles.AddRange(files);
-        BuildSeasonState(files, IsDetailSeries);
+        allDetailFiles.AddRange(files.Select(ApplyOfflineCacheState));
+        BuildSeasonState(files, IsDetailSeries, preservedSelectedSeason);
         ApplyDetailFilter();
     }
 
     private async Task RefreshContinueWatchingAsync()
     {
         var continueWatching = await videoFileRepository.GetContinueWatchingAsync();
-        ReplaceItems(ContinueWatchingItems, continueWatching);
+        ReplaceItems(ContinueWatchingItems, continueWatching.Select(ApplyOfflineCacheState).ToList());
         OnPropertyChanged(nameof(HasContinueWatching));
         await RefreshLibraryPlaybackStatesAsync();
     }
@@ -4052,10 +4902,67 @@ public partial class PosterWallViewModel : ObservableObject
             : PlaybackWatchState.Unwatched;
     }
 
+    private static PlaybackWatchState ResolvePosterWatchState(
+        IReadOnlyDictionary<string, PlaybackWatchState> playbackStates,
+        IReadOnlyList<string> itemIds)
+    {
+        var hasWatched = false;
+        foreach (var itemId in itemIds)
+        {
+            if (!playbackStates.TryGetValue(itemId, out var watchState))
+            {
+                continue;
+            }
+
+            if (watchState == PlaybackWatchState.InProgress)
+            {
+                return PlaybackWatchState.InProgress;
+            }
+
+            hasWatched |= watchState == PlaybackWatchState.Watched;
+        }
+
+        return hasWatched ? PlaybackWatchState.Watched : PlaybackWatchState.Unwatched;
+    }
+
+    private static IReadOnlyList<TvShowHomeGroup> GroupTvShowsForHome(IReadOnlyList<TvShow> shows)
+    {
+        return shows
+            .GroupBy(static show => NormalizeTvShowHomeGroupKey(show.Title), StringComparer.OrdinalIgnoreCase)
+            .Select(static group =>
+            {
+                var groupedShows = group.ToList();
+                return new TvShowHomeGroup(SelectRepresentativeTvShow(groupedShows), groupedShows);
+            })
+            .OrderBy(static group => group.Representative.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static TvShow SelectRepresentativeTvShow(IReadOnlyList<TvShow> shows)
+    {
+        return shows
+            .OrderByDescending(static show => show.IsLocked)
+            .ThenByDescending(static show => !string.IsNullOrWhiteSpace(show.PosterPath))
+            .ThenByDescending(static show => !string.IsNullOrWhiteSpace(show.Overview))
+            .ThenByDescending(static show => show.VoteAverage.HasValue)
+            .ThenBy(static show => show.Id)
+            .First();
+    }
+
+    private static string NormalizeTvShowHomeGroupKey(string? title)
+    {
+        var normalized = Regex.Replace(title ?? string.Empty, @"\s+", " ").Trim();
+        return string.IsNullOrWhiteSpace(normalized) ? Guid.NewGuid().ToString("N") : normalized;
+    }
+
     private static LibraryPosterItem CopyPosterItem(
         LibraryPosterItem item,
         PlaybackWatchState watchState,
-        bool isContinuing)
+        bool isContinuing,
+        bool? offlineCacheIsDownloading = null,
+        bool? offlineCacheIsCached = null,
+        bool? offlineCacheUnavailable = null,
+        double? offlineCacheProgress = null)
     {
         return new LibraryPosterItem
         {
@@ -4070,12 +4977,130 @@ public partial class PosterWallViewModel : ObservableObject
             ContinueWatchingLabel = item.ContinueWatchingLabel,
             IsContinuing = isContinuing,
             WatchState = watchState,
+            OfflineCacheIsDownloading = offlineCacheIsDownloading ?? item.OfflineCacheIsDownloading,
+            OfflineCacheIsCached = offlineCacheIsCached ?? item.OfflineCacheIsCached,
+            OfflineCacheUnavailable = offlineCacheUnavailable ?? item.OfflineCacheUnavailable,
+            OfflineCacheProgress = offlineCacheProgress ?? item.OfflineCacheProgress,
             MovieId = item.MovieId,
             TvShowId = item.TvShowId
         };
     }
 
-    private void BuildSeasonState(IReadOnlyList<LibraryVideoItem> files, bool isSeries)
+    private static IReadOnlyList<LibraryVideoItem> ApplyEpisodeDisplayDisambiguation(IReadOnlyList<LibraryVideoItem> files)
+    {
+        var duplicateEpisodeKeys = files
+            .Where(static file => file.IsTvEpisode)
+            .GroupBy(static file => (file.SeasonNumber, file.EpisodeNumber))
+            .Where(static group => group.Count() > 1)
+            .Select(static group => group.Key)
+            .ToHashSet();
+
+        return files
+            .Select(file =>
+            {
+                if (!file.IsTvEpisode ||
+                    duplicateEpisodeKeys.Contains((file.SeasonNumber, file.EpisodeNumber)) ||
+                    !string.IsNullOrWhiteSpace(file.CustomEpisodeSubtitle) ||
+                    string.IsNullOrWhiteSpace(file.EpisodeSubtitle))
+                {
+                    return file;
+                }
+
+                return CopyVideoItemWithEpisodeSubtitle(file, null);
+            })
+            .ToList();
+    }
+
+    private static LibraryVideoItem CopyVideoItemWithEpisodeSubtitle(LibraryVideoItem file, string? episodeSubtitle)
+    {
+        return CopyVideoItem(
+            file,
+            file.OfflineCachePath,
+            file.OfflineCacheIsDownloading,
+            file.OfflineCacheIsCached,
+            file.OfflineCacheUnavailable,
+            file.OfflineCacheProgress,
+            episodeSubtitle,
+            overrideEpisodeSubtitle: true);
+    }
+
+    private static LibraryVideoItem CopyVideoItem(
+        LibraryVideoItem file,
+        string? offlineCachePath,
+        bool offlineCacheIsDownloading,
+        bool offlineCacheIsCached,
+        bool offlineCacheUnavailable,
+        double offlineCacheProgress,
+        string? episodeSubtitle = null,
+        bool overrideEpisodeSubtitle = false)
+    {
+        return new LibraryVideoItem
+        {
+            Id = file.Id,
+            FileName = file.FileName,
+            RelativePath = file.RelativePath,
+            MetadataPath = file.MetadataPath,
+            AbsolutePath = file.AbsolutePath,
+            PlaybackPath = file.PlaybackPath,
+            SourceProtocolType = file.SourceProtocolType,
+            SourceBasePath = file.SourceBasePath,
+            SourceAuthConfig = file.SourceAuthConfig,
+            LocalIsoPlaybackPath = file.LocalIsoPlaybackPath,
+            OfflineCachePath = offlineCachePath,
+            ThumbnailPath = file.ThumbnailPath,
+            FallbackImagePath = file.FallbackImagePath,
+            PlayProgress = file.PlayProgress,
+            Duration = file.Duration,
+            LastPlayedAt = file.LastPlayedAt,
+            SeasonNumber = file.SeasonNumber,
+            EpisodeNumber = file.EpisodeNumber,
+            IsTvEpisode = file.IsTvEpisode,
+            EpisodeLabel = file.EpisodeLabel,
+            EpisodeSubtitle = overrideEpisodeSubtitle ? episodeSubtitle : file.EpisodeSubtitle,
+            CustomEpisodeSubtitle = file.CustomEpisodeSubtitle,
+            EpisodeYear = file.EpisodeYear,
+            CustomThumbnailPath = file.CustomThumbnailPath,
+            OfflineCacheIsDownloading = offlineCacheIsDownloading,
+            OfflineCacheIsCached = offlineCacheIsCached,
+            OfflineCacheUnavailable = offlineCacheUnavailable,
+            OfflineCacheProgress = offlineCacheProgress
+        };
+    }
+
+    private static long GetAvailableFreeBytes(string directory)
+    {
+        var root = Path.GetPathRoot(Path.GetFullPath(directory));
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return 0;
+        }
+
+        return new DriveInfo(root).AvailableFreeSpace;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var value = Math.Max(0, bytes);
+        var unitIndex = 0;
+        var display = (double)value;
+        while (display >= 1024 && unitIndex < units.Length - 1)
+        {
+            display /= 1024;
+            unitIndex++;
+        }
+
+        return $"{display:0.##} {units[unitIndex]}";
+    }
+
+    private static string SanitizePathSegment(string value)
+    {
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var sanitized = new string(value.Select(character => invalidChars.Contains(character) ? '_' : character).ToArray()).Trim();
+        return string.IsNullOrWhiteSpace(sanitized) ? "cache-item" : sanitized;
+    }
+
+    private void BuildSeasonState(IReadOnlyList<LibraryVideoItem> files, bool isSeries, int? preservedSelectedSeason = null)
     {
         if (!isSeries)
         {
@@ -4113,8 +5138,12 @@ public partial class PosterWallViewModel : ObservableObject
             .FirstOrDefault();
         var nextUp = recentUnfinished ?? nextUnwatched;
 
-        SelectedSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? seasons[0];
-        selectedPlaybackNavigationSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? seasons[0];
+        var resolvedSeason = preservedSelectedSeason.HasValue && seasons.Contains(preservedSelectedSeason.Value)
+            ? preservedSelectedSeason.Value
+            : preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? seasons[0];
+
+        SelectedSeason = resolvedSeason;
+        selectedPlaybackNavigationSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? resolvedSeason;
         OnPropertyChanged(nameof(HasSeasonTabs));
     }
 
@@ -4137,10 +5166,12 @@ public partial class PosterWallViewModel : ObservableObject
                 .ToList();
         }
 
+        filtered = filtered.Select(ApplyOfflineCacheState).ToList();
         ReplaceItems(DetailFiles, filtered);
         ChooseDetailPrimaryFile(filtered);
         RefreshDetailHeaderState();
         OnPropertyChanged(nameof(HasDetailFiles));
+        UpdateSelectedSeasonOfflineProgress();
         UpdatePlayerNextEpisodeAction();
     }
 
@@ -4398,7 +5429,7 @@ public partial class PosterWallViewModel : ObservableObject
             return;
         }
 
-        await TransitionToEpisodeAsync(nextEpisode);
+        await TransitionToEpisodeAsync(nextEpisode, markCurrentAsFinished: true);
     }
 
     private Task SelectPlaybackNavigationSeasonAsync(int season)
@@ -4430,7 +5461,7 @@ public partial class PosterWallViewModel : ObservableObject
         await TransitionToEpisodeAsync(targetEpisode);
     }
 
-    private async Task TransitionToEpisodeAsync(LibraryVideoItem targetEpisode)
+    private async Task TransitionToEpisodeAsync(LibraryVideoItem targetEpisode, bool markCurrentAsFinished = false)
     {
         if (!MediaSourcePathResolver.IsPlayableLocation(targetEpisode.EffectivePlaybackPath))
         {
@@ -4448,7 +5479,7 @@ public partial class PosterWallViewModel : ObservableObject
         if (currentEpisode is not null)
         {
             StopPlaybackProgressSync();
-            await PersistTransitionPlaybackStateAsync(currentEpisode);
+            await PersistTransitionPlaybackStateAsync(currentEpisode, markAsFinished: markCurrentAsFinished);
             suppressedPlaybackPersistenceVideoId =
                 currentPlaybackMode == PlaybackMode.Overlay
                     ? currentEpisode.Id
@@ -4518,11 +5549,16 @@ public partial class PosterWallViewModel : ObservableObject
         return allDetailFiles.FirstOrDefault(file => string.Equals(file.Id, videoId, StringComparison.Ordinal));
     }
 
-    private async Task PersistTransitionPlaybackStateAsync(LibraryVideoItem episode)
+    private async Task PersistTransitionPlaybackStateAsync(LibraryVideoItem episode, bool markAsFinished = false)
     {
         var duration = Math.Max(episode.Duration, Player.DurationSeconds);
         var progress = Math.Max(episode.PlayProgress, Player.CurrentPositionSeconds);
-        var shouldMarkWatched = episode.IsWatched || Player.PlaybackProgressRatio >= PlaybackProgressRules.CompletionRatio;
+        var shouldMarkWatched = markAsFinished || episode.IsWatched || Player.PlaybackProgressRatio >= PlaybackProgressRules.CompletionRatio;
+        if (shouldMarkWatched)
+        {
+            duration = Math.Max(duration, Math.Max(progress, 100));
+        }
+
         var persistedProgress = shouldMarkWatched && duration > 0
             ? duration
             : NormalizePersistedProgress(progress, duration);
@@ -4667,10 +5703,7 @@ public partial class PosterWallViewModel : ObservableObject
 
     private static string FormatEpisodeTitle(LibraryVideoItem file)
     {
-        var seasonText = file.SeasonNumber == 0
-            ? "\u7279\u522B\u7BC7"
-            : $"\u7B2C {file.SeasonNumber} \u5B63";
-        return $"{seasonText} \u7B2C {file.EpisodeNumber} \u96C6";
+        return file.EpisodeDisplayTitle;
     }
 
     private static string FormatMovieSubtitle(Movie movie)
@@ -4866,7 +5899,7 @@ public partial class PosterWallViewModel : ObservableObject
                 .Select(show => (show.Id, show.Title))
                 .ToList();
             var tvShowThumbnailQueue = shouldRefreshThumbnails
-                ? allTvShows.Select(show => (show.Id, show.Title)).ToList()
+                ? BuildTvShowThumbnailQueueInHomeOrder()
                 : new List<(long Id, string Title)>();
             var totals = new LibraryArtworkRefreshTotals();
 
@@ -5151,6 +6184,35 @@ public partial class PosterWallViewModel : ObservableObject
     private bool ShouldRefreshThumbnails(TmdbSettings settings, bool forceThumbnails)
     {
         return settings.EnableEpisodeThumbnailDownloads && allTvShows.Count > 0 && forceThumbnails;
+    }
+
+    private List<(long Id, string Title)> BuildTvShowThumbnailQueueInHomeOrder()
+    {
+        var showsById = allTvShows.ToDictionary(static show => show.Id);
+        var queuedIds = new HashSet<long>();
+        var queue = new List<(long Id, string Title)>();
+
+        foreach (var item in LibraryItems)
+        {
+            if (!item.TvShowId.HasValue ||
+                !queuedIds.Add(item.TvShowId.Value) ||
+                !showsById.TryGetValue(item.TvShowId.Value, out var show))
+            {
+                continue;
+            }
+
+            queue.Add((show.Id, show.Title));
+        }
+
+        foreach (var show in allTvShows.OrderBy(static show => show.Title, StringComparer.OrdinalIgnoreCase))
+        {
+            if (queuedIds.Add(show.Id))
+            {
+                queue.Add((show.Id, show.Title));
+            }
+        }
+
+        return queue;
     }
 
     private static bool IsUsableLocalPoster(string? posterPath)

@@ -49,6 +49,26 @@ public sealed class PlaceholderTests
     }
 
     [Fact]
+    public void ExtractSearchMetadata_RemovesBluRayReleaseTailFromRootFolder()
+    {
+        var metadata = MediaNameParser.ExtractSearchMetadata(
+            "Judgement at Nuremberg 1961 GER Blu-ray 1080p AVC DTS-HD MA 5.1-pt520@HDSky/BDMV/STREAM/00004.m2ts");
+
+        Assert.Equal("Judgement at Nuremberg", metadata.ForeignTitle);
+        Assert.Equal("Judgement at Nuremberg", metadata.FullCleanTitle);
+        Assert.Equal("1961", metadata.Year);
+    }
+
+    [Fact]
+    public void ExtractSearchMetadata_TrimsChineseBonusFeatureTitleToMainShow()
+    {
+        var metadata = MediaNameParser.ExtractSearchMetadata(
+            "命运之夜前传特典：拜托了！爱因兹贝伦咨询室.Fate ∕ Zero.Einzbern.Counseling.Room.S00.2012.1080p.Blu-ray.Remux.LPCM 2.0-LuckAni/命运之夜前传特典：拜托了！爱因兹贝伦咨询室.Fate ∕ Zero.Einzbern.Counseling.Room.S00E01.2012.1080p.Blu-ray.Remux.LPCM 2.0-LuckAni.mkv");
+
+        Assert.Equal("命运之夜前传", metadata.ChineseTitle);
+    }
+
+    [Fact]
     public void ExtractSearchMetadata_RemovesEpisodeAndReleaseTailFromTvFile()
     {
         var metadata = MediaNameParser.ExtractSearchMetadata(
@@ -181,6 +201,31 @@ public sealed class PlaceholderTests
     }
 
     [Fact]
+    public void ParseEpisodeInfo_UsesSubtitleBeforeReleaseMetadata()
+    {
+        var episode = MediaNameParser.ParseEpisodeInfo(
+            "Sisters.Who.Make.Waves.S07E01.Talk.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+            0);
+
+        Assert.True(episode.IsTvShow);
+        Assert.Equal(7, episode.Season);
+        Assert.Equal(1, episode.Episode);
+        Assert.Equal("2026", episode.Year);
+        Assert.Equal("Talk", episode.Subtitle);
+    }
+
+    [Fact]
+    public void ParseEpisodeInfo_DoesNotUseReleaseGroupAsSubtitle()
+    {
+        var episode = MediaNameParser.ParseEpisodeInfo(
+            "Show.S01E01.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+            0);
+
+        Assert.True(episode.IsTvShow);
+        Assert.Null(episode.Subtitle);
+    }
+
+    [Fact]
     public void EpisodeSortKey_OrdersMultipartSegmentsNumerically()
     {
         var sorted = new[]
@@ -203,6 +248,16 @@ public sealed class PlaceholderTests
         var season = MediaNameParser.ResolvePreferredSeason(@"D:\Shows\Season 1\Show.S02E03.mkv", "Show.S02E03.mkv");
 
         Assert.Equal(2, season);
+    }
+
+    [Fact]
+    public void ResolvePreferredSeason_UsesMinimumSeasonFromMultiSeasonPack()
+    {
+        var season = MediaNameParser.ResolvePreferredSeason(
+            "Gintama.S01-11.2006.1080p.Hami.WEB-DL.H264.AAC-HHWEB/Season 02/Gintama.S02E45.2007.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv",
+            "Gintama.S02E45.2007.1080p.Hami.WEB-DL.H264.AAC-HHWEB.mkv");
+
+        Assert.Equal(1, season);
     }
 
     [Fact]

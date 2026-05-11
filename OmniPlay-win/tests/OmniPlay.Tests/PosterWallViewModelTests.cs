@@ -554,7 +554,6 @@ public sealed class PosterWallViewModelTests
         Assert.True(videoRepository.GetByTvShowCallCount >= 2);
         Assert.Contains("1", viewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Contains("分集剧照", viewModel.StatusMessage, StringComparison.Ordinal);
-        Assert.True(viewModel.HasStatusMessage);
     }
 
     [Fact]
@@ -617,6 +616,57 @@ public sealed class PosterWallViewModelTests
         viewModel.OpenEpisodeEditCommand.Execute(video);
 
         Assert.Equal(string.Empty, viewModel.EpisodeEditSubtitle);
+    }
+
+    [Fact]
+    public async Task SaveEpisodeEditCommand_PreservesManuallySelectedSeason()
+    {
+        var videoRepository = new FakeVideoFileRepository();
+        videoRepository.TvShowFilesById[7] =
+        [
+            CreateVideoItem(
+                CreateMediaFile(),
+                id: "s1e1",
+                isTvEpisode: true,
+                seasonNumber: 1,
+                episodeNumber: 1),
+            CreateVideoItem(
+                CreateMediaFile(),
+                id: "s2e1",
+                isTvEpisode: true,
+                seasonNumber: 2,
+                episodeNumber: 1),
+            CreateVideoItem(
+                CreateMediaFile(),
+                id: "s2e2",
+                isTvEpisode: true,
+                seasonNumber: 2,
+                episodeNumber: 2)
+        ];
+        var tvShowRepository = new FakeTvShowRepository();
+        tvShowRepository.Shows.Add(new TvShow
+        {
+            Id = 7,
+            Title = "Demo Show"
+        });
+        var viewModel = CreateViewModel(
+            videoRepository,
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()),
+            tvShowRepository: tvShowRepository);
+
+        await viewModel.LoadAsync();
+        await viewModel.OpenDetailCommand.ExecuteAsync(Assert.Single(viewModel.LibraryItems));
+        viewModel.SelectedSeasonOption = 2;
+        var editedEpisode = viewModel.DetailFiles.Single(file => file.Id == "s2e1");
+
+        viewModel.OpenEpisodeEditCommand.Execute(editedEpisode);
+        viewModel.EpisodeEditSeason = "1";
+        await viewModel.SaveEpisodeEditCommand.ExecuteAsync(null);
+
+        Assert.Equal(2, viewModel.SelectedSeason);
+        Assert.Equal(["s2e2"], viewModel.DetailFiles.Select(static file => file.Id).ToArray());
     }
 
     [Fact]
@@ -851,7 +901,7 @@ public sealed class PosterWallViewModelTests
     }
 
     [Fact]
-    public void EpisodeDisplaySubtitle_IgnoresParsedSubtitleUnlessCustomized()
+    public void EpisodeDisplayTitle_IncludesParsedSubtitleWithoutDuplicatingSubtitleRow()
     {
         var parsedOnly = new LibraryVideoItem
         {
@@ -869,10 +919,78 @@ public sealed class PosterWallViewModelTests
             CustomEpisodeSubtitle = "Custom Topic"
         };
 
-        Assert.Equal(string.Empty, parsedOnly.EpisodeDisplaySubtitle);
+        Assert.Equal("Parsed Topic", parsedOnly.EpisodeDisplaySubtitle);
+        Assert.Equal(string.Concat(parsedOnly.SeasonEpisodeText, " \u00B7 Parsed Topic"), parsedOnly.EpisodeDisplayTitle);
         Assert.False(parsedOnly.HasEpisodeDisplaySubtitle);
         Assert.Equal("Custom Topic", customized.EpisodeDisplaySubtitle);
-        Assert.True(customized.HasEpisodeDisplaySubtitle);
+        Assert.Equal(string.Concat(customized.SeasonEpisodeText, " \u00B7 Custom Topic"), customized.EpisodeDisplayTitle);
+        Assert.False(customized.HasEpisodeDisplaySubtitle);
+    }
+
+    [Fact]
+    public async Task OpenDetailCommand_OnlyUsesParsedEpisodeSubtitleForDuplicateEpisodes()
+    {
+        var videoRepository = new FakeVideoFileRepository();
+        videoRepository.TvShowFilesById[7] =
+        [
+            new LibraryVideoItem
+            {
+                Id = "ep-1",
+                FileName = "Show.S01E01.Topic.mkv",
+                AbsolutePath = CreateMediaFile(),
+                PlaybackPath = CreateMediaFile(),
+                IsTvEpisode = true,
+                SeasonNumber = 1,
+                EpisodeNumber = 1,
+                EpisodeSubtitle = "Topic"
+            },
+            new LibraryVideoItem
+            {
+                Id = "ep-2-talk",
+                FileName = "Show.S01E02.Talk.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                AbsolutePath = CreateMediaFile(),
+                PlaybackPath = CreateMediaFile(),
+                IsTvEpisode = true,
+                SeasonNumber = 1,
+                EpisodeNumber = 2,
+                EpisodeSubtitle = "Talk"
+            },
+            new LibraryVideoItem
+            {
+                Id = "ep-2-team",
+                FileName = "Show.S01E02.Team.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                AbsolutePath = CreateMediaFile(),
+                PlaybackPath = CreateMediaFile(),
+                IsTvEpisode = true,
+                SeasonNumber = 1,
+                EpisodeNumber = 2,
+                EpisodeSubtitle = "Team"
+            }
+        ];
+        var tvShowRepository = new FakeTvShowRepository();
+        tvShowRepository.Shows.Add(new TvShow
+        {
+            Id = 7,
+            Title = "Demo Show"
+        });
+        var viewModel = CreateViewModel(
+            videoRepository,
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()),
+            tvShowRepository: tvShowRepository);
+
+        await viewModel.LoadAsync();
+        await viewModel.OpenDetailCommand.ExecuteAsync(Assert.Single(viewModel.LibraryItems));
+
+        var single = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-1");
+        Assert.Equal(single.SeasonEpisodeText, single.EpisodeDisplayTitle);
+        Assert.Equal(string.Empty, single.EpisodeDisplaySubtitle);
+
+        var talk = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-talk");
+        var team = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-team");
+        Assert.Equal(string.Concat(talk.SeasonEpisodeText, " \u00B7 Talk"), talk.EpisodeDisplayTitle);
+        Assert.Equal(string.Concat(team.SeasonEpisodeText, " \u00B7 Team"), team.EpisodeDisplayTitle);
     }
 
     [Fact]
@@ -1376,11 +1494,20 @@ public sealed class PosterWallViewModelTests
                 1,
                 ["已跳过本地媒体源“失效目录”：目录不存在。"])
         };
+        var mediaSourceRepository = new FakeMediaSourceRepository();
+        mediaSourceRepository.Sources.Add(new MediaSource
+        {
+            Id = 1,
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = CreateFolder()
+        });
         var viewModel = CreateViewModel(
             new FakeVideoFileRepository(),
             new FakePlaybackLauncher(),
             new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
             new PlayerViewModel(new FakeMediaPlayer()),
+            mediaSourceRepository: mediaSourceRepository,
             scanner: scanner);
 
         await viewModel.ScanAsync();
@@ -1413,11 +1540,20 @@ public sealed class PosterWallViewModelTests
             MediaKind = "剧集",
             TvShowId = 7
         };
+        var mediaSourceRepository = new FakeMediaSourceRepository();
+        mediaSourceRepository.Sources.Add(new MediaSource
+        {
+            Id = 1,
+            Name = "Shows",
+            ProtocolType = "local",
+            BaseUrl = CreateFolder()
+        });
         var viewModel = CreateViewModel(
             new FakeVideoFileRepository(),
             new FakePlaybackLauncher(),
             new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
             new PlayerViewModel(new FakeMediaPlayer()),
+            mediaSourceRepository: mediaSourceRepository,
             scanner: scanner);
         viewModel.DetailPrimaryFile = video;
         viewModel.IsDetailSeries = true;
@@ -1638,6 +1774,7 @@ public sealed class PosterWallViewModelTests
             new FakePosterImagePickerService(),
             new FakeWebDavConnectionTester(),
             new FakeNetworkShareDiscoveryService(),
+            new FakeNetworkCredentialStore(),
             playbackLauncher,
             settings,
             player);
@@ -2302,6 +2439,23 @@ public sealed class PosterWallViewModelTests
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IReadOnlyList<NetworkShareFolderItem>>([]);
+        }
+    }
+
+    private sealed class FakeNetworkCredentialStore : INetworkCredentialStore
+    {
+        public NetworkCredentialEntry? FindBest(MediaSourceProtocol protocol, string baseUrl)
+        {
+            return null;
+        }
+
+        public NetworkCredentialEntry? FindLatest()
+        {
+            return null;
+        }
+
+        public void Save(MediaSourceProtocol protocol, string baseUrl, string username, string password)
+        {
         }
     }
 

@@ -7,7 +7,7 @@ namespace OmniPlay.Tests;
 public sealed class NetworkShareDiscoveryServiceTests
 {
     [Fact]
-    public async Task DiscoverAsync_ReturnsManualNetworkEntries()
+    public async Task DiscoverAsync_ReturnsOnlyDetectedNetworkEntries()
     {
         var service = new NetworkShareDiscoveryService(
             new HttpClient(new EmptyHandler()),
@@ -15,12 +15,43 @@ public sealed class NetworkShareDiscoveryServiceTests
 
         var sources = await service.DiscoverAsync();
 
+        Assert.DoesNotContain(sources, source =>
+            string.Equals(source.BaseUrl, "http://server:5005", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(sources, source =>
+            string.Equals(source.BaseUrl, @"\\server\share", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task DiscoverAsync_DetectsWebDavEndpointWithPort()
+    {
+        var endpoints = new[] { new Uri("http://webdav.local:5005") };
+        var service = new NetworkShareDiscoveryService(
+            new HttpClient(new DelegateHandler(request =>
+            {
+                if (request.Method.Method == "PROPFIND" &&
+                    request.RequestUri?.Host == "webdav.local" &&
+                    request.RequestUri.Port == 5005)
+                {
+                    var response = new HttpResponseMessage((HttpStatusCode)207)
+                    {
+                        Content = new StringContent("""
+                        <d:multistatus xmlns:d="DAV:" />
+                        """)
+                    };
+                    response.Headers.TryAddWithoutValidation("DAV", "1,2");
+                    return response;
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            })),
+            _ => Task.FromResult<IReadOnlyList<Uri>>(endpoints));
+
+        var sources = await service.DiscoverAsync();
+
         Assert.Contains(sources, source =>
-            string.Equals(source.ProtocolType, "webdav", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(source.BaseUrl, "https://", StringComparison.Ordinal));
-        Assert.Contains(sources, source =>
-            string.Equals(source.ProtocolType, "smb", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(source.BaseUrl, @"\\server\share", StringComparison.Ordinal));
+            source.ProtocolKind == MediaSourceProtocol.WebDav &&
+            string.Equals(source.Name, "WebDAV", StringComparison.Ordinal) &&
+            string.Equals(source.BaseUrl, "http://webdav.local:5005", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -74,12 +105,15 @@ public sealed class NetworkShareDiscoveryServiceTests
 
         Assert.Contains(sources, source =>
             source.ProtocolKind == MediaSourceProtocol.Plex &&
+            string.Equals(source.Name, "Plex", StringComparison.Ordinal) &&
             string.Equals(source.BaseUrl, "http://plex.local:32400", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(sources, source =>
             source.ProtocolKind == MediaSourceProtocol.Emby &&
+            string.Equals(source.Name, "Emby", StringComparison.Ordinal) &&
             string.Equals(source.BaseUrl, "http://emby.local:8096", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(sources, source =>
             source.ProtocolKind == MediaSourceProtocol.Jellyfin &&
+            string.Equals(source.Name, "Jellyfin", StringComparison.Ordinal) &&
             string.Equals(source.BaseUrl, "http://jellyfin.local:8096", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(sources, source =>
             source.BaseUrl.Contains("printer.local", StringComparison.OrdinalIgnoreCase));
@@ -128,6 +162,109 @@ public sealed class NetworkShareDiscoveryServiceTests
         Assert.True(sawTokenHeader);
         var file = Assert.Single(files);
         Assert.Equal("Movie.2020.mkv", file.FileName);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_MapsPlexEpisodesToSoftwareParseableMetadataPaths()
+    {
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath == "/library/sections")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """<MediaContainer><Directory key="2" type="show" title="Shows" /></MediaContainer>""")
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    """
+                    <MediaContainer>
+                      <Video title="Episode One" grandparentTitle="Dark" parentIndex="1" index="1">
+                        <Media><Part key="/library/parts/ep1/file.mkv" file="/plex/metadata/opaque-ep1.mkv" size="123" /></Media>
+                      </Video>
+                      <Video title="Episode Two" grandparentTitle="Dark" parentIndex="1" index="2">
+                        <Media><Part key="/library/parts/ep2/file.mkv" file="/plex/metadata/opaque-ep2.mkv" size="124" /></Media>
+                      </Video>
+                    </MediaContainer>
+                    """)
+            };
+        })));
+        var source = new MediaSource
+        {
+            Name = "Plex",
+            ProtocolType = "plex",
+            BaseUrl = "http://plex.local:32400"
+        };
+
+        var files = await client.EnumerateFilesAsync(source);
+
+        Assert.Equal(
+            ["Dark/Season 1/Dark.S01E01.mkv", "Dark/Season 1/Dark.S01E02.mkv"],
+            files.Select(static file => file.MetadataPath).ToList());
+        Assert.Equal(
+            ["library/parts/ep1/file.mkv", "library/parts/ep2/file.mkv"],
+            files.Select(static file => file.RelativePath).ToList());
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_MapsEmbyCompatibleEpisodesToSoftwareParseableMetadataPaths()
+    {
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            Assert.Equal("/Items", request.RequestUri?.AbsolutePath);
+            Assert.Contains("SeriesName", request.RequestUri?.Query, StringComparison.OrdinalIgnoreCase);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    """
+                    {
+                      "Items": [
+                        {
+                          "Id": "ep1",
+                          "Name": "Chapter One",
+                          "Type": "Episode",
+                          "SeriesName": "Dark",
+                          "ParentIndexNumber": 1,
+                          "IndexNumber": 1,
+                          "MediaSources": [
+                            { "Id": "ep1-src", "Path": "/emby/opaque-ep1.mkv", "Container": "mkv", "Size": 123 }
+                          ]
+                        },
+                        {
+                          "Id": "ep2",
+                          "Name": "Chapter Two",
+                          "Type": "Episode",
+                          "SeriesName": "Dark",
+                          "ParentIndexNumber": 1,
+                          "IndexNumber": 2,
+                          "MediaSources": [
+                            { "Id": "ep2-src", "Path": "/emby/opaque-ep2.mkv", "Container": "mkv", "Size": 124 }
+                          ]
+                        }
+                      ]
+                    }
+                    """)
+            };
+        })));
+        var source = new MediaSource
+        {
+            Name = "Jellyfin",
+            ProtocolType = "jellyfin",
+            BaseUrl = "http://jellyfin.local:8096"
+        };
+
+        var files = await client.EnumerateFilesAsync(source);
+
+        Assert.Equal(
+            ["Dark/Season 1/Dark.S01E01.mkv", "Dark/Season 1/Dark.S01E02.mkv"],
+            files.Select(static file => file.MetadataPath).ToList());
+        Assert.Equal(
+            ["Items/ep1/Download", "Items/ep2/Download"],
+            files.Select(static file => file.RelativePath).ToList());
     }
 
     [Fact]

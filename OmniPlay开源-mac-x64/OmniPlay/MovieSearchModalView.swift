@@ -92,11 +92,11 @@ struct MovieSearchModalView: View {
         
         Task {
             do {
-                let extracted = MediaNameParser.extractSearchMetadata(from: searchQuery)
+                let userQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                let extracted = MediaNameParser.extractSearchMetadata(from: userQuery)
                 let parentChinese = MediaNameParser.extractParentFolderChineseTitle(from: originalFilename)
                 let extractedForeign = extracted.foreignTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let normalizedQuery = (extracted.chineseTitle ?? extracted.foreignTitle ?? extracted.fullCleanTitle ?? searchQuery)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedQuery = userQuery
                 let secondaryQuery = extractedForeign
                 let cleanYearInput = searchYear.trimmingCharacters(in: .whitespacesAndNewlines)
                 let effectiveYear = cleanYearInput.isEmpty ? (extracted.year ?? "") : cleanYearInput
@@ -154,7 +154,6 @@ struct MovieSearchModalView: View {
                 
                 // 🌟 使用更简洁的 MainActor 更新 UI
                 await MainActor.run {
-                    self.searchQuery = finalQuery
                     self.searchYear = effectiveYear
                     self.searchResults = results
                     self.isSearching = false

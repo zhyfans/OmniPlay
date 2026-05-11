@@ -6,6 +6,7 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <RootNamespace>OmniPlay</RootNamespace>
     <BuildInParallel>false</BuildInParallel>
+    <DefaultItemExcludes>$(DefaultItemExcludes);**\._*</DefaultItemExcludes>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Debug' and '$(ContinuousIntegrationBuild)' != 'true'">
@@ -16,4 +17,12 @@
   <PropertyGroup Condition="'$(Configuration)' == 'Release' or '$(ContinuousIntegrationBuild)' == 'true'">
     <NuGetAudit>true</NuGetAudit>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="**\._*.cs" />
+    <None Remove="**\._*" />
+    <Content Remove="**\._*" />
+    <EmbeddedResource Remove="**\._*" />
+    <AvaloniaResource Remove="**\._*" />
+  </ItemGroup>
 </Project>

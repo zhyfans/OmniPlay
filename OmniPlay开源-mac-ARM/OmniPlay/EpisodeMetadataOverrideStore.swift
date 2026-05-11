@@ -30,7 +30,7 @@ final class EpisodeMetadataOverrideStore {
 
     func resolvedEpisodeInfo(fileId: String, fileName: String, fallbackIndex: Int) -> (season: Int, episode: Int, displayName: String, isTVShow: Bool) {
         let parsed = MediaNameParser.parseEpisodeDescriptor(from: fileName, fallbackIndex: fallbackIndex)
-        let parsedDisplayName = parsed.season == 0 ? "特别篇 第 \(parsed.episode) 集" : "第 \(parsed.season) 季 第 \(parsed.episode) 集"
+        let parsedDisplayName = parsed.displayName
         guard let override = override(for: fileId) else {
             return (parsed.season, parsed.episode, parsedDisplayName, parsed.isTVShow)
         }
@@ -38,6 +38,8 @@ final class EpisodeMetadataOverrideStore {
         var displayName = override.season == 0 ? "特别篇 第 \(override.episode) 集" : "第 \(override.season) 季 第 \(override.episode) 集"
         if let subtitle = override.subtitle, !subtitle.isEmpty {
             displayName += " · \(subtitle)"
+        } else if let detailRange = parsedDisplayName.range(of: " · ") {
+            displayName += String(parsedDisplayName[detailRange.lowerBound...])
         }
 
         return (override.season, override.episode, displayName, true)

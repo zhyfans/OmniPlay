@@ -1,5 +1,8 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OmniPlay.Core.Interfaces;
@@ -13,6 +16,9 @@ public partial class SettingsViewModel : ObservableObject
     private const string TmdbWebsiteUrl = "https://www.themoviedb.org";
     private const string TmdbFaqUrl = "https://developer.themoviedb.org/docs/faq";
     private const string TmdbApiTermsUrl = "https://www.themoviedb.org/api-terms-of-use";
+    private const string GitHubRepositoryUrl = "https://github.com/nandieling/OmniPlay";
+    private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/nandieling/OmniPlay/releases/latest";
+    private const string GitHubLatestReleaseUrl = "https://github.com/nandieling/OmniPlay/releases/latest";
 
     private static readonly IReadOnlyList<AppCreditLinkItem> BuiltInCreditLinks =
     [
@@ -76,6 +82,8 @@ public partial class SettingsViewModel : ObservableObject
 
         SaveCommand = new AsyncRelayCommand(SaveAsync, () => !IsBusy);
         TestTmdbConnectionCommand = new AsyncRelayCommand(TestTmdbConnectionAsync, () => !IsBusy);
+        CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, () => !IsBusy);
+        InstallLatestUpdateCommand = new AsyncRelayCommand(InstallLatestUpdateAsync, () => !IsBusy);
         OpenAboutCommand = new RelayCommand(OpenAbout);
         CloseAboutCommand = new RelayCommand(CloseAbout);
         OpenTmdbWebsiteCommand = new RelayCommand(OpenTmdbWebsite);
@@ -84,6 +92,7 @@ public partial class SettingsViewModel : ObservableObject
         OpenCreditLinkCommand = new RelayCommand<AppCreditLinkItem?>(OpenCreditLink);
         OpenThirdPartyNoticesCommand = new RelayCommand(OpenThirdPartyNotices);
         OpenSettingsDirectoryCommand = new RelayCommand(OpenSettingsDirectory);
+        OpenGitHubRepositoryCommand = new RelayCommand(OpenGitHubRepository);
 
         SyncSelectedOptions();
     }
@@ -91,6 +100,10 @@ public partial class SettingsViewModel : ObservableObject
     public IAsyncRelayCommand SaveCommand { get; }
 
     public IAsyncRelayCommand TestTmdbConnectionCommand { get; }
+
+    public IAsyncRelayCommand CheckForUpdatesCommand { get; }
+
+    public IAsyncRelayCommand InstallLatestUpdateCommand { get; }
 
     public IRelayCommand OpenAboutCommand { get; }
 
@@ -107,6 +120,8 @@ public partial class SettingsViewModel : ObservableObject
     public IRelayCommand OpenThirdPartyNoticesCommand { get; }
 
     public IRelayCommand OpenSettingsDirectoryCommand { get; }
+
+    public IRelayCommand OpenGitHubRepositoryCommand { get; }
 
     public IReadOnlyList<AppCreditLinkItem> CreditLinks => BuiltInCreditLinks;
 
@@ -133,6 +148,9 @@ public partial class SettingsViewModel : ObservableObject
 
     [ObservableProperty]
     private bool showMediaSourceRealPath = true;
+
+    [ObservableProperty]
+    private string offlineCacheDirectory = string.Empty;
 
     [ObservableProperty]
     private bool enableLocalMetadataImport;
@@ -186,6 +204,9 @@ public partial class SettingsViewModel : ObservableObject
     private string tmdbConnectionStatusMessage = "尚未测试 TMDB 连通性。";
 
     [ObservableProperty]
+    private string updateStatusMessage = "尚未检查更新。";
+
+    [ObservableProperty]
     private bool isBusy;
 
     [ObservableProperty]
@@ -209,6 +230,7 @@ public partial class SettingsViewModel : ObservableObject
         {
             AutoScanOnStartup = AutoScanOnStartup,
             ShowMediaSourceRealPath = ShowMediaSourceRealPath,
+            OfflineCacheDirectory = OfflineCacheDirectory.Trim(),
             Tmdb = BuildTmdbSettings(),
             LocalMetadata = BuildLocalMetadataSettings(),
             Playback = BuildPlaybackPreferenceSettings()
@@ -301,6 +323,70 @@ public partial class SettingsViewModel : ObservableObject
         }
     }
 
+    private async Task CheckForUpdatesAsync()
+    {
+        await CheckForUpdatesCoreAsync(install: false);
+    }
+
+    private async Task InstallLatestUpdateAsync()
+    {
+        await CheckForUpdatesCoreAsync(install: true);
+    }
+
+    private async Task CheckForUpdatesCoreAsync(bool install)
+    {
+        IsBusy = true;
+        NotifyCommandStateChanged();
+
+        try
+        {
+            UpdateStatusMessage = install ? "正在获取 GitHub 最新版本..." : "正在检查 GitHub 最新版本...";
+            var release = await FetchLatestGitHubReleaseAsync();
+            if (release is null)
+            {
+                UpdateStatusMessage = "GitHub 仓库暂未发布 Release，已打开仓库页面。";
+                OpenExternalTarget(GitHubRepositoryUrl, "GitHub 仓库");
+                return;
+            }
+
+            var isNewer = IsVersionNewer(release.TagName, AppVersionText);
+            if (!install)
+            {
+                UpdateStatusMessage = isNewer
+                    ? $"发现新版本 {release.TagName}，可点击“直接更新”。"
+                    : $"当前已是最新版本（{AppVersionText}）。";
+                return;
+            }
+
+            if (!isNewer)
+            {
+                UpdateStatusMessage = $"当前已是最新版本（{AppVersionText}）。";
+                return;
+            }
+
+            var asset = PickWindowsReleaseAsset(release.Assets);
+            if (asset is null)
+            {
+                UpdateStatusMessage = "未找到适合 Windows 的安装包，已打开 GitHub Release 页面。";
+                OpenExternalTarget(string.IsNullOrWhiteSpace(release.HtmlUrl) ? GitHubLatestReleaseUrl : release.HtmlUrl, "GitHub Release");
+                return;
+            }
+
+            var downloadedPath = await DownloadReleaseAssetAsync(asset.Value);
+            UpdateStatusMessage = $"已下载 {Path.GetFileName(downloadedPath)}，正在打开安装包。";
+            OpenExternalTarget(downloadedPath, "更新包");
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusMessage = $"检查更新失败：{ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+            NotifyCommandStateChanged();
+        }
+    }
+
     private void OpenAbout()
     {
         IsAboutPopupOpen = true;
@@ -346,6 +432,11 @@ public partial class SettingsViewModel : ObservableObject
         OpenExternalTarget(SettingsDirectoryPath, "设置目录");
     }
 
+    private void OpenGitHubRepository()
+    {
+        OpenExternalTarget(GitHubRepositoryUrl, "GitHub 仓库");
+    }
+
     private void OpenExternalTarget(string target, string label)
     {
         if (externalLinkOpener.TryOpen(target, out var errorMessage))
@@ -364,6 +455,7 @@ public partial class SettingsViewModel : ObservableObject
     {
         AutoScanOnStartup = settings.AutoScanOnStartup;
         ShowMediaSourceRealPath = settings.ShowMediaSourceRealPath;
+        OfflineCacheDirectory = settings.OfflineCacheDirectory ?? string.Empty;
         EnableLocalMetadataImport = settings.LocalMetadata.EnableLocalMetadataImport;
         EnableLocalMetadataExport = settings.LocalMetadata.EnableLocalMetadataExport;
         EnableTmdbMetadataEnrichment = true;
@@ -498,7 +590,147 @@ public partial class SettingsViewModel : ObservableObject
     {
         SaveCommand.NotifyCanExecuteChanged();
         TestTmdbConnectionCommand.NotifyCanExecuteChanged();
+        CheckForUpdatesCommand.NotifyCanExecuteChanged();
+        InstallLatestUpdateCommand.NotifyCanExecuteChanged();
     }
+
+    private static async Task<GitHubRelease?> FetchLatestGitHubReleaseAsync()
+    {
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("OmniPlay-Windows");
+        using var response = await client.GetAsync(GitHubLatestReleaseApiUrl);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var document = await JsonDocument.ParseAsync(stream);
+        var root = document.RootElement;
+        var assets = new List<GitHubAsset>();
+        if (root.TryGetProperty("assets", out var assetsElement) &&
+            assetsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var asset in assetsElement.EnumerateArray())
+            {
+                var name = asset.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
+                var url = asset.TryGetProperty("browser_download_url", out var urlElement) ? urlElement.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(url))
+                {
+                    assets.Add(new GitHubAsset(name!, url!));
+                }
+            }
+        }
+
+        return new GitHubRelease(
+            root.TryGetProperty("tag_name", out var tagElement) ? tagElement.GetString() ?? string.Empty : string.Empty,
+            root.TryGetProperty("html_url", out var htmlElement) ? htmlElement.GetString() ?? GitHubLatestReleaseUrl : GitHubLatestReleaseUrl,
+            assets);
+    }
+
+    private static GitHubAsset? PickWindowsReleaseAsset(IReadOnlyList<GitHubAsset> assets)
+    {
+        return assets
+            .Select(asset => (Asset: asset, Score: ScoreWindowsReleaseAsset(asset.Name)))
+            .Where(item => item.Score > 0)
+            .OrderByDescending(static item => item.Score)
+            .Select(static item => item.Asset)
+            .FirstOrDefault();
+    }
+
+    private static int ScoreWindowsReleaseAsset(string name)
+    {
+        var lower = name.ToLowerInvariant();
+        if (lower.Contains("symbols") || lower.EndsWith(".pdb", StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        var score = lower.EndsWith(".exe", StringComparison.Ordinal) || lower.EndsWith(".msi", StringComparison.Ordinal)
+            ? 5
+            : lower.EndsWith(".zip", StringComparison.Ordinal) || lower.EndsWith(".7z", StringComparison.Ordinal)
+                ? 3
+                : 0;
+        if (score == 0)
+        {
+            return 0;
+        }
+
+        if (lower.Contains("win") || lower.Contains("windows"))
+        {
+            score += 4;
+        }
+
+        if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
+        {
+            if (lower.Contains("arm64") || lower.Contains("aarch64")) score += 5;
+            if (lower.Contains("x64") || lower.Contains("x86_64")) score -= 2;
+        }
+        else
+        {
+            if (lower.Contains("x64") || lower.Contains("x86_64")) score += 5;
+            if (lower.Contains("arm64") || lower.Contains("aarch64")) score -= 2;
+        }
+
+        return score;
+    }
+
+    private static async Task<string> DownloadReleaseAssetAsync(GitHubAsset asset)
+    {
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("OmniPlay-Windows");
+        var updateDirectory = Path.Combine(Path.GetTempPath(), "OmniPlayUpdates");
+        Directory.CreateDirectory(updateDirectory);
+        var destinationPath = Path.Combine(updateDirectory, SanitizeFileName(asset.Name));
+
+        await using var source = await client.GetStreamAsync(asset.DownloadUrl);
+        await using var destination = File.Create(destinationPath);
+        await source.CopyToAsync(destination);
+        return destinationPath;
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var chars = value.Select(character => invalid.Contains(character) ? '_' : character).ToArray();
+        var sanitized = new string(chars).Trim();
+        return string.IsNullOrWhiteSpace(sanitized) ? "OmniPlay-update" : sanitized;
+    }
+
+    private static bool IsVersionNewer(string candidate, string current)
+    {
+        var left = VersionParts(candidate);
+        var right = VersionParts(current);
+        if (left.Count == 0)
+        {
+            return false;
+        }
+
+        var count = Math.Max(left.Count, right.Count);
+        for (var index = 0; index < count; index++)
+        {
+            var lhs = index < left.Count ? left[index] : 0;
+            var rhs = index < right.Count ? right[index] : 0;
+            if (lhs != rhs)
+            {
+                return lhs > rhs;
+            }
+        }
+
+        return false;
+    }
+
+    private static List<int> VersionParts(string value)
+    {
+        return Regex.Matches(value.Trim().TrimStart('v', 'V'), @"\d+")
+            .Select(static match => int.TryParse(match.Value, out var number) ? number : 0)
+            .ToList();
+    }
+
+    private sealed record GitHubRelease(string TagName, string HtmlUrl, IReadOnlyList<GitHubAsset> Assets);
+
+    private readonly record struct GitHubAsset(string Name, string DownloadUrl);
 
     private static string ResolveAppVersion()
     {

@@ -1,9 +1,996 @@
 import SwiftUI
 import GRDB
 import UniformTypeIdentifiers // 🌟 引入系统类型以支持原生文件选择器
+import NetFS
+import Darwin
+import Network
 
 extension Notification.Name {
     static let standalonePlayerShouldClose = Notification.Name("StandalonePlayerShouldClose")
+}
+
+private enum RemoteISOPlaybackError: Error {
+    case invalidContentLength
+    case rangeUnsupported(Int)
+    case invalidUDF
+    case pathNotFound(String)
+    case noPlayableStreams
+    case localProxyUnavailable
+}
+
+private struct RemoteISOExtent {
+    let offset: Int64
+    let length: Int64
+}
+
+private struct RemoteISOFile {
+    let path: String
+    let fileName: String
+    let size: Int64
+    let extents: [RemoteISOExtent]
+}
+
+private struct RemoteISOProxyRegistration {
+    let urls: [URL]
+    let routeIDs: [String]
+}
+
+private extension Data {
+    func uint8(at offset: Int) -> UInt8 {
+        guard offset >= 0, offset < count else { return 0 }
+        return self[startIndex + offset]
+    }
+
+    func uint16LE(at offset: Int) -> UInt16 {
+        guard offset + 1 < count else { return 0 }
+        return UInt16(uint8(at: offset)) | (UInt16(uint8(at: offset + 1)) << 8)
+    }
+
+    func uint32LE(at offset: Int) -> UInt32 {
+        guard offset + 3 < count else { return 0 }
+        return UInt32(uint16LE(at: offset)) | (UInt32(uint16LE(at: offset + 2)) << 16)
+    }
+
+    func uint64LE(at offset: Int) -> UInt64 {
+        guard offset + 7 < count else { return 0 }
+        return UInt64(uint32LE(at: offset)) | (UInt64(uint32LE(at: offset + 4)) << 32)
+    }
+
+    func uint16BE(at offset: Int) -> UInt16 {
+        guard offset + 1 < count else { return 0 }
+        return (UInt16(uint8(at: offset)) << 8) | UInt16(uint8(at: offset + 1))
+    }
+
+    func subdataSafe(offset: Int, length: Int) -> Data {
+        guard offset >= 0, length > 0, offset < count else { return Data() }
+        let end = Swift.min(count, offset + length)
+        return subdata(in: offset..<end)
+    }
+}
+
+private final class RemoteISOHTTPByteReader {
+    private let requestURL: URL
+    private let authorizationHeader: String?
+    private let session: URLSession
+
+    init(url: URL, credential: (username: String, password: String)?) {
+        var resolvedURL = url
+        var resolvedAuthorization: String?
+        if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            let username = credential?.username ?? components.user
+            let password = credential?.password ?? components.password ?? ""
+            if let username, !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let data = "\(username):\(password)".data(using: .utf8) {
+                resolvedAuthorization = "Basic \(data.base64EncodedString())"
+            }
+            components.user = nil
+            components.password = nil
+            resolvedURL = components.url ?? url
+        }
+        requestURL = resolvedURL
+        authorizationHeader = resolvedAuthorization
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 60
+        session = URLSession(configuration: configuration, delegate: LocalNetworkTrustSessionDelegate.shared, delegateQueue: nil)
+    }
+
+    func contentLength(hint: Int64) async throws -> Int64 {
+        if hint > 0 { return hint }
+
+        var headRequest = URLRequest(url: requestURL)
+        headRequest.httpMethod = "HEAD"
+        applyAuthorization(to: &headRequest)
+        do {
+            let (_, response) = try await session.data(for: headRequest)
+            if let http = response as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let lengthText = http.value(forHTTPHeaderField: "Content-Length"),
+               let length = Int64(lengthText), length > 0 {
+                return length
+            }
+        } catch {}
+
+        var rangeRequest = URLRequest(url: requestURL)
+        rangeRequest.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        applyAuthorization(to: &rangeRequest)
+        let (_, response) = try await session.data(for: rangeRequest)
+        guard let http = response as? HTTPURLResponse else { throw RemoteISOPlaybackError.invalidContentLength }
+        if let total = Self.contentRangeTotal(http.value(forHTTPHeaderField: "Content-Range")) {
+            return total
+        }
+        if let lengthText = http.value(forHTTPHeaderField: "Content-Length"),
+           let length = Int64(lengthText), length > 1 {
+            return length
+        }
+        throw RemoteISOPlaybackError.invalidContentLength
+    }
+
+    func read(offset: Int64, length: Int) async throws -> Data {
+        guard length > 0 else { return Data() }
+        let end = offset + Int64(length) - 1
+        var request = URLRequest(url: requestURL)
+        request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
+        applyAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw RemoteISOPlaybackError.rangeUnsupported(-1)
+        }
+        guard http.statusCode == 206 else {
+            if http.statusCode == 200, offset == 0, data.count <= length {
+                return data
+            }
+            throw RemoteISOPlaybackError.rangeUnsupported(http.statusCode)
+        }
+        return data.count > length ? data.prefix(length) : data
+    }
+
+    func read(file: RemoteISOFile, offset: Int64, length: Int) async throws -> Data {
+        guard length > 0, offset < file.size else { return Data() }
+        var remaining = Swift.min(Int64(length), file.size - offset)
+        var skip = offset
+        var output = Data()
+
+        for extent in file.extents {
+            if skip >= extent.length {
+                skip -= extent.length
+                continue
+            }
+            var extentOffset = extent.offset + skip
+            var extentRemaining = extent.length - skip
+            skip = 0
+            while remaining > 0 && extentRemaining > 0 {
+                let chunkLength = Int(Swift.min(remaining, extentRemaining, 512 * 1024))
+                let data = try await read(offset: extentOffset, length: chunkLength)
+                output.append(data)
+                let readCount = Int64(data.count)
+                guard readCount > 0 else { return output }
+                extentOffset += readCount
+                remaining -= readCount
+                extentRemaining -= readCount
+                if readCount < Int64(chunkLength) { return output }
+            }
+            if remaining <= 0 { break }
+        }
+
+        return output
+    }
+
+    private func applyAuthorization(to request: inout URLRequest) {
+        if let authorizationHeader {
+            request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        }
+    }
+
+    private static func contentRangeTotal(_ value: String?) -> Int64? {
+        guard let value,
+              let slash = value.lastIndex(of: "/") else { return nil }
+        let totalText = value[value.index(after: slash)...]
+        return Int64(totalText)
+    }
+}
+
+private final class RemoteISOStreamProxy {
+    static let shared = RemoteISOStreamProxy()
+
+    private final class Route {
+        let reader: RemoteISOHTTPByteReader
+        let file: RemoteISOFile
+
+        init(reader: RemoteISOHTTPByteReader, file: RemoteISOFile) {
+            self.reader = reader
+            self.file = file
+        }
+    }
+
+    private let stateQueue = DispatchQueue(label: "nan.omniplay.remote-iso.proxy.state")
+    private let serverQueue = DispatchQueue(label: "nan.omniplay.remote-iso.proxy.server")
+    private var listener: NWListener?
+    private var port: UInt16?
+    private var routes: [String: Route] = [:]
+
+    private final class StartupSignal {
+        let semaphore = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var completed = false
+        private var readyValue = false
+
+        func complete(ready: Bool) {
+            lock.lock()
+            guard !completed else {
+                lock.unlock()
+                return
+            }
+            completed = true
+            readyValue = ready
+            lock.unlock()
+            semaphore.signal()
+        }
+
+        var isReady: Bool {
+            lock.lock()
+            let value = readyValue
+            lock.unlock()
+            return value
+        }
+    }
+
+    func register(files: [RemoteISOFile], reader: RemoteISOHTTPByteReader) throws -> RemoteISOProxyRegistration {
+        try stateQueue.sync {
+            let port = try startIfNeededLocked()
+            var urls: [URL] = []
+            var routeIDs: [String] = []
+            for file in files {
+                let routeID = UUID().uuidString
+                routes[routeID] = Route(reader: reader, file: file)
+                routeIDs.append(routeID)
+
+                var components = URLComponents()
+                components.scheme = "http"
+                components.host = "127.0.0.1"
+                components.port = Int(port)
+                components.path = "/remoteiso/\(routeID)/\(file.fileName)"
+                if let url = components.url {
+                    urls.append(url)
+                }
+            }
+            guard urls.count == files.count else { throw RemoteISOPlaybackError.localProxyUnavailable }
+            return RemoteISOProxyRegistration(urls: urls, routeIDs: routeIDs)
+        }
+    }
+
+    func unregister(routeIDs: [String]) {
+        stateQueue.sync {
+            for routeID in routeIDs {
+                routes.removeValue(forKey: routeID)
+            }
+        }
+    }
+
+    private func startIfNeededLocked() throws -> UInt16 {
+        if let port, port > 0 { return port }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters, on: .any)
+        let startup = StartupSignal()
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                startup.complete(ready: true)
+            case .failed, .cancelled:
+                startup.complete(ready: false)
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection: connection)
+        }
+        listener.start(queue: serverQueue)
+        guard startup.semaphore.wait(timeout: .now() + 3) == .success,
+              startup.isReady,
+              let rawPort = listener.port?.rawValue,
+              rawPort > 0 else {
+            listener.cancel()
+            throw RemoteISOPlaybackError.localProxyUnavailable
+        }
+        listener.stateUpdateHandler = nil
+        self.listener = listener
+        self.port = rawPort
+        return rawPort
+    }
+
+    private func route(for routeID: String) -> Route? {
+        stateQueue.sync { routes[routeID] }
+    }
+
+    private func handle(connection: NWConnection) {
+        connection.start(queue: serverQueue)
+        receiveHeader(connection: connection, buffer: Data())
+    }
+
+    private func receiveHeader(connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, _, error in
+            guard let self else { return }
+            if error != nil {
+                connection.cancel()
+                return
+            }
+            var nextBuffer = buffer
+            if let data { nextBuffer.append(data) }
+            if nextBuffer.range(of: Data("\r\n\r\n".utf8)) != nil {
+                self.respond(to: nextBuffer, connection: connection)
+            } else if nextBuffer.count < 256 * 1024 {
+                self.receiveHeader(connection: connection, buffer: nextBuffer)
+            } else {
+                self.sendError(400, connection: connection)
+            }
+        }
+    }
+
+    private func respond(to requestData: Data, connection: NWConnection) {
+        guard let requestText = String(data: requestData, encoding: .isoLatin1) else {
+            sendError(400, connection: connection)
+            return
+        }
+        let lines = requestText.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else {
+            sendError(400, connection: connection)
+            return
+        }
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else {
+            sendError(400, connection: connection)
+            return
+        }
+        let method = parts[0].uppercased()
+        guard method == "GET" || method == "HEAD" else {
+            sendError(405, connection: connection)
+            return
+        }
+
+        let path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
+        let pathParts = path.split(separator: "/").map(String.init)
+        guard pathParts.count >= 2,
+              pathParts[0] == "remoteiso",
+              let route = route(for: pathParts[1]) else {
+            sendError(404, connection: connection)
+            return
+        }
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            headers[name] = value
+        }
+
+        guard let byteRange = parseByteRange(headers["range"], fileSize: route.file.size) else {
+            sendError(416, connection: connection)
+            return
+        }
+        let status = headers["range"] == nil ? 200 : 206
+        stream(route: route, range: byteRange, method: method, status: status, connection: connection)
+    }
+
+    private func parseByteRange(_ header: String?, fileSize: Int64) -> (offset: Int64, length: Int64)? {
+        guard fileSize > 0 else { return nil }
+        guard let header, header.lowercased().hasPrefix("bytes=") else {
+            return (0, fileSize)
+        }
+        let rangeText = String(header.dropFirst(6))
+        guard let firstRange = rangeText.split(separator: ",").first else { return nil }
+        let bounds = firstRange.split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2 else { return nil }
+
+        if bounds[0].isEmpty, let suffix = Int64(bounds[1]), suffix > 0 {
+            let length = Swift.min(suffix, fileSize)
+            return (fileSize - length, length)
+        }
+
+        guard let start = Int64(bounds[0]), start >= 0, start < fileSize else { return nil }
+        let end = bounds[1].isEmpty ? (fileSize - 1) : Swift.min(Int64(bounds[1]) ?? (fileSize - 1), fileSize - 1)
+        guard end >= start else { return nil }
+        return (start, end - start + 1)
+    }
+
+    private func stream(route: Route, range: (offset: Int64, length: Int64), method: String, status: Int, connection: NWConnection) {
+        Task.detached(priority: .userInitiated) {
+            do {
+                let statusLine = status == 206 ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
+                var headers = [
+                    statusLine,
+                    "Content-Type: video/MP2T",
+                    "Accept-Ranges: bytes",
+                    "Content-Length: \(range.length)",
+                    "Connection: close"
+                ]
+                if status == 206 {
+                    let end = range.offset + range.length - 1
+                    headers.append("Content-Range: bytes \(range.offset)-\(end)/\(route.file.size)")
+                }
+                headers.append("\r\n")
+                try await self.send(Data(headers.joined(separator: "\r\n").utf8), connection: connection)
+
+                if method != "HEAD" {
+                    var sent: Int64 = 0
+                    while sent < range.length {
+                        let chunkLength = Int(Swift.min(range.length - sent, 512 * 1024))
+                        let data = try await route.reader.read(file: route.file, offset: range.offset + sent, length: chunkLength)
+                        guard !data.isEmpty else { break }
+                        try await self.send(data, connection: connection)
+                        sent += Int64(data.count)
+                    }
+                }
+                connection.cancel()
+            } catch {
+                connection.cancel()
+            }
+        }
+    }
+
+    private func send(_ data: Data, connection: NWConnection) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            })
+        }
+    }
+
+    private func sendError(_ status: Int, connection: NWConnection) {
+        let message: String
+        switch status {
+        case 400: message = "Bad Request"
+        case 404: message = "Not Found"
+        case 405: message = "Method Not Allowed"
+        case 416: message = "Range Not Satisfiable"
+        default: message = "Error"
+        }
+        let body = Data(message.utf8)
+        let response = [
+            "HTTP/1.1 \(status) \(message)",
+            "Content-Length: \(body.count)",
+            "Connection: close",
+            "\r\n"
+        ].joined(separator: "\r\n")
+        connection.send(content: Data(response.utf8) + body, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+}
+
+private final class RemoteISOImageParser {
+    private struct UDFPartition {
+        let number: Int
+        let startBlock: Int64
+        let blockCount: Int64
+    }
+
+    private struct UDFMetadataPartitionMap {
+        let physicalPartitionNumber: Int
+        let metadataFileLocation: Int64
+        let metadataMirrorFileLocation: Int64
+    }
+
+    private struct UDFLongAD {
+        let length: Int64
+        let block: Int64
+        let partitionRef: Int
+    }
+
+    private struct UDFFileEntry {
+        let fileType: UInt8
+        let informationLength: Int64
+        let extents: [RemoteISOExtent]
+        let inlineData: Data?
+    }
+
+    private struct UDFDirectoryEntry {
+        let name: String
+        let isDirectory: Bool
+        let icb: UDFLongAD
+    }
+
+    private let reader: RemoteISOHTTPByteReader
+    private let isoSize: Int64
+    private var logicalBlockSize: Int64 = 2048
+    private var partitionsByNumber: [Int: UDFPartition] = [:]
+    private var partitionsByReference: [Int: UDFPartition] = [:]
+    private var metadataPartitionMapsByReference: [Int: UDFMetadataPartitionMap] = [:]
+    private var metadataExtentsByReference: [Int: [RemoteISOExtent]] = [:]
+
+    init(reader: RemoteISOHTTPByteReader, isoSize: Int64) {
+        self.reader = reader
+        self.isoSize = isoSize
+    }
+
+    func bluRayStreamFiles() async throws -> [RemoteISOFile] {
+        if let udfFiles = try? await parseUDFBluRayStreamFiles(), !udfFiles.isEmpty {
+            return udfFiles
+        }
+        let isoFiles = try await parseISO9660BluRayStreamFiles()
+        if !isoFiles.isEmpty { return isoFiles }
+        throw RemoteISOPlaybackError.noPlayableStreams
+    }
+
+    private func parseUDFBluRayStreamFiles() async throws -> [RemoteISOFile] {
+        partitionsByNumber.removeAll()
+        partitionsByReference.removeAll()
+        metadataPartitionMapsByReference.removeAll()
+        metadataExtentsByReference.removeAll()
+
+        let anchor = try await findUDFAnchor()
+        let mainLength = Int64(anchor.uint32LE(at: 16))
+        let mainLocation = Int64(anchor.uint32LE(at: 20))
+        guard mainLength > 0, mainLocation > 0 else { throw RemoteISOPlaybackError.invalidUDF }
+
+        var fileSetAD: UDFLongAD?
+        var partitionMap: [Int: Int] = [:]
+        let descriptorSectors = Swift.min((mainLength + 2047) / 2048, 4096)
+        for sectorOffset in 0..<descriptorSectors {
+            let descriptor = try await readSector(mainLocation + sectorOffset)
+            let tag = descriptor.uint16LE(at: 0)
+            if tag == 8 { break }
+            switch tag {
+            case 5:
+                let number = Int(descriptor.uint16LE(at: 22))
+                let start = Int64(descriptor.uint32LE(at: 188))
+                let length = Int64(descriptor.uint32LE(at: 192))
+                partitionsByNumber[number] = UDFPartition(number: number, startBlock: start, blockCount: length)
+            case 6:
+                let blockSize = Int64(descriptor.uint32LE(at: 212))
+                if blockSize > 0 { logicalBlockSize = blockSize }
+                fileSetAD = parseLongAD(descriptor, offset: 248)
+                partitionMap = parsePartitionMaps(descriptor)
+            default:
+                continue
+            }
+        }
+
+        for (reference, partitionNumber) in partitionMap {
+            if let partition = partitionsByNumber[partitionNumber] {
+                partitionsByReference[reference] = partition
+            }
+        }
+        if partitionsByReference.isEmpty {
+            for (index, partition) in partitionsByNumber.values.sorted(by: { $0.number < $1.number }).enumerated() {
+                partitionsByReference[index] = partition
+            }
+        }
+        try await resolveMetadataPartitions()
+
+        guard let fileSetAD else { throw RemoteISOPlaybackError.invalidUDF }
+        let fileSetDescriptor = try await readDescriptor(at: fileSetAD)
+        guard fileSetDescriptor.uint16LE(at: 0) == 256 else { throw RemoteISOPlaybackError.invalidUDF }
+        let rootICB = parseLongAD(fileSetDescriptor, offset: 400)
+        let streamICB = try await locateUDFBluRayStreamDirectory(rootICB: rootICB)
+        let entries = try await readUDFDirectory(icb: streamICB)
+
+        var files: [RemoteISOFile] = []
+        for entry in entries where !entry.isDirectory {
+            let lower = entry.name.lowercased()
+            guard lower.hasSuffix(".m2ts") || lower.hasSuffix(".m2t") || lower.hasSuffix(".ts") else { continue }
+            let fileEntry = try await readUDFFileEntry(icb: entry.icb)
+            let extents = limitedExtents(fileEntry.extents, length: fileEntry.informationLength)
+            guard fileEntry.informationLength > 0, !extents.isEmpty else { continue }
+            files.append(RemoteISOFile(path: "BDMV/STREAM/\(entry.name)", fileName: entry.name, size: fileEntry.informationLength, extents: extents))
+        }
+        return files
+    }
+
+    private func findUDFAnchor() async throws -> Data {
+        let sectors = Swift.max(0, isoSize / 2048)
+        let candidates = [Int64(256), sectors - 256, sectors - 1].filter { $0 >= 0 }
+        for sector in candidates {
+            let data = try await readSector(sector)
+            if data.uint16LE(at: 0) == 2 {
+                return data
+            }
+        }
+        throw RemoteISOPlaybackError.invalidUDF
+    }
+
+    private func parsePartitionMaps(_ descriptor: Data) -> [Int: Int] {
+        let mapTableLength = Int(descriptor.uint32LE(at: 264))
+        let mapCount = Int(descriptor.uint32LE(at: 268))
+        var result: [Int: Int] = [:]
+        var offset = 440
+        for reference in 0..<mapCount {
+            guard offset + 2 <= descriptor.count, offset < 440 + mapTableLength else { break }
+            let type = descriptor.uint8(at: offset)
+            let length = Int(descriptor.uint8(at: offset + 1))
+            guard length > 0, offset + length <= descriptor.count else { break }
+            if type == 1, length >= 6 {
+                result[reference] = Int(descriptor.uint16LE(at: offset + 4))
+            } else if type == 2, length >= 59 {
+                let identifier = String(data: descriptor.subdataSafe(offset: offset + 5, length: 23), encoding: .ascii) ?? ""
+                if identifier.contains("UDF Metadata") {
+                    metadataPartitionMapsByReference[reference] = UDFMetadataPartitionMap(
+                        physicalPartitionNumber: Int(descriptor.uint16LE(at: offset + 38)),
+                        metadataFileLocation: Int64(descriptor.uint32LE(at: offset + 40)),
+                        metadataMirrorFileLocation: Int64(descriptor.uint32LE(at: offset + 44))
+                    )
+                }
+            }
+            offset += length
+        }
+        return result
+    }
+
+    private func resolveMetadataPartitions() async throws {
+        for (reference, map) in metadataPartitionMapsByReference {
+            let locations = [map.metadataFileLocation, map.metadataMirrorFileLocation]
+            for location in locations where location > 0 {
+                let metadataICB = UDFLongAD(
+                    length: logicalBlockSize,
+                    block: location,
+                    partitionRef: map.physicalPartitionNumber
+                )
+                if let fileEntry = try? await readUDFFileEntry(icb: metadataICB) {
+                    let extents = limitedExtents(fileEntry.extents, length: fileEntry.informationLength)
+                    if !extents.isEmpty {
+                        metadataExtentsByReference[reference] = extents
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private func locateUDFBluRayStreamDirectory(rootICB: UDFLongAD) async throws -> UDFLongAD {
+        if let streamICB = try? await traverseUDFPath(rootICB: rootICB, components: ["BDMV", "STREAM"]) {
+            return streamICB
+        }
+        var visited = 0
+        if let streamICB = try await searchUDFBluRayStreamDirectory(in: rootICB, depth: 0, visited: &visited) {
+            return streamICB
+        }
+        throw RemoteISOPlaybackError.pathNotFound("BDMV/STREAM")
+    }
+
+    private func searchUDFBluRayStreamDirectory(in directoryICB: UDFLongAD, depth: Int, visited: inout Int) async throws -> UDFLongAD? {
+        guard depth <= 4, visited < 256 else { return nil }
+        visited += 1
+
+        let entries = try await readUDFDirectory(icb: directoryICB)
+        if let bdmv = entries.first(where: { $0.isDirectory && $0.name.caseInsensitiveCompare("BDMV") == .orderedSame }) {
+            let bdmvEntries = try await readUDFDirectory(icb: bdmv.icb)
+            if let stream = bdmvEntries.first(where: { $0.isDirectory && $0.name.caseInsensitiveCompare("STREAM") == .orderedSame }) {
+                return stream.icb
+            }
+        }
+
+        for entry in entries where entry.isDirectory {
+            let name = entry.name.lowercased()
+            guard name != "certificate", name != "any!" else { continue }
+            if let found = try? await searchUDFBluRayStreamDirectory(in: entry.icb, depth: depth + 1, visited: &visited) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    private func traverseUDFPath(rootICB: UDFLongAD, components: [String]) async throws -> UDFLongAD {
+        var current = rootICB
+        for component in components {
+            let entries = try await readUDFDirectory(icb: current)
+            guard let next = entries.first(where: { $0.isDirectory && $0.name.caseInsensitiveCompare(component) == .orderedSame }) else {
+                throw RemoteISOPlaybackError.pathNotFound(component)
+            }
+            current = next.icb
+        }
+        return current
+    }
+
+    private func readUDFDirectory(icb: UDFLongAD) async throws -> [UDFDirectoryEntry] {
+        let fileEntry = try await readUDFFileEntry(icb: icb)
+        let data: Data
+        if let inlineData = fileEntry.inlineData {
+            data = inlineData
+        } else {
+            let length = Int(Swift.min(fileEntry.informationLength, 64 * 1024 * 1024))
+            data = try await readAbsoluteExtents(fileEntry.extents, maxLength: length)
+        }
+
+        var entries: [UDFDirectoryEntry] = []
+        var offset = 0
+        while offset + 38 <= data.count {
+            let tag = data.uint16LE(at: offset)
+            if tag != 257 {
+                offset += 4
+                continue
+            }
+            let characteristics = data.uint8(at: offset + 18)
+            let nameLength = Int(data.uint8(at: offset + 19))
+            let icb = parseLongAD(data, offset: offset + 20)
+            let implementationUseLength = Int(data.uint16LE(at: offset + 36))
+            let nameOffset = offset + 38 + implementationUseLength
+            let entryLength = align4(38 + implementationUseLength + nameLength)
+            guard entryLength > 0, offset + entryLength <= data.count else { break }
+            let nameData = data.subdataSafe(offset: nameOffset, length: nameLength)
+            let name = decodeOSTACompressedUnicode(nameData)
+            let isParent = (characteristics & 0x08) != 0
+            if !name.isEmpty, !isParent {
+                entries.append(UDFDirectoryEntry(name: name, isDirectory: (characteristics & 0x02) != 0, icb: icb))
+            }
+            offset += entryLength
+        }
+        return entries
+    }
+
+    private func readUDFFileEntry(icb: UDFLongAD) async throws -> UDFFileEntry {
+        let descriptor = try await readDescriptor(at: icb)
+        let tag = descriptor.uint16LE(at: 0)
+        guard tag == 261 || tag == 266 else { throw RemoteISOPlaybackError.invalidUDF }
+
+        let fileType = descriptor.uint8(at: 27)
+        let informationLength = Int64(bitPattern: descriptor.uint64LE(at: 56))
+        let flags = descriptor.uint16LE(at: 34) & 0x0007
+        let lengthEAOffset = tag == 261 ? 168 : 208
+        let lengthADOffset = tag == 261 ? 172 : 212
+        let allocationOffset = tag == 261 ? 176 : 216
+        let lengthEA = Int(descriptor.uint32LE(at: lengthEAOffset))
+        let lengthAD = Int(descriptor.uint32LE(at: lengthADOffset))
+        let adOffset = allocationOffset + lengthEA
+        let adData = descriptor.subdataSafe(offset: adOffset, length: lengthAD)
+
+        if flags == 3 {
+            return UDFFileEntry(fileType: fileType, informationLength: Int64(adData.count), extents: [], inlineData: adData)
+        }
+
+        var extents: [RemoteISOExtent] = []
+        var offset = 0
+        let descriptorLength: Int
+        switch flags {
+        case 0: descriptorLength = 8
+        case 1: descriptorLength = 16
+        case 2: descriptorLength = 20
+        default: descriptorLength = 0
+        }
+        while descriptorLength > 0, offset + descriptorLength <= adData.count {
+            let rawLength = adData.uint32LE(at: offset)
+            let extentType = rawLength >> 30
+            let length = Int64(rawLength & 0x3fffffff)
+            if length > 0, extentType != 3 {
+                let block: Int64
+                let partitionRef: Int
+                if flags == 0 {
+                    block = Int64(adData.uint32LE(at: offset + 4))
+                    partitionRef = icb.partitionRef
+                } else if flags == 1 {
+                    block = Int64(adData.uint32LE(at: offset + 4))
+                    partitionRef = Int(adData.uint16LE(at: offset + 8))
+                } else {
+                    block = Int64(adData.uint32LE(at: offset + 12))
+                    partitionRef = Int(adData.uint16LE(at: offset + 16))
+                }
+                if let absoluteOffset = absoluteOffset(block: block, partitionRef: partitionRef) {
+                    extents.append(RemoteISOExtent(offset: absoluteOffset, length: length))
+                }
+            }
+            offset += descriptorLength
+        }
+        return UDFFileEntry(fileType: fileType, informationLength: informationLength, extents: extents, inlineData: nil)
+    }
+
+    private func parseLongAD(_ data: Data, offset: Int) -> UDFLongAD {
+        let rawLength = data.uint32LE(at: offset)
+        return UDFLongAD(
+            length: Int64(rawLength & 0x3fffffff),
+            block: Int64(data.uint32LE(at: offset + 4)),
+            partitionRef: Int(data.uint16LE(at: offset + 8))
+        )
+    }
+
+    private func readDescriptor(at ad: UDFLongAD) async throws -> Data {
+        guard let offset = absoluteOffset(block: ad.block, partitionRef: ad.partitionRef) else {
+            throw RemoteISOPlaybackError.invalidUDF
+        }
+        return try await reader.read(offset: offset, length: Int(logicalBlockSize))
+    }
+
+    private func absoluteOffset(block: Int64, partitionRef: Int) -> Int64? {
+        if let metadataExtents = metadataExtentsByReference[partitionRef],
+           let metadataOffset = offsetInExtents(metadataExtents, fileOffset: block * logicalBlockSize) {
+            return metadataOffset
+        }
+        let partition = partitionsByReference[partitionRef] ?? partitionsByNumber[partitionRef] ?? partitionsByReference.values.first
+        guard let partition else { return nil }
+        return (partition.startBlock + block) * logicalBlockSize
+    }
+
+    private func offsetInExtents(_ extents: [RemoteISOExtent], fileOffset: Int64) -> Int64? {
+        var remaining = fileOffset
+        for extent in extents {
+            if remaining < extent.length {
+                return extent.offset + remaining
+            }
+            remaining -= extent.length
+        }
+        return nil
+    }
+
+    private func readAbsoluteExtents(_ extents: [RemoteISOExtent], maxLength: Int) async throws -> Data {
+        var output = Data()
+        var remaining = maxLength
+        for extent in extents where remaining > 0 {
+            var extentOffset = extent.offset
+            var extentRemaining = Int(Swift.min(Int64(remaining), extent.length))
+            while extentRemaining > 0 {
+                let chunkLength = Swift.min(extentRemaining, 512 * 1024)
+                let data = try await reader.read(offset: extentOffset, length: chunkLength)
+                guard !data.isEmpty else { return output }
+                output.append(data)
+                extentOffset += Int64(data.count)
+                extentRemaining -= data.count
+                remaining -= data.count
+                if data.count < chunkLength { return output }
+            }
+        }
+        return output
+    }
+
+    private func limitedExtents(_ extents: [RemoteISOExtent], length: Int64) -> [RemoteISOExtent] {
+        var remaining = length
+        var result: [RemoteISOExtent] = []
+        for extent in extents where remaining > 0 {
+            let resolvedLength = Swift.min(extent.length, remaining)
+            result.append(RemoteISOExtent(offset: extent.offset, length: resolvedLength))
+            remaining -= resolvedLength
+        }
+        return result
+    }
+
+    private func parseISO9660BluRayStreamFiles() async throws -> [RemoteISOFile] {
+        let pvd = try await readSector(16)
+        guard String(data: pvd.subdataSafe(offset: 1, length: 5), encoding: .ascii) == "CD001" else {
+            return []
+        }
+        guard let root = parseISO9660DirectoryRecord(pvd, offset: 156) else { return [] }
+        let stream = try await locateISO9660BluRayStreamDirectory(root: root)
+        let entries = try await readISO9660Directory(stream)
+        return entries.compactMap { entry in
+            guard !entry.isDirectory else { return nil }
+            let lower = entry.name.lowercased()
+            guard lower.hasSuffix(".m2ts") || lower.hasSuffix(".m2t") || lower.hasSuffix(".ts") else { return nil }
+            let offset = Int64(entry.extent) * 2048
+            let size = Int64(entry.size)
+            return RemoteISOFile(path: "BDMV/STREAM/\(entry.name)", fileName: entry.name, size: size, extents: [RemoteISOExtent(offset: offset, length: size)])
+        }
+    }
+
+    private struct ISO9660Entry {
+        let name: String
+        let extent: UInt32
+        let size: UInt32
+        let isDirectory: Bool
+    }
+
+    private func locateISO9660BluRayStreamDirectory(root: ISO9660Entry) async throws -> ISO9660Entry {
+        if let bdmv = try? await findISO9660Entry(in: root, named: "BDMV", directory: true),
+           let stream = try? await findISO9660Entry(in: bdmv, named: "STREAM", directory: true) {
+            return stream
+        }
+        var visited = 0
+        if let stream = try await searchISO9660BluRayStreamDirectory(in: root, depth: 0, visited: &visited) {
+            return stream
+        }
+        throw RemoteISOPlaybackError.pathNotFound("BDMV/STREAM")
+    }
+
+    private func searchISO9660BluRayStreamDirectory(in directory: ISO9660Entry, depth: Int, visited: inout Int) async throws -> ISO9660Entry? {
+        guard depth <= 4, visited < 256 else { return nil }
+        visited += 1
+
+        let entries = try await readISO9660Directory(directory)
+        if let bdmv = entries.first(where: { $0.isDirectory && $0.name.caseInsensitiveCompare("BDMV") == .orderedSame }) {
+            let bdmvEntries = try await readISO9660Directory(bdmv)
+            if let stream = bdmvEntries.first(where: { $0.isDirectory && $0.name.caseInsensitiveCompare("STREAM") == .orderedSame }) {
+                return stream
+            }
+        }
+
+        for entry in entries where entry.isDirectory {
+            let name = entry.name.lowercased()
+            guard name != "certificate", name != "any!" else { continue }
+            if let found = try? await searchISO9660BluRayStreamDirectory(in: entry, depth: depth + 1, visited: &visited) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    private func findISO9660Entry(in directory: ISO9660Entry, named name: String, directory isDirectory: Bool) async throws -> ISO9660Entry {
+        let entries = try await readISO9660Directory(directory)
+        guard let entry = entries.first(where: { $0.isDirectory == isDirectory && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            throw RemoteISOPlaybackError.pathNotFound(name)
+        }
+        return entry
+    }
+
+    private func readISO9660Directory(_ directory: ISO9660Entry) async throws -> [ISO9660Entry] {
+        let offset = Int64(directory.extent) * 2048
+        let length = Int(directory.size)
+        let data = try await reader.read(offset: offset, length: length)
+        var entries: [ISO9660Entry] = []
+        var cursor = 0
+        while cursor < data.count {
+            let recordLength = Int(data.uint8(at: cursor))
+            if recordLength == 0 {
+                cursor = ((cursor / 2048) + 1) * 2048
+                continue
+            }
+            if let entry = parseISO9660DirectoryRecord(data, offset: cursor),
+               entry.name != ".", entry.name != ".." {
+                entries.append(entry)
+            }
+            cursor += recordLength
+        }
+        return entries
+    }
+
+    private func parseISO9660DirectoryRecord(_ data: Data, offset: Int) -> ISO9660Entry? {
+        guard offset + 34 <= data.count else { return nil }
+        let recordLength = Int(data.uint8(at: offset))
+        guard recordLength >= 34, offset + recordLength <= data.count else { return nil }
+        let extent = data.uint32LE(at: offset + 2)
+        let size = data.uint32LE(at: offset + 10)
+        let flags = data.uint8(at: offset + 25)
+        let nameLength = Int(data.uint8(at: offset + 32))
+        let rawName = data.subdataSafe(offset: offset + 33, length: nameLength)
+        let name: String
+        if rawName.count == 1, rawName.uint8(at: 0) == 0 {
+            name = "."
+        } else if rawName.count == 1, rawName.uint8(at: 0) == 1 {
+            name = ".."
+        } else {
+            let decoded = String(data: rawName, encoding: .ascii) ?? ""
+            name = decoded
+                .replacingOccurrences(of: ";1", with: "", options: [.caseInsensitive])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        }
+        return ISO9660Entry(name: name, extent: extent, size: size, isDirectory: (flags & 0x02) != 0)
+    }
+
+    private func readSector(_ sector: Int64) async throws -> Data {
+        try await reader.read(offset: sector * 2048, length: 2048)
+    }
+
+    private func align4(_ value: Int) -> Int {
+        (value + 3) & ~3
+    }
+
+    private func decodeOSTACompressedUnicode(_ data: Data) -> String {
+        guard !data.isEmpty else { return "" }
+        let compressionID = data.uint8(at: 0)
+        if compressionID == 8 {
+            let payload = data.subdataSafe(offset: 1, length: data.count - 1)
+            return String(data: payload, encoding: .utf8)
+                ?? String(data: payload, encoding: .isoLatin1)
+                ?? ""
+        }
+        if compressionID == 16 {
+            var scalars = String.UnicodeScalarView()
+            var offset = 1
+            while offset + 1 < data.count {
+                let value = data.uint16BE(at: offset)
+                if let scalar = UnicodeScalar(Int(value)) {
+                    scalars.append(scalar)
+                }
+                offset += 2
+            }
+            return String(scalars)
+        }
+        return String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1)
+            ?? ""
+    }
 }
 
 // ==========================================
@@ -65,6 +1052,8 @@ struct PlayerScreen: View {
     
     @State private var isBluRayFolder: Bool = false
     @State private var blurayRootPath: String? = nil
+    @State private var attachedDiscImageMountPaths: [String] = []
+    @State private var remoteISOProxyRouteIDs: [String] = []
     
     @State private var showControls = true
     @State private var isCursorHidden = false
@@ -657,7 +1646,9 @@ struct PlayerScreen: View {
                 )
                 if !applied {
                     await MainActor.run {
-                        self.errorMessage = "文件不存在。请重新连接外置硬盘/NAS，或先缓存到本地后再播放。"
+                        if self.errorMessage == nil {
+                            self.errorMessage = "文件不存在。请重新连接外置硬盘/NAS，或先缓存到本地后再播放。"
+                        }
                     }
                 } else {
                     print("[PlayerScreen] prepare DB snapshot applied")
@@ -675,11 +1666,51 @@ struct PlayerScreen: View {
         dismiss()
     }
 
-    nonisolated private static func applyFinishedPlaybackState(to file: inout VideoFile) {
-        let resolvedDuration = file.duration > 0 ? file.duration : max(file.playProgress, 100.0)
+    private func detachAttachedDiscImages() {
+        let mountPaths = attachedDiscImageMountPaths
+        attachedDiscImageMountPaths.removeAll()
+        guard !mountPaths.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            for mountPath in mountPaths {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                process.arguments = ["detach", mountPath, "-force", "-quiet"]
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    print("[PlayerScreen] ISO detach mount=\(mountPath) status=\(process.terminationStatus)")
+                } catch {
+                    print("[PlayerScreen] ISO detach failed mount=\(mountPath) error=\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func stopRemoteISOProxyRoutes() {
+        let routeIDs = remoteISOProxyRouteIDs
+        remoteISOProxyRouteIDs.removeAll()
+        guard !routeIDs.isEmpty else { return }
+        RemoteISOStreamProxy.shared.unregister(routeIDs: routeIDs)
+    }
+
+    nonisolated private static func applyFinishedPlaybackState(
+        to file: inout VideoFile,
+        observedDuration: Double = 0,
+        observedProgress: Double = 0
+    ) {
+        let resolvedDuration = max(file.duration, max(observedDuration, max(observedProgress, 100.0)))
         file.duration = resolvedDuration
         file.playProgress = resolvedDuration
         file.lastPlayedAt = nil
+    }
+
+    nonisolated private static func playbackResumeStartPosition(for file: VideoFile) -> Double {
+        guard file.playProgress > 5.0 else { return 0.0 }
+        guard file.duration > 0 else { return file.playProgress }
+        if file.playProgress / file.duration >= 0.95 || file.duration - file.playProgress <= 5.0 {
+            return 0.0
+        }
+        return min(file.playProgress, max(file.duration - 5.0, 0.0))
     }
 
     private func normalizedPlaybackFilename(_ value: String) -> String {
@@ -767,6 +1798,8 @@ struct PlayerScreen: View {
         forceCursorVisible()
         traceClose("calling playerManager.stop()")
         playerManager.stop()
+        stopRemoteISOProxyRoutes()
+        detachAttachedDiscImages()
         endPlaybackPowerAssertion()
         
         if let fileId = fileIdToSave {
@@ -788,9 +1821,17 @@ struct PlayerScreen: View {
                             let resolvedDuration = max(durationToSave, file.duration)
                             let finished = resolvedDuration > 0 && (progressToSave / resolvedDuration) >= 0.95
                             let thresholded = progressToSave > 5.0 ? progressToSave : 0.0
-                            file.playProgress = finished ? 0.0 : thresholded
-                            file.duration = resolvedDuration
-                            file.lastPlayedAt = (!finished && thresholded > 0.0) ? Date().timeIntervalSince1970 : nil
+                            if finished {
+                                Self.applyFinishedPlaybackState(
+                                    to: &file,
+                                    observedDuration: durationToSave,
+                                    observedProgress: progressToSave
+                                )
+                            } else {
+                                file.playProgress = thresholded
+                                file.duration = resolvedDuration
+                                file.lastPlayedAt = thresholded > 0.0 ? Date().timeIntervalSince1970 : nil
+                            }
                             try file.update(db)
                         }
                     }
@@ -866,10 +1907,337 @@ struct PlayerScreen: View {
             sourceBaseUrl = URL(fileURLWithPath: normalizedBase)
         }
 
-        let targetFile = files[startIndex]
-        let remainingFiles = Array(files[startIndex...])
-        let isDirectOpenFile = targetFile.mediaType == "direct"
         var remotePlaybackContexts: [String: EmbyRemotePlaybackContext] = [:]
+
+        func sanitizedWebDAVMountURL(_ url: URL) -> URL {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+            components.user = nil
+            components.password = nil
+            return components.url ?? url
+        }
+
+        func stableMountKey(for url: URL) -> String {
+            let raw = url.absoluteString.precomposedStringWithCanonicalMapping.lowercased()
+            var hash: UInt64 = 1469598103934665603
+            for byte in raw.utf8 {
+                hash ^= UInt64(byte)
+                hash = hash &* 1099511628211
+            }
+            return String(format: "%016llx", hash)
+        }
+
+        func mountPathComponents(from path: String) -> [String] {
+            path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                .split(separator: "/")
+                .map(String.init)
+        }
+
+        func mountedLocalURL(pathComponents: [String], mountRoot: URL) -> URL {
+            var localURL = mountRoot
+            for component in pathComponents {
+                localURL.appendPathComponent(component)
+            }
+            return localURL
+        }
+
+        func webDAVOriginURL(from url: URL) -> URL? {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  components.scheme != nil,
+                  components.host != nil else {
+                return nil
+            }
+            components.user = nil
+            components.password = nil
+            components.path = ""
+            components.query = nil
+            components.fragment = nil
+            return components.url
+        }
+
+        func webDAVParentURL(from url: URL) -> URL? {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+                return nil
+            }
+            components.user = nil
+            components.password = nil
+            components.query = nil
+            components.fragment = nil
+            let parentPath = (components.path as NSString).deletingLastPathComponent
+            components.path = parentPath.isEmpty ? "/" : parentPath
+            return components.url
+        }
+
+        func webDAVISOMountCandidates(for file: VideoFile, remoteURL: URL) -> [(label: String, mountURL: URL, relativeComponents: [String])] {
+            let fileRelativePath = file.relativePath.isEmpty ? file.fileName : file.relativePath
+            let fileComponents = mountPathComponents(from: fileRelativePath)
+            let sanitizedBaseURL = sanitizedWebDAVMountURL(sourceBaseUrl)
+            var candidates: [(label: String, mountURL: URL, relativeComponents: [String])] = [
+                ("library", sanitizedBaseURL, fileComponents)
+            ]
+
+            if let parentURL = webDAVParentURL(from: remoteURL) {
+                let fileName = remoteURL.lastPathComponent.removingPercentEncoding ?? remoteURL.lastPathComponent
+                candidates.append(("parent", parentURL, [fileName]))
+            }
+
+            if let originURL = webDAVOriginURL(from: sourceBaseUrl) {
+                let sourcePathComponents = mountPathComponents(from: sourceBaseUrl.path.removingPercentEncoding ?? sourceBaseUrl.path)
+                candidates.append(("origin", originURL, sourcePathComponents + fileComponents))
+            }
+
+            var seen = Set<String>()
+            return candidates.filter { candidate in
+                let key = candidate.mountURL.absoluteString + "|" + candidate.relativeComponents.joined(separator: "/")
+                guard !seen.contains(key) else { return false }
+                seen.insert(key)
+                return !candidate.relativeComponents.isEmpty
+            }
+        }
+
+        func webDAVMountedISOPlaybackURL(for file: VideoFile, remoteURL: URL) async -> URL? {
+            guard sourceKind == .webdav,
+                  !remoteURL.isFileURL,
+                  remoteURL.pathExtension.lowercased() == "iso" else {
+                return nil
+            }
+
+            let credential = webDAVCredential
+            for candidate in webDAVISOMountCandidates(for: file, remoteURL: remoteURL) {
+                let mountRoot = URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Library/Caches/OmniPlay/WebDAVMounts")
+                    .appendingPathComponent(stableMountKey(for: candidate.mountURL), isDirectory: true)
+                let localURL = mountedLocalURL(pathComponents: candidate.relativeComponents, mountRoot: mountRoot)
+                if FileManager.default.fileExists(atPath: localURL.path) {
+                    log("WebDAV ISO using existing mounted path=\(localURL.path) label=\(candidate.label)")
+                    return localURL
+                }
+
+                log("WebDAV ISO mount start label=\(candidate.label) base=\(candidate.mountURL.absoluteString) mount=\(mountRoot.path)")
+                let result = await Task.detached(priority: .userInitiated) { () -> (status: Int, mountPoints: [String], error: String?) in
+                    do {
+                        try FileManager.default.createDirectory(at: mountRoot, withIntermediateDirectories: true)
+
+                        let openOptions = NSMutableDictionary()
+                        openOptions[kNAUIOptionKey] = kNAUIOptionNoUI
+                        if credential != nil {
+                            openOptions[kNetFSUseAuthenticationInfoKey] = true
+                        }
+
+                        let mountOptions = NSMutableDictionary()
+                        mountOptions[kNetFSMountAtMountDirKey] = true
+                        mountOptions[kNetFSMountFlagsKey] = NSNumber(value: MNT_RDONLY)
+                        mountOptions[kNetFSSoftMountKey] = true
+
+                        var mountPoints: Unmanaged<CFArray>?
+                        let status = NetFSMountURLSync(
+                            candidate.mountURL as CFURL,
+                            mountRoot as CFURL,
+                            credential?.username as CFString?,
+                            credential?.password as CFString?,
+                            openOptions,
+                            mountOptions,
+                            &mountPoints
+                        )
+                        let points = (mountPoints?.takeRetainedValue() as? [String]) ?? []
+                        return (Int(status), points, nil)
+                    } catch {
+                        return (Int.max, [], error.localizedDescription)
+                    }
+                }.value
+
+                if FileManager.default.fileExists(atPath: localURL.path) {
+                    log("WebDAV ISO mount ready label=\(candidate.label) status=\(result.status) path=\(localURL.path)")
+                    return localURL
+                }
+
+                log("WebDAV ISO mount failed label=\(candidate.label) status=\(result.status) points=\(result.mountPoints.joined(separator: ",")) error=\(result.error ?? "nil")")
+            }
+
+            return nil
+        }
+
+        func attachISOImageIfNeeded(_ isoURL: URL) async -> String? {
+            guard isoURL.isFileURL,
+                  isoURL.pathExtension.lowercased() == "iso",
+                  FileManager.default.fileExists(atPath: isoURL.path) else {
+                return nil
+            }
+
+            log("ISO attach start path=\(isoURL.path)")
+            let result = await Task.detached(priority: .userInitiated) { () -> (mountPoint: String?, error: String?) in
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                process.arguments = [
+                    "attach",
+                    "-readonly",
+                    "-nobrowse",
+                    "-noverify",
+                    "-noautoopen",
+                    "-plist",
+                    isoURL.path
+                ]
+
+                let output = Pipe()
+                let errorOutput = Pipe()
+                process.standardOutput = output
+                process.standardError = errorOutput
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    let errorData = errorOutput.fileHandleForReading.readDataToEndOfFile()
+                    guard process.terminationStatus == 0 else {
+                        let message = String(data: errorData, encoding: .utf8) ?? "hdiutil attach failed"
+                        return (nil, message.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+
+                    guard let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+                          let entities = plist["system-entities"] as? [[String: Any]] else {
+                        return (nil, "hdiutil attach output parse failed")
+                    }
+
+                    let mountPoints = entities.compactMap { $0["mount-point"] as? String }
+                    if let bluRayMount = mountPoints.first(where: {
+                        FileManager.default.fileExists(atPath: URL(fileURLWithPath: $0).appendingPathComponent("BDMV").path)
+                    }) {
+                        return (bluRayMount, nil)
+                    }
+                    return (mountPoints.first, nil)
+                } catch {
+                    return (nil, error.localizedDescription)
+                }
+            }.value
+
+            if let mountPoint = result.mountPoint {
+                if !attachedDiscImageMountPaths.contains(mountPoint) {
+                    attachedDiscImageMountPaths.append(mountPoint)
+                }
+                log("ISO attach ready mount=\(mountPoint)")
+                return mountPoint
+            }
+
+            log("ISO attach failed path=\(isoURL.path) error=\(result.error ?? "nil")")
+            return nil
+        }
+
+        func remoteISOProxyPlaybackRegistration(for file: VideoFile, remoteURL: URL) async -> RemoteISOProxyRegistration? {
+            guard sourceKind == .webdav,
+                  !remoteURL.isFileURL,
+                  remoteURL.pathExtension.lowercased() == "iso" else {
+                return nil
+            }
+
+            let reader = RemoteISOHTTPByteReader(url: remoteURL, credential: webDAVCredential)
+            do {
+                let isoSize = try await reader.contentLength(hint: file.fileSize)
+                let streamFiles = try await RemoteISOImageParser(reader: reader, isoSize: isoSize).bluRayStreamFiles()
+                let includeExtras = UserDefaults.standard.bool(forKey: "playBluRayExtras")
+                let candidates = streamFiles.map {
+                    MediaNameParser.BluRayStreamCandidate(
+                        fileName: $0.fileName,
+                        fileSize: $0.size,
+                        duration: 0
+                    )
+                }
+                let selectedIndexes = MediaNameParser.selectedBluRayStreamIndices(
+                    from: candidates,
+                    includeExtras: includeExtras
+                )
+                let selectedFiles = selectedIndexes.map { streamFiles[$0] }.sorted { lhs, rhs in
+                    let lhsKey = MediaNameParser.bluRayStreamPlaybackSortKey(for: lhs.fileName)
+                    let rhsKey = MediaNameParser.bluRayStreamPlaybackSortKey(for: rhs.fileName)
+                    if lhsKey.number != rhsKey.number { return lhsKey.number < rhsKey.number }
+                    return lhsKey.name < rhsKey.name
+                }
+                guard !selectedFiles.isEmpty else { throw RemoteISOPlaybackError.noPlayableStreams }
+
+                let registration = try RemoteISOStreamProxy.shared.register(files: selectedFiles, reader: reader)
+                remoteISOProxyRouteIDs.append(contentsOf: registration.routeIDs)
+                let names = selectedFiles.map { "\($0.fileName):\($0.size)" }.joined(separator: ",")
+                log("WebDAV ISO proxy ready isoSize=\(isoSize) streams=\(streamFiles.count) selected=\(selectedFiles.count) includeExtras=\(includeExtras) files=\(names)")
+                return registration
+            } catch {
+                log("WebDAV ISO proxy failed error=\(error)")
+                return nil
+            }
+        }
+
+        func bdmvRootKey(for file: VideoFile) -> String? {
+            let relativePath = file.relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let components = relativePath.split(separator: "/").map(String.init)
+            guard let bdmvIndex = components.firstIndex(where: { $0.caseInsensitiveCompare("BDMV") == .orderedSame }),
+                  bdmvIndex > 0 else {
+                return nil
+            }
+            return components[..<bdmvIndex]
+                .joined(separator: "/")
+                .precomposedStringWithCanonicalMapping
+                .lowercased()
+        }
+
+        func isBDMVStreamFile(_ file: VideoFile) -> Bool {
+            let relativePath = file.relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let components = relativePath.split(separator: "/").map(String.init)
+            guard let bdmvIndex = components.firstIndex(where: { $0.caseInsensitiveCompare("BDMV") == .orderedSame }),
+                  components.indices.contains(bdmvIndex + 1),
+                  components[bdmvIndex + 1].caseInsensitiveCompare("STREAM") == .orderedSame else {
+                return false
+            }
+            let fileName = file.fileName.isEmpty ? (file.relativePath as NSString).lastPathComponent : file.fileName
+            let ext = (fileName as NSString).pathExtension.lowercased()
+            return ext == "m2ts" || ext == "m2t" || ext == "ts"
+        }
+
+        func normalizedBDMVPlaybackFiles(from sourceFiles: [VideoFile], requestedIndex: Int) -> (files: [VideoFile], startIndex: Int)? {
+            guard sourceFiles.indices.contains(requestedIndex),
+                  let rootKey = bdmvRootKey(for: sourceFiles[requestedIndex]) else {
+                return nil
+            }
+            let includeExtras = UserDefaults.standard.bool(forKey: "playBluRayExtras")
+            let groupFiles = sourceFiles.filter { bdmvRootKey(for: $0) == rootKey }
+            let streamFiles = groupFiles.filter(isBDMVStreamFile)
+            guard !streamFiles.isEmpty else { return nil }
+
+            let candidates = streamFiles.map {
+                MediaNameParser.BluRayStreamCandidate(
+                    fileName: $0.fileName,
+                    fileSize: $0.fileSize,
+                    duration: $0.duration
+                )
+            }
+            let selectedIndexes = MediaNameParser.selectedBluRayStreamIndices(
+                from: candidates,
+                includeExtras: includeExtras
+            )
+            let selectedFiles = selectedIndexes.map { streamFiles[$0] }
+
+            let orderedFiles = selectedFiles.sorted { lhs, rhs in
+                let lhsKey = MediaNameParser.bluRayStreamPlaybackSortKey(for: lhs.fileName)
+                let rhsKey = MediaNameParser.bluRayStreamPlaybackSortKey(for: rhs.fileName)
+                if lhsKey.number != rhsKey.number { return lhsKey.number < rhsKey.number }
+                return lhsKey.name < rhsKey.name
+            }
+            guard !orderedFiles.isEmpty else { return nil }
+
+            let requestedId = sourceFiles[requestedIndex].id
+            let resolvedStartIndex: Int
+            if includeExtras, let requestedStreamIndex = orderedFiles.firstIndex(where: { $0.id == requestedId }) {
+                resolvedStartIndex = requestedStreamIndex
+            } else {
+                resolvedStartIndex = 0
+            }
+
+            log("BDMV playback normalized root=\(rootKey) input=\(sourceFiles.count) streams=\(streamFiles.count) selected=\(orderedFiles.count) startIndex=\(resolvedStartIndex) includeExtras=\(includeExtras)")
+            return (orderedFiles, resolvedStartIndex)
+        }
+
+        let playbackSelection = normalizedBDMVPlaybackFiles(from: files, requestedIndex: startIndex)
+        let playbackFiles = playbackSelection?.files ?? files
+        let playbackStartIndex = playbackSelection?.startIndex ?? startIndex
+        let targetFile = playbackFiles[playbackStartIndex]
+        let remainingFiles = Array(playbackFiles[playbackStartIndex...])
+        let isDirectOpenFile = targetFile.mediaType == "direct"
 
         func sourcePlaybackURL(for file: VideoFile) async -> URL? {
             switch sourceKind {
@@ -1120,12 +2488,31 @@ struct PlayerScreen: View {
         func normalizedFileNameKey(_ value: String) -> String {
             value.precomposedStringWithCanonicalMapping.lowercased()
         }
-        
-        guard let targetSourceURL = await sourcePlaybackURL(for: targetFile) else { return false }
+
+        guard let originalTargetSourceURL = await sourcePlaybackURL(for: targetFile) else { return false }
         let targetLocalURL = localPlaybackURL(for: targetFile)
+        let requiresRemoteWebDAVISO = targetLocalURL == nil
+            && sourceKind == .webdav
+            && !originalTargetSourceURL.isFileURL
+            && originalTargetSourceURL.pathExtension.lowercased() == "iso"
+        let remoteISOProxyRegistration = requiresRemoteWebDAVISO
+            ? await remoteISOProxyPlaybackRegistration(for: targetFile, remoteURL: originalTargetSourceURL)
+            : nil
+        let mountedISOPlaybackURL = requiresRemoteWebDAVISO && remoteISOProxyRegistration == nil
+            ? await webDAVMountedISOPlaybackURL(for: targetFile, remoteURL: originalTargetSourceURL)
+            : nil
+        if requiresRemoteWebDAVISO && remoteISOProxyRegistration == nil && mountedISOPlaybackURL == nil {
+            errorMessage = "无法播放 WebDAV ISO：远程 Range 解析失败，系统挂载也失败。请确认服务器支持 Range 请求，或使用 SMB/NFS 源播放 ISO。"
+            return false
+        }
+        let targetSourceURL = remoteISOProxyRegistration?.urls.first ?? mountedISOPlaybackURL ?? originalTargetSourceURL
         let targetExists: Bool = {
             if isDirectOpenFile { return true }
             if targetLocalURL != nil { return true }
+            if remoteISOProxyRegistration != nil { return true }
+            if let mountedISOPlaybackURL {
+                return FileManager.default.fileExists(atPath: mountedISOPlaybackURL.path)
+            }
             switch sourceKind {
             case .local:
                 return FileManager.default.fileExists(atPath: targetSourceURL.path)
@@ -1138,29 +2525,37 @@ struct PlayerScreen: View {
         
         var urls: [URL] = []
         var localCacheAccessCount = 0
-        for file in remainingFiles {
-            if let localPlaybackURL = localPlaybackURL(for: file) {
-                urls.append(localPlaybackURL)
-                localCacheAccessCount += 1
-            } else if file.id == targetFile.id {
-                urls.append(targetSourceURL)
-            } else {
-                if let nasURL = await sourcePlaybackURL(for: file),
-                   (isDirectOpenFile || !nasURL.absoluteString.isEmpty) {
-                    urls.append(nasURL)
+        if let proxyURLs = remoteISOProxyRegistration?.urls {
+            urls = proxyURLs
+        } else {
+            for file in remainingFiles {
+                if let localPlaybackURL = localPlaybackURL(for: file) {
+                    urls.append(localPlaybackURL)
+                    localCacheAccessCount += 1
+                } else if file.id == targetFile.id {
+                    urls.append(targetSourceURL)
+                } else {
+                    if let nasURL = await sourcePlaybackURL(for: file),
+                       (isDirectOpenFile || !nasURL.absoluteString.isEmpty) {
+                        urls.append(nasURL)
+                    }
                 }
             }
         }
         guard !urls.isEmpty else { return false }
         log("applyPreparedPlayback urlsPrepared=\(urls.count) localCacheCount=\(localCacheAccessCount)")
+        let firstPlaybackURL = urls.first ?? targetSourceURL
+        let attachedISOBlurayRoot = firstPlaybackURL.isFileURL && firstPlaybackURL.pathExtension.lowercased() == "iso"
+            ? await attachISOImageIfNeeded(firstPlaybackURL)
+            : nil
         
         var isBDMV = false
         var bdRoot: String? = nil
         if localCacheAccessCount > 0 && targetLocalURL != nil {
-            let firstURL = urls.first ?? targetSourceURL
+            let firstURL = firstPlaybackURL
             let isISOFile = firstURL.pathExtension.lowercased() == "iso"
             isBDMV = isISOFile
-            bdRoot = isISOFile ? firstURL.path : nil
+            bdRoot = isISOFile ? (attachedISOBlurayRoot ?? firstURL.path) : nil
         } else if sourceBaseUrl.isFileURL, targetFile.relativePath.contains("BDMV/STREAM") {
             isBDMV = true
             let pathComps = targetFile.relativePath.components(separatedBy: "/")
@@ -1170,9 +2565,9 @@ struct PlayerScreen: View {
                 for comp in parentComps { root = root.appendingPathComponent(comp) }
                 bdRoot = root.path
             }
-        } else if sourceBaseUrl.isFileURL, targetSourceURL.pathExtension.lowercased() == "iso" {
+        } else if targetSourceURL.isFileURL, targetSourceURL.pathExtension.lowercased() == "iso" {
             isBDMV = true
-            bdRoot = targetSourceURL.path
+            bdRoot = attachedISOBlurayRoot ?? targetSourceURL.path
         }
         
         let resolvedURLs = urls
@@ -1181,7 +2576,7 @@ struct PlayerScreen: View {
             self.blurayRootPath = bdRoot
             self.allPlaylistFiles = remainingFiles
             self.currentVideoFileId = targetFile.id
-            self.startPosition = targetFile.playProgress
+            self.startPosition = Self.playbackResumeStartPosition(for: targetFile)
             self.rootFolderURL = sourceBaseUrl
             self.videoURLs = resolvedURLs
             self.embyRemotePlaybackContext = remotePlaybackContexts[targetFile.id]
@@ -2060,27 +3455,38 @@ struct PlayerScreen: View {
     
     private func playNextEpisodeAndMarkCurrentWatched() {
         guard let currentId = currentVideoFileId else { return }
-        let duration = playerManager.duration
-        let currentTime = playerManager.currentTimePos
+        guard let currentIndex = allPlaylistFiles.firstIndex(where: { $0.id == currentId }),
+              allPlaylistFiles.indices.contains(currentIndex + 1) else { return }
+        let nextFileId = allPlaylistFiles[currentIndex + 1].id
+        let snapshot = playerManager.playbackEngineSnapshot
+        let duration = max(playerManager.duration, snapshot.duration)
+        let currentTime = max(playerManager.currentTimePos, snapshot.timePos)
         
         Task.detached {
             do {
                 try await AppDatabase.shared.dbQueue.write { db in
                     if var file = try VideoFile.fetchOne(db, key: currentId) {
-                        let resolvedDuration = max(duration, file.duration)
-                        file.duration = resolvedDuration
-                        file.playProgress = resolvedDuration > 0 ? resolvedDuration : max(currentTime, file.playProgress)
-                        file.lastPlayedAt = nil
+                        Self.applyFinishedPlaybackState(
+                            to: &file,
+                            observedDuration: duration,
+                            observedProgress: currentTime
+                        )
                         try file.update(db)
                     }
                 }
                 await MainActor.run {
-                    NotificationCenter.default.post(name: .libraryUpdated, object: nil)
+                    NotificationCenter.default.post(
+                        name: .libraryUpdated,
+                        object: nil,
+                        userInfo: [LibraryUpdateUserInfoKey.preferredVideoFileId: nextFileId]
+                    )
+                    currentVideoFileId = nextFileId
                     playerManager.executeMpvCommand(["playlist-next", "force"])
                     resetHideTimer()
                 }
             } catch {
                 await MainActor.run {
+                    currentVideoFileId = nextFileId
                     playerManager.executeMpvCommand(["playlist-next", "force"])
                     resetHideTimer()
                 }

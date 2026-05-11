@@ -32,23 +32,7 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
 
     public async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverAsync(CancellationToken cancellationToken = default)
     {
-        Dictionary<string, NetworkSourceDiscoveryItem> results = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["webdav:manual"] = new()
-            {
-                Name = "手动输入 WebDAV",
-                ProtocolType = "webdav",
-                BaseUrl = "https://",
-                Description = "输入 WebDAV 地址后登录并选择文件夹。"
-            },
-            ["smb:manual"] = new()
-            {
-                Name = "手动输入 SMB",
-                ProtocolType = "smb",
-                BaseUrl = @"\\server\share",
-                Description = "输入 SMB 服务器或共享路径后登录并选择文件夹。"
-            }
-        };
+        Dictionary<string, NetworkSourceDiscoveryItem> results = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (var drive in DriveInfo.GetDrives().Where(static drive => drive.DriveType == DriveType.Network))
         {
@@ -78,7 +62,13 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             };
         }
 
-        foreach (var mediaServer in await DiscoverMediaServersAsync(cancellationToken))
+        var httpCandidates = await LoadHttpEndpointCandidatesAsync(cancellationToken);
+        foreach (var webDavServer in await DiscoverWebDavServersAsync(httpCandidates, cancellationToken))
+        {
+            results[$"{webDavServer.ProtocolType}:{webDavServer.BaseUrl}"] = webDavServer;
+        }
+
+        foreach (var mediaServer in await DiscoverMediaServersAsync(httpCandidates, cancellationToken))
         {
             results[$"{mediaServer.ProtocolType}:{mediaServer.BaseUrl}"] = mediaServer;
         }
@@ -104,18 +94,42 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
         };
     }
 
-    private async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverMediaServersAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<Uri>> LoadHttpEndpointCandidatesAsync(CancellationToken cancellationToken)
     {
-        IReadOnlyList<Uri> candidates;
         try
         {
-            candidates = await mediaServerEndpointProvider(cancellationToken);
+            return await mediaServerEndpointProvider(cancellationToken);
         }
         catch
         {
             return [];
         }
+    }
 
+    private async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverWebDavServersAsync(
+        IReadOnlyList<Uri> candidates,
+        CancellationToken cancellationToken)
+    {
+        Dictionary<string, NetworkSourceDiscoveryItem> results = new(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates.DistinctBy(static uri => uri.GetLeftPart(UriPartial.Authority)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var item = await ProbeWebDavAsync(candidate, cancellationToken);
+            if (item is not null)
+            {
+                results[$"{item.ProtocolType}:{item.BaseUrl}"] = item;
+            }
+        }
+
+        return results.Values
+            .OrderBy(static item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverMediaServersAsync(
+        IReadOnlyList<Uri> candidates,
+        CancellationToken cancellationToken)
+    {
         Dictionary<string, NetworkSourceDiscoveryItem> results = new(StringComparer.OrdinalIgnoreCase);
         foreach (var candidate in candidates.DistinctBy(static uri => uri.GetLeftPart(UriPartial.Authority)))
         {
@@ -131,6 +145,48 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             .OrderBy(static item => item.ProtocolLabel, StringComparer.OrdinalIgnoreCase)
             .ThenBy(static item => item.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private async Task<NetworkSourceDiscoveryItem?> ProbeWebDavAsync(Uri candidate, CancellationToken cancellationToken)
+    {
+        if (!candidate.IsAbsoluteUri ||
+            (candidate.Scheme != Uri.UriSchemeHttp && candidate.Scheme != Uri.UriSchemeHttps) ||
+            string.IsNullOrWhiteSpace(candidate.Host))
+        {
+            return null;
+        }
+
+        var baseUri = new Uri(candidate.GetLeftPart(UriPartial.Authority));
+        using var request = BuildWebDavRequest(baseUri, null);
+
+        try
+        {
+            using var response = await SendProbeAsync(request, cancellationToken);
+            if (response is null)
+            {
+                return null;
+            }
+
+            var isMultiStatus = (int)response.StatusCode == 207;
+            var hasDavHeader = response.Headers.Contains("DAV");
+            if (!isMultiStatus && !hasDavHeader)
+            {
+                return null;
+            }
+
+            var normalized = MediaSourceNormalizer.NormalizeBaseUrl(MediaSourceProtocol.WebDav, baseUri.AbsoluteUri);
+            return new NetworkSourceDiscoveryItem
+            {
+                Name = "WebDAV",
+                ProtocolType = "webdav",
+                BaseUrl = normalized,
+                Description = $"Discovered WebDAV endpoint: {normalized}"
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task<NetworkSourceDiscoveryItem?> ProbeMediaServerAsync(Uri candidate, CancellationToken cancellationToken)
@@ -192,7 +248,7 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             var normalized = MediaSourceNormalizer.NormalizeBaseUrl(MediaSourceProtocol.Plex, baseUri.AbsoluteUri);
             return new NetworkSourceDiscoveryItem
             {
-                Name = ResolveServerName("Plex", baseUri),
+                Name = "Plex",
                 ProtocolType = "plex",
                 BaseUrl = normalized,
                 Description = $"预扫描到的 Plex 媒体服务器：{normalized}"
@@ -242,7 +298,7 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             var normalized = MediaSourceNormalizer.NormalizeBaseUrl(protocol, baseUri.AbsoluteUri);
             return new NetworkSourceDiscoveryItem
             {
-                Name = ResolveServerName(protocol == MediaSourceProtocol.Jellyfin ? "Jellyfin" : "Emby", baseUri),
+                Name = protocol == MediaSourceProtocol.Jellyfin ? "Jellyfin" : "Emby",
                 ProtocolType = protocol == MediaSourceProtocol.Jellyfin ? "jellyfin" : "emby",
                 BaseUrl = normalized,
                 Description = $"预扫描到的 {(protocol == MediaSourceProtocol.Jellyfin ? "Jellyfin" : "Emby")} 媒体服务器：{normalized}"
@@ -588,11 +644,6 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
 
         var authority = uri.GetLeftPart(UriPartial.Authority);
         results[authority] = new Uri(authority);
-    }
-
-    private static string ResolveServerName(string protocolLabel, Uri baseUri)
-    {
-        return $"{protocolLabel} · {baseUri.Host}";
     }
 
     private async Task<IReadOnlyList<NetworkShareFolderItem>> ListWebDavFoldersAsync(

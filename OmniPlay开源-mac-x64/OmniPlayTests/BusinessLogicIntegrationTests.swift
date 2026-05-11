@@ -88,7 +88,7 @@ struct BusinessLogicIntegrationTests {
 
         let seoulSpringSample = "/电影/12.12.The.Day.2023.HKG.Blu-ray.1080p.AVC.TrueHD.5.1-Breeze@Sunny/BDMV/STREAM/00003.m2ts"
         let seoulSpringMetadata = MediaNameParser.extractSearchMetadata(from: seoulSpringSample)
-        #expect(seoulSpringMetadata.foreignTitle?.localizedCaseInsensitiveContains("The Day") == true)
+        #expect(seoulSpringMetadata.foreignTitle == "12 12 The Day")
         #expect(seoulSpringMetadata.year == "2023")
 
         let yuruCampSample = "/动画/映画 ゆるキャン△ 2022 2160P ULTRA-HD Blu-ray HEVC Atmos 7.1-SweetDreamDay/BDMV/STREAM/00004.m2ts"
@@ -132,6 +132,23 @@ struct BusinessLogicIntegrationTests {
         #expect(y1917Metadata.chineseTitle == "逆战救兵")
         #expect(y1917Metadata.year == "2019")
 
+    }
+
+    @Test("Blu-ray stream selection should prefer main feature by size")
+    func bluRayStreamSelectionPrefersMainFeature() {
+        let singleMain = [
+            MediaNameParser.BluRayStreamCandidate(fileName: "00013.m2ts", fileSize: 1_000, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00000.m2ts", fileSize: 10_000, duration: 0)
+        ]
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: singleMain, includeExtras: false) == [1])
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: singleMain, includeExtras: true) == [1, 0])
+
+        let splitMain = [
+            MediaNameParser.BluRayStreamCandidate(fileName: "00000.m2ts", fileSize: 10_000, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00001.m2ts", fileSize: 9_200, duration: 0),
+            MediaNameParser.BluRayStreamCandidate(fileName: "00020.m2ts", fileSize: 1_000, duration: 0)
+        ]
+        #expect(MediaNameParser.selectedBluRayStreamIndices(from: splitMain, includeExtras: false) == [0, 1])
     }
 
     @Test("Episode parsing and season detection should match common release names")
@@ -207,6 +224,15 @@ struct BusinessLogicIntegrationTests {
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "chi", subtitleTracks: tracks) == 1)
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "eng", subtitleTracks: tracks) == 3)
         #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "no", subtitleTracks: tracks) == nil)
+
+        let unknownTracks: [(id: Int64, lang: String, title: String)] = [
+            (10, "", ""),
+            (11, "und", ""),
+            (12, "", "PGS")
+        ]
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "chi", subtitleTracks: unknownTracks) == 12)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "eng", subtitleTracks: unknownTracks) == 12)
+        #expect(MPVPlayerManager.preferredSubtitleId(defaultSub: "no", subtitleTracks: unknownTracks) == nil)
     }
 
     @Test("MediaLibraryManager DB integration: fetch filters direct, keeps mounted sources, rematch cleans fake movie")
@@ -466,6 +492,7 @@ struct BusinessLogicIntegrationTests {
                 t.column("playProgress", .double).notNull().defaults(to: 0.0)
                 t.column("duration", .double).notNull().defaults(to: 0.0)
                 t.column("customSubtitle", .text)
+                t.column("fileSize", .integer).notNull().defaults(to: 0)
                 t.column("lastPlayedAt", .double)
             }
         }

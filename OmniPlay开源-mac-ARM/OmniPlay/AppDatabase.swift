@@ -70,6 +70,13 @@ class AppDatabase {
                 t.add(column: "lastPlayedAt", .double)
             }
         }
+
+        // v5: 记录文件大小，用于蓝光 BDMV 主片识别和缓存空间预估。
+        migrator.registerMigration("v5") { db in
+            try db.alter(table: "videoFile") { t in
+                t.add(column: "fileSize", .integer).notNull().defaults(to: 0)
+            }
+        }
         
         try migrator.migrate(dbQueue)
     }

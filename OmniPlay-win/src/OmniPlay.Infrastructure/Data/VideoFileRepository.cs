@@ -88,7 +88,12 @@ namespace OmniPlay.Infrastructure.Data;
                                 AND mediaSource.isEnabled = 1
                                 AND mediaSource.removedAt IS NULL
                 LEFT JOIN tvShow ON tvShow.id = videoFile.episodeId
-                WHERE videoFile.episodeId = @TvShowId
+                WHERE videoFile.episodeId IN (
+                    SELECT matchingShow.id
+                    FROM tvShow AS selectedShow
+                    JOIN tvShow AS matchingShow ON matchingShow.title = selectedShow.title
+                    WHERE selectedShow.id = @TvShowId
+                )
                 ORDER BY videoFile.fileName COLLATE NOCASE ASC
                 """,
                 new { TvShowId = tvShowId },
@@ -386,6 +391,9 @@ namespace OmniPlay.Infrastructure.Data;
                 row.SourceBasePath,
                 playbackRelativePath,
                 authConfig),
+            SourceProtocolType = row.SourceProtocolType,
+            SourceBasePath = row.SourceBasePath,
+            SourceAuthConfig = authConfig,
             LocalIsoPlaybackPath = ResolveLocalIsoPlaybackPath(row.SourceProtocolType, row.MetadataPath, row.FileName),
             ThumbnailPath = resolvedThumbnailPath,
             CustomThumbnailPath = customThumbnailPath,

@@ -29,12 +29,12 @@ struct MovieDetailView: View {
     @State private var availableSeasons: [Int] = []
     @State private var selectedSeason: Int = 1
     @State private var isTVShow: Bool = false
+    @State private var isDetailCacheModeActive = false
     @State private var cacheSupportByFileId: [String: Bool] = [:]
     @State private var loadFileDetailsTask: Task<Void, Never>? = nil
     
     @State private var localPoster: NSImage? = nil
     @State private var displayMovieTitle: String
-    @State private var showSeasonCacheAlert = false // 修复：整季缓存弹窗状态
     @State private var playbackAlertMessage = ""
     @State private var showPlaybackAlert = false
     
@@ -79,12 +79,23 @@ struct MovieDetailView: View {
                     // 2. 左右分栏的高级信息区
                     HStack(alignment: .top, spacing: 45) {
                         
-                        // 🌟 核心升级：详情页的左侧海报也使用具有智能自愈功能的组件！
-                                                CachedPosterView(posterPath: movie.posterPath)
-                                                    .frame(width: 260, height: 390) // 🌟 修复：明确给定 2:3 比例的高度 (260 * 1.5)
-                                                    .clipped() // 🌟 修复：防止内部的 fill 模式溢出
-                                                    .cornerRadius(12)
-                                                    .shadow(color: theme.textSecondary.opacity(0.15), radius: 25, y: 15)
+                        ZStack {
+                            // 🌟 核心升级：详情页的左侧海报也使用具有智能自愈功能的组件！
+                            CachedPosterView(posterPath: movie.posterPath)
+                                .frame(width: 260, height: 390) // 🌟 修复：明确给定 2:3 比例的高度 (260 * 1.5)
+                                .clipped() // 🌟 修复：防止内部的 fill 模式溢出
+                                .cornerRadius(12)
+                                .shadow(color: theme.textSecondary.opacity(0.15), radius: 25, y: 15)
+
+                            if isDetailCacheModeActive {
+                                Button(action: { cacheEntireTitle() }) {
+                                    cacheOverlayContent(for: videoFiles, downloadTitle: "离线缓存整部影片或整部剧集")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isCacheActionDisabled(for: videoFiles))
+                                .conditionalHelp(cacheHelpText(for: videoFiles, defaultText: "离线缓存整部影片或整部剧集"), show: enableFastTooltip)
+                            }
+                        }
                         
                         VStack(alignment: .leading, spacing: 16) {
                             Text(displayMovieTitle).font(.system(size: 46, weight: .heavy)).foregroundColor(theme.textPrimary).lineLimit(2)
@@ -135,27 +146,25 @@ struct MovieDetailView: View {
                                 .fixedSize()
                                 
                                 // 整季缓存专属按钮
-                                if cacheManager.isCacheModeActive {
-                                    Button(action: { showSeasonCacheAlert = true }) {
-                                        Image(systemName: "icloud.and.arrow.down")
-                                            .font(.system(size: 14, weight: .bold))
-                                            .foregroundColor(theme.accent)
-                                            .padding(8)
-                                            .background(theme.accent.opacity(0.1))
-                                            .clipShape(Circle())
+                                if isDetailCacheModeActive {
+                                    HStack(spacing: 10) {
+                                        Button(action: { cacheSelectedSeason() }) {
+                                            cacheOverlayContent(for: allEpisodesForSelectedSeason.map(\.file), downloadTitle: "缓存当前选择的整季", compact: true)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(isCacheActionDisabled(for: allEpisodesForSelectedSeason.map(\.file)))
+                                        .conditionalHelp(cacheHelpText(for: allEpisodesForSelectedSeason.map(\.file), defaultText: "缓存当前选择的整季"), show: enableFastTooltip)
+
+                                        if let progress = aggregateCacheProgress(for: allEpisodesForSelectedSeason.map(\.file)) {
+                                            ProgressView(value: progress)
+                                                .progressViewStyle(.linear)
+                                                .tint(theme.accent)
+                                                .frame(width: 120)
+                                        }
                                     }
-                                    .buttonStyle(.plain)
-                                    .conditionalHelp("缓存当前选择的整季", show: enableFastTooltip)
                                 }
                             }
                             .padding(.horizontal, 60)
-                            .alert("缓存第 \(selectedSeason) 季", isPresented: $showSeasonCacheAlert) {
-                                Button("取消", role: .cancel) { }
-                                Button("确定缓存") { cacheSelectedSeason() }
-                            } message: {
-                                Text("确定要将本季的所有剧集加入后台离线缓存队列吗？")
-                            }
-                            
                             LazyVGrid(columns: episodeGridColumns, alignment: .leading, spacing: 24) {
                                 ForEach(allEpisodesForSelectedSeason) { ep in
                                     EpisodeCardView(
@@ -164,7 +173,8 @@ struct MovieDetailView: View {
                                         ep: ep,
                                         currentVideoFileId: $currentVideoFileId,
                                         localPoster: localPoster,
-                                        isCacheSupported: cacheSupportByFileId[ep.file.id] ?? false
+                                        isCacheSupported: cacheSupportByFileId[ep.file.id] ?? false,
+                                        isDetailCacheModeActive: isDetailCacheModeActive
                                     )
                                 }
                             }
@@ -188,12 +198,12 @@ struct MovieDetailView: View {
             VStack {
                 HStack {
                     Spacer()
-                    Button(action: { withAnimation { cacheManager.isCacheModeActive.toggle() } }) {
-                        Image(systemName: cacheManager.isCacheModeActive ? "icloud.fill" : "icloud")
+                    Button(action: { withAnimation { isDetailCacheModeActive.toggle() } }) {
+                        Image(systemName: isDetailCacheModeActive ? "icloud.fill" : "icloud")
                             .font(.title3.bold())
                             .padding(14)
                             .background(theme.background.opacity(0.8))
-                            .foregroundColor(cacheManager.isCacheModeActive ? theme.accent : theme.textPrimary)
+                            .foregroundColor(isDetailCacheModeActive ? theme.accent : theme.textPrimary)
                             .clipShape(Circle())
                             .shadow(color: theme.textSecondary.opacity(0.1), radius: 5, y: 3)
                     }
@@ -227,8 +237,9 @@ struct MovieDetailView: View {
                 self.localPoster = img
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .libraryUpdated)) { _ in
-            loadFileDetails(preservingCurrentSelection: true)
+        .onReceive(NotificationCenter.default.publisher(for: .libraryUpdated)) { notification in
+            let preferredFileId = notification.userInfo?[LibraryUpdateUserInfoKey.preferredVideoFileId] as? String
+            loadFileDetails(preservingCurrentSelection: true, preferredFileId: preferredFileId)
         }
         .onDisappear {
             loadFileDetailsTask?.cancel()
@@ -248,6 +259,47 @@ struct MovieDetailView: View {
         season == 0 ? Int.max : season
     }
 
+    private func episodeBaseDisplayName(season: Int, episode: Int) -> String {
+        season == 0 ? "特别篇 第 \(episode) 集" : "第 \(season) 季 第 \(episode) 集"
+    }
+
+    private func episodeDetailSuffix(from descriptor: MediaNameParser.EpisodeDescriptor) -> String? {
+        let pieces = [descriptor.variantTitle, descriptor.segmentLabel]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !pieces.isEmpty else { return nil }
+        return pieces.joined(separator: " · ")
+    }
+
+    private func applyingDuplicateEpisodeSuffixes(
+        to episodes: [EpisodeItem],
+        eligibleEpisodeIDs: Set<String>,
+        explicitSubtitleFileIDs: Set<String>,
+        detailSuffixesByFileID: [String: String]
+    ) -> [EpisodeItem] {
+        let duplicateCounts = Dictionary(
+            grouping: episodes.filter { eligibleEpisodeIDs.contains($0.id) },
+            by: { "\($0.season)#\($0.episode)" }
+        ).mapValues(\.count)
+
+        return episodes.map { episode in
+            let key = "\(episode.season)#\(episode.episode)"
+            guard duplicateCounts[key, default: 0] > 1,
+                  !explicitSubtitleFileIDs.contains(episode.id),
+                  let suffix = detailSuffixesByFileID[episode.id],
+                  !suffix.isEmpty else {
+                return episode
+            }
+            return EpisodeItem(
+                id: episode.id,
+                file: episode.file,
+                season: episode.season,
+                episode: episode.episode,
+                displayName: "\(episodeBaseDisplayName(season: episode.season, episode: episode.episode)) · \(suffix)"
+            )
+        }
+    }
+
     private func hasUnfinishedPlaybackProgress(_ file: VideoFile) -> Bool {
         guard file.playProgress > 5.0 else { return false }
         guard file.duration > 0 else { return true }
@@ -265,10 +317,18 @@ struct MovieDetailView: View {
             (lhs.file.lastPlayedAt ?? 0) < (rhs.file.lastPlayedAt ?? 0)
         }
     }
+
+    private func nextUpEpisode(in season: Int, from episodes: [EpisodeItem]) -> EpisodeItem? {
+        let seasonEpisodes = episodes.filter { $0.season == season }
+        return mostRecentUnfinishedEpisode(in: seasonEpisodes)
+            ?? seasonEpisodes.first { isNotFullyWatched($0.file) }
+            ?? seasonEpisodes.first
+    }
     
-    private func loadFileDetails(preservingCurrentSelection: Bool = false) {
+    private func loadFileDetails(preservingCurrentSelection: Bool = false, preferredFileId: String? = nil) {
         let preservedSeason = preservingCurrentSelection ? selectedSeason : nil
         let preservedFileId = preservingCurrentSelection ? currentVideoFileId : nil
+        let explicitPreferredFileId = preferredFileId?.trimmingCharacters(in: .whitespacesAndNewlines)
         loadFileDetailsTask?.cancel()
         loadFileDetailsTask = Task {
             do {
@@ -294,23 +354,36 @@ struct MovieDetailView: View {
                         (seasonSortPriority(rhsResolved.season), rhsResolved.episode, rhsDetailKey)
                 }.map(\.element)
                 var episodes: [EpisodeItem] = []
+                var eligibleEpisodeIDs = Set<String>()
+                var explicitSubtitleFileIDs = Set<String>()
+                var detailSuffixesByFileID: [String: String] = [:]
                 var isShow = false
                 
                 for (index, file) in sortedFiles.enumerated() {
                     let parsed = MediaNameParser.parseEpisodeDescriptor(from: file.fileName, fallbackIndex: index)
-                    let resolvedInfo = EpisodeMetadataOverrideStore.shared.resolvedEpisodeInfo(
-                        fileId: file.id,
-                        fileName: file.fileName,
-                        fallbackIndex: index
-                    )
-                    let s = resolvedInfo.season
-                    let e = resolvedInfo.episode
-                    var dName = resolvedInfo.displayName
+                    let override = EpisodeMetadataOverrideStore.shared.override(for: file.id)
+                    let preferredSeason = override == nil
+                        ? MediaNameParser.resolvePreferredSeason(
+                            from: file.relativePath,
+                            fileName: file.fileName,
+                            fallbackIndex: index
+                        )
+                        : nil
+                    let s = override?.season ?? preferredSeason ?? parsed.season
+                    let e = override?.episode ?? parsed.episode
+                    var dName = episodeBaseDisplayName(season: s, episode: e)
                     if parsed.isTVShow {
                         isShow = true
+                        eligibleEpisodeIDs.insert(file.id)
+                        if let subtitle = override?.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !subtitle.isEmpty {
+                            dName += " · \(subtitle)"
+                            explicitSubtitleFileIDs.insert(file.id)
+                        } else if let suffix = episodeDetailSuffix(from: parsed) {
+                            detailSuffixesByFileID[file.id] = suffix
+                        }
                     } else if displayMovieTitle.contains("季") || displayMovieTitle.contains("集") {
                         isShow = true
-                        dName = "第 \(e) 集"
+                        eligibleEpisodeIDs.insert(file.id)
                     } else {
                         dName = sortedFiles.count > 1 ? "部分 \(index + 1)" : "正片"
                     }
@@ -320,7 +393,12 @@ struct MovieDetailView: View {
                 let seasons = Array(Set(episodes.map { $0.season })).sorted {
                     seasonSortPriority($0) < seasonSortPriority($1)
                 }
-                let sortedEpisodes = episodes
+                let sortedEpisodes = applyingDuplicateEpisodeSuffixes(
+                    to: episodes,
+                    eligibleEpisodeIDs: eligibleEpisodeIDs,
+                    explicitSubtitleFileIDs: explicitSubtitleFileIDs,
+                    detailSuffixesByFileID: detailSuffixesByFileID
+                )
                 let resumeEp = mostRecentUnfinishedEpisode(in: sortedEpisodes)
                 let nextUnwatchedEp = sortedEpisodes.first { isNotFullyWatched($0.file) }
                 let nextUpEp = resumeEp ?? nextUnwatchedEp ?? sortedEpisodes.first
@@ -333,12 +411,22 @@ struct MovieDetailView: View {
                             (pair.0.id, cacheManager.supportsCaching(mediaSource: pair.1))
                         }
                     )
-                    if let preservedFileId, let preservedEpisode = sortedEpisodes.first(where: { $0.id == preservedFileId }) {
-                        self.selectedSeason = preservedEpisode.season
-                        self.currentVideoFileId = preservedEpisode.id
+                    if let explicitPreferredFileId,
+                       !explicitPreferredFileId.isEmpty,
+                       let preferredEpisode = sortedEpisodes.first(where: { $0.id == explicitPreferredFileId }) {
+                        self.selectedSeason = preferredEpisode.season
+                        self.currentVideoFileId = preferredEpisode.id
                     } else if let preservedSeason, seasons.contains(preservedSeason) {
                         self.selectedSeason = preservedSeason
-                        self.currentVideoFileId = sortedEpisodes.first(where: { $0.season == preservedSeason })?.id
+                        if let preservedFileId,
+                           let preservedEpisode = sortedEpisodes.first(where: { $0.id == preservedFileId && $0.season == preservedSeason }) {
+                            self.currentVideoFileId = preservedEpisode.id
+                        } else {
+                            self.currentVideoFileId = nextUpEpisode(in: preservedSeason, from: sortedEpisodes)?.id
+                        }
+                    } else if let preservedFileId, let preservedEpisode = sortedEpisodes.first(where: { $0.id == preservedFileId }) {
+                        self.selectedSeason = preservedEpisode.season
+                        self.currentVideoFileId = preservedEpisode.id
                     } else if let target = nextUpEp {
                         self.selectedSeason = target.season
                         self.currentVideoFileId = target.id
@@ -360,19 +448,30 @@ struct MovieDetailView: View {
     
     private func cacheSelectedSeason() {
         let episodesToCache = allEpisodes.filter { $0.season == selectedSeason }
+        let supportedFiles = episodesToCache.map(\.file).filter { cacheSupportByFileId[$0.id] ?? false }
         var hasUnsupported = false
         for ep in episodesToCache {
             if !(cacheSupportByFileId[ep.file.id] ?? false) {
                 hasUnsupported = true
-                continue
             }
-            if !OfflineCacheManager.shared.isCached(ep.file) {
-                OfflineCacheManager.shared.startDownload(file: ep.file)
-            }
+        }
+        let filesToCache = supportedFiles.filter { !OfflineCacheManager.shared.isCached($0) }
+        if !filesToCache.isEmpty {
+            OfflineCacheManager.shared.startDownloads(files: filesToCache, groupTitle: "\(movie.title) 第 \(selectedSeason) 季")
         }
         if hasUnsupported {
-            OfflineCacheManager.shared.cacheStatusMessage = "部分剧集来自远程源，已跳过离线缓存"
+            OfflineCacheManager.shared.cacheStatusMessage = "部分剧集的媒体源暂不支持离线缓存，已跳过"
         }
+    }
+
+    private func cacheEntireTitle() {
+        let supportedFiles = videoFiles.filter { cacheSupportByFileId[$0.id] ?? false }
+        let filesToCache = supportedFiles.filter { !OfflineCacheManager.shared.isCached($0) }
+        guard !filesToCache.isEmpty else {
+            OfflineCacheManager.shared.cacheStatusMessage = supportedFiles.isEmpty ? "该媒体源暂不支持离线缓存" : "所选内容已在本地缓存中"
+            return
+        }
+        OfflineCacheManager.shared.startDownloads(files: filesToCache, groupTitle: movie.title)
     }
     
     private func attemptPlayback(for file: VideoFile) {
@@ -500,6 +599,58 @@ struct MovieDetailView: View {
         }
     }
 
+    private func aggregateCacheProgress(for files: [VideoFile]) -> Double? {
+        let cacheableFiles = files.filter { cacheSupportByFileId[$0.id] ?? false }
+        guard !cacheableFiles.isEmpty else { return nil }
+        guard cacheableFiles.contains(where: { cacheManager.downloadProgress[$0.id] != nil }) else { return nil }
+        let total = cacheableFiles.reduce(0.0) { partial, file in
+            if cacheManager.isCached(file) { return partial + 1.0 }
+            return partial + (cacheManager.downloadProgress[file.id] ?? 0.0)
+        }
+        return total / Double(cacheableFiles.count)
+    }
+
+    private func allCacheableFilesCached(_ files: [VideoFile]) -> Bool {
+        let cacheableFiles = files.filter { cacheSupportByFileId[$0.id] ?? false }
+        return !cacheableFiles.isEmpty && cacheableFiles.allSatisfy { cacheManager.isCached($0) }
+    }
+
+    private func isCacheActionDisabled(for files: [VideoFile]) -> Bool {
+        let cacheableFiles = files.filter { cacheSupportByFileId[$0.id] ?? false }
+        return cacheableFiles.isEmpty ||
+            cacheableFiles.contains(where: { cacheManager.downloadProgress[$0.id] != nil }) ||
+            cacheableFiles.allSatisfy { cacheManager.isCached($0) }
+    }
+
+    private func cacheHelpText(for files: [VideoFile], defaultText: String) -> String {
+        let cacheableFiles = files.filter { cacheSupportByFileId[$0.id] ?? false }
+        if cacheableFiles.isEmpty { return "该媒体源暂不支持离线缓存" }
+        if cacheableFiles.contains(where: { cacheManager.downloadProgress[$0.id] != nil }) { return "正在离线缓存" }
+        if cacheableFiles.allSatisfy({ cacheManager.isCached($0) }) { return "已缓存到本地" }
+        return defaultText
+    }
+
+    @ViewBuilder
+    private func cacheOverlayContent(for files: [VideoFile], downloadTitle: String, compact: Bool = false) -> some View {
+        if let progress = aggregateCacheProgress(for: files) {
+            OfflineCacheProgressBadge(progress: progress, tint: theme.accent)
+                .scaleEffect(compact ? 0.72 : 1.0)
+        } else {
+            let cacheableFiles = files.filter { cacheSupportByFileId[$0.id] ?? false }
+            let allCached = !cacheableFiles.isEmpty && cacheableFiles.allSatisfy { cacheManager.isCached($0) }
+            let unsupported = cacheableFiles.isEmpty
+            ZStack {
+                Circle()
+                    .fill(Color.black.opacity(compact ? 0.0 : 0.62))
+                    .frame(width: compact ? 34 : 56, height: compact ? 34 : 56)
+                Image(systemName: allCached ? "checkmark.circle.fill" : (unsupported ? "icloud.slash" : "arrow.down.circle.fill"))
+                    .font(.system(size: compact ? 24 : 28, weight: .bold))
+                    .foregroundColor(allCached ? theme.accent : (compact ? theme.accent : .white))
+                    .accessibilityLabel(downloadTitle)
+            }
+        }
+    }
+
     private var effectiveMovie: Movie {
         var currentMovie = movie
         currentMovie.title = displayMovieTitle
@@ -514,6 +665,7 @@ struct EpisodeCardView: View {
     @Binding var currentVideoFileId: String?
     let localPoster: NSImage?
     let isCacheSupported: Bool
+    let isDetailCacheModeActive: Bool
     
     @AppStorage("appTheme") var appTheme = ThemeType.appleLight.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.appleLight.colors }
@@ -538,7 +690,7 @@ struct EpisodeCardView: View {
         let isDownloading = downloadProgress != nil
         
         VStack(alignment: .leading, spacing: 10) {
-            ZStack(alignment: .topTrailing) {
+            ZStack {
                 Button(action: { currentVideoFileId = ep.file.id }) {
                     ZStack {
                         EpisodeThumbnailView(
@@ -555,36 +707,32 @@ struct EpisodeCardView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }.buttonStyle(.plain)
 
-                HStack(spacing: 8) {
-                    if isHovering {
-                        Button(action: { showEditModal = true }) {
-                            Image(systemName: "pencil.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(.white)
-                                .shadow(radius: 3)
-                        }
-                        .buttonStyle(.plain)
-                        .transition(.opacity)
+                if isDetailCacheModeActive {
+                    Button(action: { cacheEpisode() }) {
+                        episodeCacheOverlayContent
                     }
-
-                    if cacheManager.isCacheModeActive {
-                        Button(action: {
-                            if isCached { cacheManager.deleteCache(fileId: ep.file.id, fileName: ep.file.fileName) }
-                            else if isCacheSupported && !isDownloading { cacheManager.startDownload(file: ep.file) }
-                        }) {
-                            ZStack {
-                                Circle().fill(theme.surface.opacity(0.85)).frame(width: 28, height: 28).shadow(color: .black.opacity(0.15), radius: 3)
-                                if isDownloading { ProgressView().progressViewStyle(CircularProgressViewStyle(tint: theme.accent)).scaleEffect(0.6) }
-                                else if isCached { Image(systemName: "checkmark.icloud.fill").font(.system(size: 14, weight: .bold)).foregroundColor(theme.accent) }
-                                else if !isCacheSupported { Image(systemName: "icloud.slash").font(.system(size: 14, weight: .bold)).foregroundColor(theme.textSecondary) }
-                                else { Image(systemName: "icloud.and.arrow.down").font(.system(size: 14, weight: .bold)).foregroundColor(theme.textPrimary) }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!isCacheSupported)
-                    }
+                    .buttonStyle(.plain)
+                    .disabled(!isCacheSupported || isDownloading || isCached)
                 }
-                .padding(8)
+
+                VStack {
+                    HStack(spacing: 8) {
+                        Spacer()
+                        if isHovering {
+                            Button(action: { showEditModal = true }) {
+                                Image(systemName: "pencil.circle.fill")
+                                    .font(.title2)
+                                    .foregroundColor(.white)
+                                    .shadow(radius: 3)
+                            }
+                            .buttonStyle(.plain)
+                            .transition(.opacity)
+                        }
+                    }
+                    .padding(8)
+                    Spacer()
+                }
+                .frame(width: cardWidth, height: thumbnailHeight)
             }
             .onHover { isHovering = $0 }
             
@@ -607,6 +755,34 @@ struct EpisodeCardView: View {
         .sheet(isPresented: $showEditModal) {
             EpisodeThumbnailEditModalView(movieId: movieId, movieTitle: $movieTitle, episode: ep)
         }
+    }
+
+    @ViewBuilder
+    private var episodeCacheOverlayContent: some View {
+        if let progress = cacheManager.downloadProgress[ep.file.id] {
+            OfflineCacheProgressBadge(progress: progress, tint: theme.accent)
+        } else {
+            ZStack {
+                Circle()
+                    .fill(Color.black.opacity(0.62))
+                    .frame(width: 52, height: 52)
+                Image(systemName: cacheManager.isCached(ep.file) ? "checkmark.circle.fill" : (!isCacheSupported ? "icloud.slash" : "arrow.down.circle.fill"))
+                    .font(.system(size: 25, weight: .bold))
+                    .foregroundColor(cacheManager.isCached(ep.file) ? theme.accent : .white)
+            }
+        }
+    }
+
+    private func cacheEpisode() {
+        guard isCacheSupported else {
+            cacheManager.cacheStatusMessage = "该媒体源暂不支持离线缓存"
+            return
+        }
+        guard !cacheManager.isCached(ep.file) else {
+            cacheManager.cacheStatusMessage = "《\(ep.file.fileName)》已在本地缓存中"
+            return
+        }
+        cacheManager.startDownload(file: ep.file)
     }
 }
 

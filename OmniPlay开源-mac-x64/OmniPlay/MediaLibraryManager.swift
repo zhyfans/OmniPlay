@@ -4,7 +4,86 @@ import SwiftUI
 
 extension Notification.Name { static let libraryUpdated = Notification.Name("OmniPlayLibraryUpdated") }
 
+enum LibraryUpdateUserInfoKey {
+    static let preferredVideoFileId = "preferredVideoFileId"
+}
+
 enum MediaNameParser {
+    struct BluRayStreamCandidate {
+        let fileName: String
+        let fileSize: Int64
+        let duration: Double
+    }
+
+    nonisolated static func bluRayStreamPlaybackSortKey(for fileName: String) -> (number: Int, name: String) {
+        let stem = ((fileName as NSString).lastPathComponent as NSString).deletingPathExtension
+        let numeric = Int(stem.trimmingCharacters(in: .whitespacesAndNewlines))
+        return (numeric ?? Int.max, fileName.lowercased())
+    }
+
+    nonisolated static func selectedBluRayStreamIndices(
+        from candidates: [BluRayStreamCandidate],
+        includeExtras: Bool
+    ) -> [Int] {
+        let ordered = candidates.indices.sorted { lhs, rhs in
+            let lhsKey = bluRayStreamPlaybackSortKey(for: candidates[lhs].fileName)
+            let rhsKey = bluRayStreamPlaybackSortKey(for: candidates[rhs].fileName)
+            if lhsKey.number != rhsKey.number { return lhsKey.number < rhsKey.number }
+            return lhsKey.name < rhsKey.name
+        }
+        guard !includeExtras else { return ordered }
+        guard !ordered.isEmpty else { return [] }
+
+        if let bySize = selectedBluRayMainFeatureIndices(
+            ordered: ordered,
+            candidates: candidates,
+            metric: { Double(max(0, $0.fileSize)) }
+        ) {
+            return bySize
+        }
+
+        if let byDuration = selectedBluRayMainFeatureIndices(
+            ordered: ordered,
+            candidates: candidates,
+            metric: { $0.duration >= 300 ? $0.duration : 0 }
+        ) {
+            return byDuration
+        }
+
+        return Array(ordered.prefix(1))
+    }
+
+    nonisolated private static func selectedBluRayMainFeatureIndices(
+        ordered: [Int],
+        candidates: [BluRayStreamCandidate],
+        metric: (BluRayStreamCandidate) -> Double
+    ) -> [Int]? {
+        let known = ordered.filter { metric(candidates[$0]) > 0 }
+        guard !known.isEmpty else { return nil }
+        let byMetric = known.sorted { lhs, rhs in
+            let lhsMetric = metric(candidates[lhs])
+            let rhsMetric = metric(candidates[rhs])
+            if lhsMetric != rhsMetric { return lhsMetric > rhsMetric }
+            let lhsKey = bluRayStreamPlaybackSortKey(for: candidates[lhs].fileName)
+            let rhsKey = bluRayStreamPlaybackSortKey(for: candidates[rhs].fileName)
+            if lhsKey.number != rhsKey.number { return lhsKey.number < rhsKey.number }
+            return lhsKey.name < rhsKey.name
+        }
+        guard let largest = byMetric.first else { return nil }
+        let largestMetric = metric(candidates[largest])
+        guard largestMetric > 0 else { return nil }
+        guard byMetric.count > 1 else { return [largest] }
+
+        let secondMetric = metric(candidates[byMetric[1]])
+        if secondMetric <= 0 || largestMetric >= secondMetric * 1.55 {
+            return [largest]
+        }
+
+        let clusterThreshold = largestMetric * 0.72
+        let cluster = ordered.filter { metric(candidates[$0]) >= clusterThreshold }
+        return cluster.isEmpty ? [largest] : cluster
+    }
+
     nonisolated static func cleanedTitleSource(from rawPath: String) -> String {
         var textToParse = rawPath
         if rawPath.contains("BDMV") || rawPath.hasSuffix(".m2ts") || rawPath.hasSuffix(".m2t") {
@@ -56,8 +135,6 @@ enum MediaNameParser {
             options: .regularExpression
         )
         
-        textToParse = truncateEpisodeDescriptor(from: textToParse)
-
         let extractedYear: String? = chooseReleaseYear(from: originalText) ?? chooseReleaseYear(from: textToParse)
         if let extractedYear {
             let removePattern = #"[ \.\-_\(\)\[\]\{\}【】（）《》「」『』〔〕〖〗]*\#(extractedYear)[ \.\-_\(\)\[\]\{\}【】（）《》「」『』〔〕〖〗]*"#
@@ -65,9 +142,12 @@ enum MediaNameParser {
                 textToParse = String(textToParse[..<cutRange.lowerBound])
             }
         }
+        textToParse = removeReleaseTitleNoise(textToParse)
         
         let cleanPatterns = [
-            #"(?i)\b(1080p|2160p|4k|720p|480p|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|aac|dts|hdr|dv)\b"#,
+            #"(?i)\b(1080p|2160p|4k|720p|480p|blu[- ]?ray|bluray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|vc[- ]?1|aac|dts[- ]?hd|dts|lpcm|truehd|hdr|dv)\b"#,
+            #"(?i)\b[sS]\d{1,2}\s*[-–~]\s*(?:[sS])?\d{1,2}\b"#,
+            #"(?i)\bseason\s*\d{1,2}\s*[-–~]\s*(?:season\s*)?\d{1,2}\b"#,
             #"(?i)\b[sS]\d{1,2}[eE][pP]?\d{1,3}\b"#,
             #"(?i)\bpart\s*\d+\b"#,
             #"(?i)\b[sS]\d{1,2}\b"#,
@@ -75,7 +155,9 @@ enum MediaNameParser {
             #"第\s*\d{1,3}\s*[集话]"#,
             #"(?i)\bseason\s*\d{1,2}\b"#,
             #"(?i)\b\d{1,2}bit\b"#,
-            #"(?i)\b(aac|ac3|eac3|ddp|dts|truehd|flac|mp3)\d*(\.\d+)?\b"#,
+            #"(?i)\b(aac|ac3|eac3|ddp|dts|dts[- ]?hd|truehd|lpcm|flac|mp3)\d*(\.\d+)?\b"#,
+            #"(?i)\b(ma|hi10p|10bit|8bit)\b"#,
+            #"(?i)\b(usa|ger|gbr|uk|jpn|jap|kor|chn|hkg|tw|fr|fra|ita|esp|rus|can|aus)\b"#,
             #"(?i)\b(bonus|extras?|featurette|behind[- ]?the[- ]?scenes|trailer|sample)\b"#,
             #"(?i)\b(disc|disk|cd|dvd)\b"#,
             #"(?i)\b(disc|disk|cd|dvd)\s*[-_ ]?\d{1,2}\b"#,
@@ -94,6 +176,8 @@ enum MediaNameParser {
         }
         
         textToParse = textToParse.replacingOccurrences(of: #"[._]+"#, with: " ", options: .regularExpression)
+        textToParse = textToParse.replacingOccurrences(of: #"(?i)(?:\s*[-–—:]\s*|\s+)the\s+movie\s*$"#, with: "", options: .regularExpression)
+        textToParse = textToParse.replacingOccurrences(of: #"^[\s._\-–—:]+"#, with: "", options: .regularExpression)
         textToParse = textToParse.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)"#, with: " ", options: .regularExpression)
         textToParse = textToParse.replacingOccurrences(of: #"[【】（）《》「」『』〔〕〖〗]"#, with: " ", options: .regularExpression)
         textToParse = textToParse.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
@@ -257,6 +341,9 @@ enum MediaNameParser {
     }
 
     nonisolated static func parsePreferredSeason(from rawPath: String) -> Int? {
+        if let value = parseMultiSeasonRangeStart(from: rawPath), value > 0 {
+            return value
+        }
         if let match = rawPath.range(of: #"[sS](\d{1,2})(?!\d)"#, options: .regularExpression) {
             let text = String(rawPath[match]).uppercased().replacingOccurrences(of: "S", with: "")
             if let value = Int(text), value > 0 { return value }
@@ -274,12 +361,57 @@ enum MediaNameParser {
     }
 
     nonisolated static func resolvePreferredSeason(from rawPath: String, fileName: String, fallbackIndex: Int = 0) -> Int? {
+        if let value = parseMultiSeasonRangeStart(from: rawPath), value > 0 {
+            return value
+        }
         let parsed = parseEpisodeInfo(from: fileName, fallbackIndex: fallbackIndex)
         if parsed.isTVShow, parsed.season > 0 {
-            // 文件名中的 SxxEyy 优先级最高，避免目录里的 S01-11 干扰。
+            // 普通单季目录按文件名 SxxEyy 定位；多季合集已在上面取合集最小季。
             return parsed.season
         }
         return parsePreferredSeason(from: rawPath)
+    }
+
+    nonisolated static func parseMultiSeasonRangeStart(from rawPath: String) -> Int? {
+        let components = rawPath
+            .components(separatedBy: "/")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let searchableComponents = components.count > 1 ? Array(components.dropLast()) : components
+        for component in searchableComponents.reversed() {
+            if let value = seasonRangeStart(in: component), value > 0 {
+                return value
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func seasonRangeStart(in text: String) -> Int? {
+        let patterns = [
+            #"(?i)\bS\d{1,2}\s*[-–~]\s*(?:S)?\d{1,2}\b"#,
+            #"(?i)\bseason\s*\d{1,2}\s*[-–~]\s*(?:season\s*)?\d{1,2}\b"#
+        ]
+        for pattern in patterns {
+            if let match = text.range(of: pattern, options: .regularExpression) {
+                let matched = String(text[match])
+                if let numberRange = matched.range(of: #"\d{1,2}"#, options: .regularExpression),
+                   let value = Int(String(matched[numberRange])) {
+                    return value
+                }
+            }
+        }
+
+        if let match = text.range(of: #"第\s*[一二三四五六七八九十零〇两\d]{1,3}\s*[-–~至到]\s*[一二三四五六七八九十零〇两\d]{1,3}\s*季"#, options: .regularExpression) {
+            let matched = String(text[match])
+                .replacingOccurrences(of: "第", with: "")
+                .replacingOccurrences(of: "季", with: "")
+            let separators = CharacterSet(charactersIn: "-–~至到")
+            let first = matched.components(separatedBy: separators).first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if let value = Int(first) { return value }
+            if let value = chineseNumberToInt(first) { return value }
+        }
+        return nil
     }
     
     nonisolated static func isLikelyTVEpisodePath(_ rawPath: String) -> Bool {
@@ -384,7 +516,7 @@ enum MediaNameParser {
             "remux", "avc", "hevc", "hdr", "dv", "dovi", "sdr", "hdr10", "hdr10plus",
             "aac", "ac3", "eac3", "ddp", "dts", "truehd", "atmos", "flac", "mp3", "opus",
             "nf", "netflix", "amzn", "amazon", "dsnp", "disney", "hulu", "atvp", "max",
-            "cmctv", "hhweb", "hdsky", "baha", "friday", "bglobal", "b-global", "complete",
+            "cmctv", "cctv", "mweb", "adweb", "tx", "hhweb", "hdsky", "baha", "friday", "bglobal", "b-global", "complete",
             "proper", "repack", "internal"
         ]
         return metadataTokens.contains(lower)
@@ -425,7 +557,19 @@ enum MediaNameParser {
             .joined()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let merged, !merged.isEmpty else { return nil }
-        return merged
+        return trimChineseSupplementTitle(merged)
+    }
+
+    nonisolated private static func trimChineseSupplementTitle(_ input: String) -> String {
+        let markers = ["特典", "特別收錄", "特别收录", "特別收录", "花絮", "幕后", "幕後", "附赠", "附贈", "预告片", "預告片", "样片", "樣片"]
+        for marker in markers {
+            guard let range = input.range(of: marker) else { continue }
+            let prefix = String(input[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if prefix.count >= 2 {
+                return prefix
+            }
+        }
+        return input
     }
 
     nonisolated private static func isGenericDiscOrVolumeFolder(_ input: String) -> Bool {
@@ -442,21 +586,32 @@ enum MediaNameParser {
             "vol", "volume", "disc", "disk", "cd", "part", "bonus", "extra", "extras",
             "featurette", "trailer", "sample", "cmctv", "bdrom", "bdmv", "special", "features", "anniversary", "edition"
         ]
-        let filtered = tokens.filter { token in
+        let leadingNumericTitleIndexes: Set<Int> = {
+            var indexes: [Int] = []
+            for (index, token) in tokens.enumerated() {
+                guard token.range(of: #"^\d{1,2}$"#, options: .regularExpression) != nil else { break }
+                indexes.append(index)
+            }
+            return indexes.count >= 2 ? Set(indexes) : []
+        }()
+        let filtered = tokens.enumerated().compactMap { index, token -> String? in
             let lower = token.lowercased()
-            if noiseTokens.contains(lower) { return false }
-            if lower.hasPrefix("-") || lower.hasSuffix("-") { return false }
-            if lower.range(of: #"^\d+$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^(disc|disk|cd|dvd)$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^(disc|disk|cd|dvd)[-_ ]?\d{1,2}$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^(vol|volume)[-_ ]?\d{1,2}([\-–]\d{1,2})?$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^[se]\d{1,3}$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^(x|h)?26[45]$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^(aac|ac3|eac3|ddp|dts|truehd|flac|mp3)\d*(\.\d+)?$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^\d{1,2}bit$"#, options: .regularExpression) != nil { return false }
-            if lower.range(of: #"^cctv\d*k?$"#, options: .regularExpression) != nil { return false }
-            return token.range(of: #"\p{Han}"#, options: .regularExpression) == nil &&
-                token.range(of: #"^[\p{L}0-9'&:+-]+$"#, options: .regularExpression) != nil
+            if noiseTokens.contains(lower) { return nil }
+            if lower.hasPrefix("-") || lower.hasSuffix("-") { return nil }
+            if lower.range(of: #"^\d+$"#, options: .regularExpression) != nil && !leadingNumericTitleIndexes.contains(index) { return nil }
+            if lower.range(of: #"^(disc|disk|cd|dvd)$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^(disc|disk|cd|dvd)[-_ ]?\d{1,2}$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^(vol|volume)[-_ ]?\d{1,2}([\-–]\d{1,2})?$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^[se]\d{1,3}$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^(x|h)?26[45]$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^(aac|ac3|eac3|ddp|dts|truehd|flac|mp3)\d*(\.\d+)?$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^\d{1,2}bit$"#, options: .regularExpression) != nil { return nil }
+            if lower.range(of: #"^cctv\d*k?$"#, options: .regularExpression) != nil { return nil }
+            guard token.range(of: #"\p{Han}"#, options: .regularExpression) == nil,
+                  token.range(of: #"^[\p{L}0-9'&:+-]+$"#, options: .regularExpression) != nil else {
+                return nil
+            }
+            return token
         }
         let merged = filtered.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !merged.isEmpty else { return nil }
@@ -465,6 +620,35 @@ enum MediaNameParser {
             return nil
         }
         return merged
+    }
+
+    nonisolated private static func removeReleaseTitleNoise(_ input: String) -> String {
+        var normalized = input
+            .replacingOccurrences(of: #"[._]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let supplementTrimmed = trimChineseSupplementTitle(normalized)
+        if supplementTrimmed != normalized {
+            return supplementTrimmed
+        }
+
+        normalized = normalized.replacingOccurrences(
+            of: #"(?i)^(?:disc|disk|cd|dvd|vol|volume)\s*\d{0,2}\s*[-–—:]+\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        normalized = normalized.replacingOccurrences(of: #"^[\s._\-–—:]+"#, with: "", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(of: #"(?i)\b(?:cctv4k|cctv)\b"#, with: " ", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(of: #"(?i)\bepisode\s*\d{1,3}\b"#, with: " ", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(of: #"(剧场版|纪念版|花絮|特典|番外|幕后花絮)"#, with: " ", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(
+            of: #"(?i)(?:\s*[-–—:]\s*|\s+)the\s+movie\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return normalized
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     nonisolated private static func truncateBeforeReleaseMetadata(_ input: String) -> String {
@@ -705,7 +889,11 @@ class MediaLibraryManager {
     }
     
     // 🌟 核心升级：3轮递进式自动刮削引擎
-    func processUnmatchedFiles(sourceID: Int64? = nil, placeholderMovieID: Int64? = nil) async throws {
+    func processUnmatchedFiles(
+        sourceID: Int64? = nil,
+        placeholderMovieID: Int64? = nil,
+        exposeFailures: Bool = true
+    ) async throws {
         let unmatchedFiles = try await dbQueue.read { db in
             if let sourceID, let placeholderMovieID {
                 return try VideoFile.fetchAll(
@@ -801,8 +989,7 @@ class MediaLibraryManager {
                 fileName: file.fileName,
                 fallbackIndex: 0
             )
-            let shouldApplyYearFilter = !((preferredMediaType?.lowercased() == "tv") || preferredSeason != nil)
-            let yearForSearch = shouldApplyYearFilter ? targetYear : nil
+            let yearForSearch = targetYear
             
             print("\n🎬 正在处理文件: \(file.fileName)")
             
@@ -942,23 +1129,130 @@ class MediaLibraryManager {
             
         }
 
+        if exposeFailures {
+            try await exposeRemainingUnmatchedFiles(sourceID: sourceID, placeholderMovieID: placeholderMovieID)
+        }
+
         await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
+    }
+
+    private func exposeRemainingUnmatchedFiles(sourceID: Int64?, placeholderMovieID: Int64?) async throws {
+        try await dbQueue.write { db in
+            let files: [VideoFile]
+            if let sourceID, let placeholderMovieID {
+                files = try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.sourceId = ?
+                      AND videoFile.movieId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [sourceID, placeholderMovieID]
+                )
+            } else if let sourceID {
+                files = try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.sourceId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [sourceID]
+                )
+            } else if let placeholderMovieID {
+                files = try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND videoFile.movieId = ?
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """,
+                    arguments: [placeholderMovieID]
+                )
+            } else {
+                files = try VideoFile.fetchAll(
+                    db,
+                    sql: """
+                    SELECT videoFile.*
+                    FROM videoFile
+                    JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+                    WHERE videoFile.mediaType = 'unmatched'
+                      AND COALESCE(mediaSource.isEnabled, 1) = 1
+                    """
+                )
+            }
+
+            let failedMovieIDs = Set(files.compactMap(\.movieId))
+            guard !failedMovieIDs.isEmpty else { return }
+
+            for movieID in failedMovieIDs {
+                guard var movie = try Movie.fetchOne(db, key: movieID) else { continue }
+                movie.overview = "未能自动刮削，可手动重新匹配。"
+                movie.isLocked = true
+                try movie.update(db)
+            }
+
+            for var file in files {
+                file.mediaType = "movie"
+                try file.update(db)
+            }
+        }
     }
 
     private func representativeUnmatchedFiles(from files: [VideoFile]) -> [VideoFile] {
         var seenKeys = Set<String>()
         var representatives: [VideoFile] = []
-        let sortedFiles = files.sorted {
-            if $0.sourceId != $1.sourceId { return $0.sourceId < $1.sourceId }
-            return $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
-        }
+        let sortedFiles = files.enumerated().sorted { lhs, rhs in
+            let lhsKey = representativeScrapeSortKey(for: lhs.element, fallbackIndex: lhs.offset)
+            let rhsKey = representativeScrapeSortKey(for: rhs.element, fallbackIndex: rhs.offset)
+            if lhsKey.sourceId != rhsKey.sourceId { return lhsKey.sourceId < rhsKey.sourceId }
+            if lhsKey.groupKey != rhsKey.groupKey { return lhsKey.groupKey < rhsKey.groupKey }
+            if lhsKey.season != rhsKey.season { return lhsKey.season < rhsKey.season }
+            if lhsKey.episode != rhsKey.episode { return lhsKey.episode < rhsKey.episode }
+            return lhsKey.path.localizedStandardCompare(rhsKey.path) == .orderedAscending
+        }.map(\.element)
         for file in sortedFiles {
-            let groupKey = file.movieId.map { "movie:\($0)" } ?? "file:\(file.id)"
+            let groupKey = representativeGroupKey(for: file)
             guard !seenKeys.contains(groupKey) else { continue }
             seenKeys.insert(groupKey)
             representatives.append(file)
         }
         return representatives
+    }
+
+    private func representativeGroupKey(for file: VideoFile) -> String {
+        file.movieId.map { "movie:\($0)" } ?? "file:\(file.id)"
+    }
+
+    private func representativeScrapeSortKey(
+        for file: VideoFile,
+        fallbackIndex: Int
+    ) -> (sourceId: Int64, groupKey: String, season: Int, episode: Int, path: String) {
+        let preferredSeason = MediaNameParser.resolvePreferredSeason(
+            from: file.relativePath,
+            fileName: file.fileName,
+            fallbackIndex: fallbackIndex
+        )
+        let parsed = MediaNameParser.parseEpisodeInfo(from: file.fileName, fallbackIndex: fallbackIndex)
+        let season = preferredSeason ?? (parsed.isTVShow ? parsed.season : Int.max)
+        let seasonRank = season == 0 ? Int.max : season
+        return (
+            sourceId: file.sourceId,
+            groupKey: representativeGroupKey(for: file),
+            season: seasonRank,
+            episode: parsed.episode,
+            path: file.relativePath
+        )
     }
     
     private func saveScrapingResult(_ tmdbResult: TMDBResult, for file: VideoFile) async throws {
@@ -1263,6 +1557,13 @@ enum MediaSourceScanDiagnosticsFormatter {
 private struct ScannedMediaFile {
     let relativePath: String
     let fileName: String
+    let fileSize: Int64
+
+    nonisolated init(relativePath: String, fileName: String, fileSize: Int64 = 0) {
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.fileSize = fileSize
+    }
 }
 
 private struct LocalSidecarImport {
@@ -2203,39 +2504,50 @@ private struct LocalFilesystemScanner: MediaSourceScanner {
         }
 
         let exts = ["mp4", "mkv", "mov", "avi", "rmvb", "flv", "webm", "m2ts", "ts", "iso", "m4v", "wmv"]
-        var bdmvGroups: [String: [(url: URL, size: Int)]] = [:]
-        var normalFiles: [URL] = []
+        let includeBluRayExtras = UserDefaults.standard.bool(forKey: "playBluRayExtras")
+        var bdmvGroups: [String: [(url: URL, size: Int64)]] = [:]
+        var normalFiles: [(url: URL, size: Int64)] = []
 
         while let fileURL = enumerator.nextObject() as? URL {
             if Task.isCancelled { return [] }
             if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { continue }
 
             if exts.contains(fileURL.pathExtension.lowercased()) {
-                if fileURL.path.contains("BDMV/STREAM") {
-                    let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-                    let comps = fileURL.pathComponents
-                    if let idx = comps.firstIndex(of: "BDMV") {
-                        let parent = comps[0..<idx].joined(separator: "/")
-                        bdmvGroups[parent, default: []].append((url: fileURL, size: size))
+                let comps = fileURL.pathComponents
+                if let idx = comps.firstIndex(where: { $0.caseInsensitiveCompare("BDMV") == .orderedSame }) {
+                    guard comps.indices.contains(idx + 1),
+                          comps[idx + 1].caseInsensitiveCompare("STREAM") == .orderedSame else {
+                        continue
                     }
+                    let size = Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                    let parent = comps[0..<idx].joined(separator: "/")
+                    bdmvGroups[parent, default: []].append((url: fileURL, size: size))
                 } else {
-                    normalFiles.append(fileURL)
+                    let size = Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                    normalFiles.append((url: fileURL, size: size))
                 }
             }
         }
 
-        var resolved: [URL] = normalFiles
+        var resolved = normalFiles
         for (_, files) in bdmvGroups {
-            let maxSize = files.map { $0.size }.max() ?? 0
-            if maxSize > 0 {
-                let threshold = Double(maxSize) * 0.3
-                resolved.append(contentsOf: files.filter { Double($0.size) >= threshold }.map { $0.url })
+            let candidates = files.map {
+                MediaNameParser.BluRayStreamCandidate(
+                    fileName: $0.url.lastPathComponent,
+                    fileSize: $0.size,
+                    duration: 0
+                )
             }
+            let selectedIndexes = MediaNameParser.selectedBluRayStreamIndices(
+                from: candidates,
+                includeExtras: includeBluRayExtras
+            )
+            resolved.append(contentsOf: selectedIndexes.map { files[$0] })
         }
 
-        return resolved.map { url in
-            let relativePath = url.path.replacingOccurrences(of: rootPathPrefix, with: "")
-            return ScannedMediaFile(relativePath: relativePath, fileName: url.lastPathComponent)
+        return resolved.map { item in
+            let relativePath = item.url.path.replacingOccurrences(of: rootPathPrefix, with: "")
+            return ScannedMediaFile(relativePath: relativePath, fileName: item.url.lastPathComponent, fileSize: item.size)
         }
     }
 }
@@ -2360,6 +2672,7 @@ private struct WebDAVScanner: MediaSourceScanner {
         var visitedDirectories: Set<String> = []
         var normalFiles: [ScannedMediaFile] = []
         var bdmvGroups: [String: [(file: ScannedMediaFile, size: Int64)]] = [:]
+        let includeBluRayExtras = UserDefaults.standard.bool(forKey: "playBluRayExtras")
 
         while let directoryURL = pendingDirectories.first {
             if Task.isCancelled { return [] }
@@ -2385,15 +2698,16 @@ private struct WebDAVScanner: MediaSourceScanner {
                 let ext = (fileName as NSString).pathExtension.lowercased()
                 guard extSet.contains(ext) else { continue }
 
-                let file = ScannedMediaFile(relativePath: relativePath, fileName: fileName)
-                if relativePath.contains("BDMV/STREAM") {
-                    let components = relativePath.components(separatedBy: "/")
-                    if let bdmvIndex = components.firstIndex(of: "BDMV"), bdmvIndex > 0 {
-                        let parent = components[0..<bdmvIndex].joined(separator: "/")
-                        bdmvGroups[parent, default: []].append((file: file, size: max(0, entry.contentLength)))
-                    } else {
-                        normalFiles.append(file)
+                let file = ScannedMediaFile(relativePath: relativePath, fileName: fileName, fileSize: max(0, entry.contentLength))
+                let components = relativePath.components(separatedBy: "/")
+                if let bdmvIndex = components.firstIndex(where: { $0.caseInsensitiveCompare("BDMV") == .orderedSame }) {
+                    guard components.indices.contains(bdmvIndex + 1),
+                          components[bdmvIndex + 1].caseInsensitiveCompare("STREAM") == .orderedSame,
+                          bdmvIndex > 0 else {
+                        continue
                     }
+                    let parent = components[0..<bdmvIndex].joined(separator: "/")
+                    bdmvGroups[parent, default: []].append((file: file, size: max(0, entry.contentLength)))
                 } else {
                     normalFiles.append(file)
                 }
@@ -2402,13 +2716,18 @@ private struct WebDAVScanner: MediaSourceScanner {
 
         var resolved = normalFiles
         for (_, files) in bdmvGroups {
-            let maxSize = files.map(\.size).max() ?? 0
-            if maxSize > 0 {
-                let threshold = Double(maxSize) * 0.3
-                resolved.append(contentsOf: files.filter { Double($0.size) >= threshold }.map(\.file))
-            } else {
-                resolved.append(contentsOf: files.map(\.file))
+            let candidates = files.map {
+                MediaNameParser.BluRayStreamCandidate(
+                    fileName: $0.file.fileName,
+                    fileSize: $0.size,
+                    duration: 0
+                )
             }
+            let selectedIndexes = MediaNameParser.selectedBluRayStreamIndices(
+                from: candidates,
+                includeExtras: includeBluRayExtras
+            )
+            resolved.append(contentsOf: selectedIndexes.map { files[$0].file })
         }
 
         return resolved
@@ -3036,6 +3355,24 @@ extension MediaLibraryManager {
             removedCount = sourceAndRemoval.removed
 
             let existingPathSet = Set(existingFiles.filter { scannedPathSet.contains($0.relativePath) }.map(\.relativePath))
+            let scannedByPath = Dictionary(uniqueKeysWithValues: scannedFiles.map { ($0.relativePath, $0) })
+            try await dbQueue.write { db in
+                for var existingFile in existingFiles {
+                    guard let scanned = scannedByPath[existingFile.relativePath] else { continue }
+                    var shouldUpdate = false
+                    if scanned.fileSize > 0, existingFile.fileSize != scanned.fileSize {
+                        existingFile.fileSize = scanned.fileSize
+                        shouldUpdate = true
+                    }
+                    if existingFile.fileName != scanned.fileName {
+                        existingFile.fileName = scanned.fileName
+                        shouldUpdate = true
+                    }
+                    if shouldUpdate {
+                        try existingFile.update(db)
+                    }
+                }
+            }
             let pendingGroups = buildPendingMediaGroups(
                 from: scannedFiles,
                 sourceId: sourceId,
@@ -3309,7 +3646,8 @@ extension MediaLibraryManager {
                     movieId: group.fakeMovieId,
                     episodeId: nil,
                     playProgress: 0.0,
-                    duration: 0.0
+                    duration: 0.0,
+                    fileSize: item.file.fileSize
                 )
                 try newVideo.insert(db)
                 if let thumbnailPath = item.sidecar?.episodeMetadata?.thumbnailPath {

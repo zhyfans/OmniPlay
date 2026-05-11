@@ -57,6 +57,11 @@ enum TMDBCredentialSource: Equatable {
     }
 }
 
+struct TMDBConnectionCheckResult {
+    let isConnected: Bool
+    let message: String
+}
+
 class TMDBService {
     static let shared = TMDBService()
     static let publicSourceDefaultsKey = "tmdbUsePublicSource"
@@ -101,6 +106,31 @@ class TMDBService {
 
     func currentCredentialSource() -> TMDBCredentialSource {
         Self.credentialSource()
+    }
+
+    func checkConnection(customAPIInput: String? = nil) async -> TMDBConnectionCheckResult {
+        let credential = Self.credentialSource(customAPIInput: customAPIInput)
+        guard credential.isAvailable else {
+            return TMDBConnectionCheckResult(isConnected: false, message: "当前未配置可用的 TMDB API。")
+        }
+
+        let urlString = "\(baseURL)/configuration"
+        guard let request = makeRequest(urlString: urlString, credential: credential) else {
+            return TMDBConnectionCheckResult(isConnected: false, message: "TMDB 请求地址无效。")
+        }
+
+        do {
+            let (_, response) = try await tmdbSession.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return TMDBConnectionCheckResult(isConnected: false, message: "TMDB 未返回有效响应。")
+            }
+            if http.statusCode == 200 {
+                return TMDBConnectionCheckResult(isConnected: true, message: "TMDB 连接正常。")
+            }
+            return TMDBConnectionCheckResult(isConnected: false, message: "TMDB 返回 HTTP \(http.statusCode)。")
+        } catch {
+            return TMDBConnectionCheckResult(isConnected: false, message: error.localizedDescription)
+        }
     }
     
     // 🌟 自动刮削调用入口（带年份参数）

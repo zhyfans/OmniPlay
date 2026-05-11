@@ -189,6 +189,7 @@ struct PosterWallView: View {
     @State private var isProcessing = false
     @State private var processingMessage = ""
     @State private var showSettings = false
+    @State private var settingsFocusTMDBApi = false
     @State private var mediaSources: [MediaSource] = []
     
     // 删除了关于网络别名的复杂状态变量
@@ -197,6 +198,7 @@ struct PosterWallView: View {
     @State private var isShowingRenameSourceSheet = false
     @State private var sourceToRename: MediaSource? = nil
     @State private var renamingSourceName: String = ""
+    @State private var isShowingManualRemoteSourceSheet = false
     @State private var isShowingAddWebDAVSheet = false
     @State private var webDAVName: String = ""
     @State private var webDAVBaseURL: String = ""
@@ -258,6 +260,10 @@ struct PosterWallView: View {
     @State private var sourcePendingRemoval: MediaSource? = nil
     @State private var isLoadingLibraryData = false
     @State private var needsLibraryReloadAfterCurrentLoad = false
+    @State private var hasPerformedStartupTMDBCheck = false
+    @State private var isShowingTMDBConnectionAlert = false
+    @State private var tmdbConnectionMessage = ""
+    @State private var isHomeCacheModeActive = false
     
     // 🌟 彻底删除了所有与 network 相关的 State
     
@@ -305,9 +311,18 @@ struct PosterWallView: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 20) {
                                         ForEach(continueWatchingMovies, id: \.id) { movie in
-                                            NavigationLink(destination: MovieDetailView(movie: movie)) {
-                                                MovieCardView(movie: movie, isContinueWatchingContext: true).frame(width: 160)
-                                            }.buttonStyle(.plain)
+                                            if isHomeCacheModeActive {
+                                                MovieCardView(
+                                                    movie: movie,
+                                                    isContinueWatchingContext: true,
+                                                    isHomeCacheModeActive: isHomeCacheModeActive
+                                                )
+                                                .frame(width: 160)
+                                            } else {
+                                                NavigationLink(destination: MovieDetailView(movie: movie)) {
+                                                    MovieCardView(movie: movie, isContinueWatchingContext: true).frame(width: 160)
+                                                }.buttonStyle(.plain)
+                                            }
                                         }
                                     }.padding(.horizontal, 25)
                                 }
@@ -340,7 +355,13 @@ struct PosterWallView: View {
                             
                             LazyVGrid(columns: columns, spacing: 30) {
                                 ForEach(displayedMovies, id: \.id) { movie in
-                                    NavigationLink(destination: MovieDetailView(movie: movie)) { MovieCardView(movie: movie) }.buttonStyle(.plain)
+                                    if isHomeCacheModeActive {
+                                        MovieCardView(movie: movie, isHomeCacheModeActive: isHomeCacheModeActive)
+                                    } else {
+                                        NavigationLink(destination: MovieDetailView(movie: movie)) {
+                                            MovieCardView(movie: movie)
+                                        }.buttonStyle(.plain)
+                                    }
                                 }
                             }.padding(.horizontal, 25).padding(.bottom, 25).animation(.easeInOut, value: displayedMovies.count)
                         }
@@ -403,16 +424,19 @@ struct PosterWallView: View {
                     .disabled(isProcessing)
                     .conditionalHelp("重新扫描目录并刷新刮削结果", show: enableFastTooltip)
                     
-                    Button(action: { withAnimation { OfflineCacheManager.shared.isCacheModeActive.toggle() } }) {
-                        Image(systemName: OfflineCacheManager.shared.isCacheModeActive ? "icloud.fill" : "icloud")
+                    Button(action: { withAnimation { isHomeCacheModeActive.toggle() } }) {
+                        Image(systemName: isHomeCacheModeActive ? "icloud.fill" : "icloud")
                             .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(OfflineCacheManager.shared.isCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
+                            .foregroundColor(isHomeCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
                     .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
 
-                    Button(action: { showSettings = true }) {
+                    Button(action: {
+                        settingsFocusTMDBApi = false
+                        showSettings = true
+                    }) {
                         Image(systemName: "gearshape")
                             .font(.system(size: 21, weight: .medium))
                             .foregroundColor(topToolbarInactiveIconColor)
@@ -426,9 +450,15 @@ struct PosterWallView: View {
                 .padding(.top, 10)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity).navigationTitle("我的觅影库")
-            .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showSettings) {
+                SettingsView(focusTMDBApi: settingsFocusTMDBApi)
+                    .onDisappear { settingsFocusTMDBApi = false }
+            }
             .sheet(isPresented: $isShowingRenameSourceSheet) {
                 renameSourceSheet()
+            }
+            .sheet(isPresented: $isShowingManualRemoteSourceSheet) {
+                manualRemoteSourceSheet()
             }
             .sheet(isPresented: $isShowingWebDAVPreScanLoginSheet) {
                 webDAVPreScanLoginSheet()
@@ -442,6 +472,19 @@ struct PosterWallView: View {
             .sheet(isPresented: $isShowingRemoveSourceSheet) {
                 removeSourceSheet()
             }
+            .alert("TMDB API 无法连接", isPresented: $isShowingTMDBConnectionAlert) {
+                Button("不添加直接扫描") {
+                    triggerScanAndScrape(skipTMDBScrape: true)
+                }
+                Button("关闭", role: .cancel) {
+                    settingsFocusTMDBApi = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        showSettings = true
+                    }
+                }
+            } message: {
+                Text("建议添加自己的 TMDB API 后再刮削海报与影视信息。\n\(tmdbConnectionMessage)")
+            }
             // 🌟 彻底删除了那个恶心的 SMB/WebDAV Sheet 弹窗！
         }
         .onAppear {
@@ -450,10 +493,8 @@ struct PosterWallView: View {
                 prepareManualWebDAVBrowserLogin()
                 isShowingWebDAVPreScanLoginSheet = true
             }
-            if autoScanOnStartup {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if !isProcessing { triggerScanAndScrape() }
-                }
+            if autoScanOnStartup && ProcessInfo.processInfo.environment["UITEST_MODE"] != "1" {
+                scheduleStartupTMDBPreflight()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .libraryUpdated)) { _ in
@@ -596,25 +637,13 @@ struct PosterWallView: View {
                 
                 Button(action: {
                     isShowingManageSources = false
-                    prepareManualWebDAVBrowserLogin()
-                    isShowingWebDAVPreScanLoginSheet = true
+                    isShowingManualRemoteSourceSheet = true
                 }) {
-                    Label("添加 WebDAV 媒体源", systemImage: "network")
+                    Label("WebDAV/媒体服务器", systemImage: "network.badge.shield.half.filled")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
-                .accessibilityIdentifier("menu.addWebDAV")
-
-                Button(action: {
-                    isShowingManageSources = false
-                    resetMediaServerForm()
-                    isShowingMediaServerSheet = true
-                }) {
-                    Label("添加 Plex/Emby/Jellyfin", systemImage: "server.rack")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("menu.addMediaServer")
+                .accessibilityIdentifier("menu.addRemoteSource")
             }
 
             Divider()
@@ -851,6 +880,45 @@ struct PosterWallView: View {
         .frame(width: 420)
     }
 
+    private func manualRemoteSourceSheet() -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("WebDAV/媒体服务器")
+                .font(.title3.bold())
+            Text("选择要手动连接的远程媒体源类型。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Button {
+                isShowingManualRemoteSourceSheet = false
+                prepareManualWebDAVBrowserLogin()
+                isShowingWebDAVPreScanLoginSheet = true
+            } label: {
+                Label("WebDAV", systemImage: "network")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                isShowingManualRemoteSourceSheet = false
+                resetMediaServerForm()
+                isShowingMediaServerSheet = true
+            } label: {
+                Label("Plex/Emby/Jellyfin", systemImage: "server.rack")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            HStack {
+                Spacer()
+                Button("取消") {
+                    isShowingManualRemoteSourceSheet = false
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+
     private func removeSourceSheet() -> some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("移除媒体源")
@@ -936,6 +1004,51 @@ struct PosterWallView: View {
             webDAVPassword = ""
         }
         if shouldBumpUsage { bumpHistoryUsage(for: item.id) }
+    }
+
+    private func applyRecentWebDAVHistoryToBrowser(_ item: RecentWebDAVHistoryItem, shouldBumpUsage: Bool, replaceBaseURL: Bool) {
+        if item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let host = URL(string: item.baseURL)?.host,
+           webDAVBrowserName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            webDAVBrowserName = host
+        } else if !item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  webDAVBrowserName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || replaceBaseURL {
+            webDAVBrowserName = item.name
+        }
+        if replaceBaseURL {
+            webDAVBrowserBaseURL = readableWebDAVURL(from: item.baseURL)
+        }
+        webDAVBrowserUsername = item.username
+        webDAVBrowserCredentialID = item.credentialID
+        if let credentialID = item.credentialID,
+           let credential = WebDAVCredentialStore.shared.loadCredential(id: credentialID) {
+            webDAVBrowserUsername = credential.username
+            webDAVBrowserPassword = credential.password
+        } else {
+            webDAVBrowserPassword = ""
+        }
+        if shouldBumpUsage { bumpHistoryUsage(for: item.id) }
+    }
+
+    private func matchingRecentWebDAVHistory(for baseURL: String) -> RecentWebDAVHistoryItem? {
+        let normalizedURL = normalizedWebDAVBrowserURL(baseURL)
+        let sorted = recentWebDAVHistory.sorted(by: { $0.lastUsed > $1.lastUsed })
+        if let exact = sorted.first(where: { normalizedWebDAVBrowserURL($0.baseURL) == normalizedURL }) {
+            return exact
+        }
+        return sorted.first { isSameWebDAVEndpoint($0.baseURL, normalizedURL) }
+    }
+
+    nonisolated private func isSameWebDAVEndpoint(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = URL(string: MediaSourceProtocol.webdav.normalizedBaseURL(lhs)),
+              let right = URL(string: MediaSourceProtocol.webdav.normalizedBaseURL(rhs)),
+              let leftHost = left.host?.lowercased(),
+              let rightHost = right.host?.lowercased(),
+              leftHost == rightHost else {
+            return false
+        }
+        return left.scheme?.lowercased() == right.scheme?.lowercased()
+            && left.port == right.port
     }
 
     private func bumpHistoryUsage(for id: UUID) {
@@ -1169,6 +1282,7 @@ struct PosterWallView: View {
     }
 
     private func prepareManualWebDAVBrowserLogin() {
+        recentWebDAVHistory = PosterWallView.loadRecentWebDAVHistory()
         webDAVBrowserName = ""
         webDAVBrowserBaseURL = ""
         webDAVBrowserUsername = ""
@@ -1184,11 +1298,18 @@ struct PosterWallView: View {
         webDAVBrowserIsLoading = false
         webDAVBrowserIsBatchMounting = false
         webDAVBrowserStarredFolders = []
+        if let latest = recentWebDAVHistory.sorted(by: { $0.lastUsed > $1.lastUsed }).first {
+            applyRecentWebDAVHistoryToBrowser(latest, shouldBumpUsage: false, replaceBaseURL: true)
+        } else if let snapshot = fetchLatestWebDAVSourceSnapshot() {
+            applyRecentWebDAVHistoryToBrowser(snapshot, shouldBumpUsage: false, replaceBaseURL: true)
+        }
     }
 
     private func prepareWebDAVBrowserLogin(for device: DiscoveredDevice) {
+        let deviceURL = discoveredDeviceURLString(for: device)
+        recentWebDAVHistory = PosterWallView.loadRecentWebDAVHistory()
         webDAVBrowserName = device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name
-        webDAVBrowserBaseURL = discoveredDeviceURLString(for: device)
+        webDAVBrowserBaseURL = deviceURL
         webDAVBrowserUsername = ""
         webDAVBrowserPassword = ""
         webDAVBrowserCredentialID = nil
@@ -1202,6 +1323,9 @@ struct PosterWallView: View {
         webDAVBrowserIsLoading = false
         webDAVBrowserIsBatchMounting = false
         webDAVBrowserStarredFolders = []
+        if let history = matchingRecentWebDAVHistory(for: deviceURL) {
+            applyRecentWebDAVHistoryToBrowser(history, shouldBumpUsage: false, replaceBaseURL: false)
+        }
     }
 
     private func webDAVPreScanLoginSheet() -> some View {
@@ -2225,7 +2349,27 @@ struct PosterWallView: View {
         }
     }
 
-    private func triggerScanAndScrape(sourceID: Int64? = nil, sourceIDs: [Int64]? = nil) {
+    private func scheduleStartupTMDBPreflight() {
+        guard !hasPerformedStartupTMDBCheck else { return }
+        hasPerformedStartupTMDBCheck = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard !isProcessing else { return }
+            Task {
+                let result = await TMDBService.shared.checkConnection()
+                await MainActor.run {
+                    guard !isProcessing else { return }
+                    if result.isConnected {
+                        triggerScanAndScrape()
+                    } else {
+                        tmdbConnectionMessage = result.message
+                        isShowingTMDBConnectionAlert = true
+                    }
+                }
+            }
+        }
+    }
+
+    private func triggerScanAndScrape(sourceID: Int64? = nil, sourceIDs: [Int64]? = nil, skipTMDBScrape: Bool = false) {
         guard !isProcessing else { return }
         currentScanTask?.cancel()
         let runID = UUID()
@@ -2286,19 +2430,34 @@ struct PosterWallView: View {
                             self.processingMessage = "扫描中 (\(index + 1)/\(validSources.count))：\(source.name)"
                         }
                     }
-                    let result = await libraryManager.scanLocalSourceWithResult(source, deferUnidentifiedGroups: true) { placeholderMovieID in
-                        guard let sid = source.id, !Task.isCancelled else { return }
-                        let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
-                        guard isCurrentRun else { return }
-                        await MainActor.run {
-                            withAnimation {
-                                self.processingMessage = "刮削元数据和海报：\(source.name)"
+                    let result: MediaSourceScanResult
+                    if skipTMDBScrape {
+                        result = await libraryManager.scanLocalSourceWithResult(
+                            source,
+                            deferUnidentifiedGroups: true
+                        )
+                    } else {
+                        result = await libraryManager.scanLocalSourceWithResult(
+                            source,
+                            deferUnidentifiedGroups: true
+                        ) { placeholderMovieID in
+                            guard let sid = source.id, !Task.isCancelled else { return }
+                            let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
+                            guard isCurrentRun else { return }
+                            await MainActor.run {
+                                withAnimation {
+                                    self.processingMessage = "刮削元数据和海报：\(source.name)"
+                                }
                             }
-                        }
-                        try? await libraryManager.processUnmatchedFiles(sourceID: sid, placeholderMovieID: placeholderMovieID)
-                        await MainActor.run {
-                            guard self.currentScanRunID == runID else { return }
-                            loadData()
+                            try? await libraryManager.processUnmatchedFiles(
+                                sourceID: sid,
+                                placeholderMovieID: placeholderMovieID,
+                                exposeFailures: false
+                            )
+                            await MainActor.run {
+                                guard self.currentScanRunID == runID else { return }
+                                loadData()
+                            }
                         }
                     }
                     let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
@@ -2317,6 +2476,20 @@ struct PosterWallView: View {
                         if Task.isCancelled {
                             await MainActor.run { finishScanRun(runID: runID, reloadData: true) }
                             return
+                        }
+                        if skipTMDBScrape {
+                            await MainActor.run {
+                                guard self.currentScanRunID == runID else { return }
+                                withAnimation {
+                                    self.processingMessage = "显示未刮削海报：\(source.name)"
+                                }
+                            }
+                            try? await libraryManager.exposeQueuedUnmatchedPlaceholders(sourceID: sid)
+                            await MainActor.run {
+                                guard self.currentScanRunID == runID else { return }
+                                loadData()
+                            }
+                            continue
                         }
                         await MainActor.run {
                             guard self.currentScanRunID == runID else { return }
@@ -2347,6 +2520,19 @@ struct PosterWallView: View {
                         loadData()
                     }
                 }
+                if skipTMDBScrape {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        withAnimation { self.processingMessage = "等待 TMDB API 连通后刮削..." }
+                    }
+                    try? await libraryManager.exposeQueuedUnmatchedPlaceholders()
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        loadData()
+                        finishScanRun(runID: runID, reloadData: true)
+                    }
+                    return
+                }
                 if Task.isCancelled {
                     await MainActor.run { finishScanRun(runID: runID, reloadData: true) }
                     return
@@ -2355,7 +2541,10 @@ struct PosterWallView: View {
                     guard self.currentScanRunID == runID else { return }
                     withAnimation { self.processingMessage = "补齐分集剧照..." }
                 }
-                ThumbnailManager.shared.enqueueMissingEpisodeThumbnailsAcrossLibrary()
+                let orderedMovieIDs = await MainActor.run {
+                    self.displayedMovies.compactMap(\.id)
+                }
+                ThumbnailManager.shared.enqueueMissingEpisodeThumbnailsAcrossLibrary(orderedMovieIDs: orderedMovieIDs)
                 
                 await MainActor.run {
                     finishScanRun(runID: runID, reloadData: true)

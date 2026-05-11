@@ -444,12 +444,33 @@ class ThumbnailManager: ObservableObject {
         }
     }
     
-    func enqueueMissingEpisodeThumbnailsAcrossLibrary() {
+    func enqueueMissingEpisodeThumbnailsAcrossLibrary(orderedMovieIDs: [Int64] = []) {
         DispatchQueue.global(qos: .background).async {
             guard let queue = AppDatabase.shared.dbQueue else { return }
             do {
                 let tasks = try queue.read { db -> [EpisodeThumbnailTask] in
-                    let movies = try Movie.fetchAll(db)
+                    var order: [Int64: Int] = [:]
+                    for (index, movieID) in orderedMovieIDs.enumerated() where order[movieID] == nil {
+                        order[movieID] = index
+                    }
+                    let movies: [Movie]
+                    if !orderedMovieIDs.isEmpty {
+                        var seenMovieIDs = Set<Int64>()
+                        var orderedMovies: [Movie] = []
+                        for movieID in orderedMovieIDs where seenMovieIDs.insert(movieID).inserted {
+                            if let movie = try Movie.fetchOne(db, key: movieID) {
+                                orderedMovies.append(movie)
+                            }
+                        }
+                        movies = orderedMovies
+                    } else {
+                        movies = try Movie.fetchAll(db).sorted { lhs, rhs in
+                            let lhsRank = lhs.id.flatMap { order[$0] } ?? Int.max
+                            let rhsRank = rhs.id.flatMap { order[$0] } ?? Int.max
+                            if lhsRank != rhsRank { return lhsRank < rhsRank }
+                            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+                        }
+                    }
                     var aggregated: [EpisodeThumbnailTask] = []
                     for movie in movies {
                         if let mid = movie.id {

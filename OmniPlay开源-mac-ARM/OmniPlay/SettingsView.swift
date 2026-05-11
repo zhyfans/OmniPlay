@@ -1,8 +1,10 @@
 import SwiftUI
 import GRDB
+import AppKit
 
 struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
+    private let focusTMDBApi: Bool
     
     // 绑定全局持久化设置
     @AppStorage("keepLocalPosters") var keepLocalPosters = true
@@ -19,6 +21,7 @@ struct SettingsView: View {
     @AppStorage("defaultAudio") var defaultAudio = "auto"
     @AppStorage("defaultSub") var defaultSub = "chi"
     @AppStorage("playbackQualityMode") var playbackQualityMode = "balanced"
+    @AppStorage("playBluRayExtras") var playBluRayExtras = false
     
     @AppStorage("appTheme") var appTheme = ThemeType.appleLight.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.crystal.colors }
@@ -29,6 +32,17 @@ struct SettingsView: View {
     @State private var apiValidationMessage = ""
     @State private var apiValidationColor: Color = .primary
     @State private var isShowingOpenSourceInfo = false
+    @State private var isCheckingForUpdate = false
+    @State private var updateStatusMessage = ""
+    @State private var updateStatusColor: Color = .secondary
+    @FocusState private var isTMDBApiFocused: Bool
+
+    private let githubRepositoryURL = "https://github.com/nandieling/OmniPlay"
+    private let githubLatestReleaseAPI = "https://api.github.com/repos/nandieling/OmniPlay/releases/latest"
+
+    init(focusTMDBApi: Bool = false) {
+        self.focusTMDBApi = focusTMDBApi
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -83,6 +97,43 @@ struct SettingsView: View {
                     Text("设置后，您可以在影视详情页将 NAS 视频缓存至此目录，方便离线观看。")
                         .font(.caption).foregroundColor(theme.textSecondary)
                 }
+
+                Section(header: Text("软件更新").font(.headline).padding(.top, 10)) {
+                    HStack(spacing: 8) {
+                        Text("当前版本")
+                        Text(currentAppVersion)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer(minLength: 0)
+                    }
+
+                    HStack(spacing: 10) {
+                        Button(action: { checkForUpdates(install: false) }) {
+                            if isCheckingForUpdate {
+                                ProgressView().controlSize(.small).frame(width: 52)
+                            } else {
+                                Text("检查更新")
+                            }
+                        }
+                        .disabled(isCheckingForUpdate)
+
+                        Button("直接更新") {
+                            checkForUpdates(install: true)
+                        }
+                        .disabled(isCheckingForUpdate)
+
+                        Button("打开 GitHub 仓库") {
+                            openExternalURL(githubRepositoryURL)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(theme.accent)
+
+                    if !updateStatusMessage.isEmpty {
+                        Text(updateStatusMessage)
+                            .font(.caption)
+                            .foregroundColor(updateStatusColor)
+                    }
+                }
                 
                 Section(header: Text("外观与主题").font(.headline).padding(.top, 10)) {
                     Picker("应用主题配色", selection: $appTheme) {
@@ -122,6 +173,9 @@ struct SettingsView: View {
                         Text("画质优先").tag("quality")
                     }
                     .help("切换后新打开的播放窗口会生效。")
+
+                    Toggle("播放蓝光花絮", isOn: $playBluRayExtras)
+                        .help("默认关闭。关闭时蓝光 BDMV 会按 STREAM 文件大小自动选择主电影；开启后会按文件编号播放包含花絮在内的所有 STREAM 视频。")
                 }
                 
                 Section(header: Text("刮削服务 (TMDB)").font(.headline).padding(.top, 10)) {
@@ -135,6 +189,7 @@ struct SettingsView: View {
                     HStack {
                         TextField("API Key / v4 令牌", text: $tmdbApiKey)
                             .textFieldStyle(.roundedBorder)
+                            .focused($isTMDBApiFocused)
                         
                         Button(action: validateTMDBApi) {
                             if isValidatingAPI {
@@ -149,6 +204,10 @@ struct SettingsView: View {
                     Text("填写自定义 API 后会优先使用你的密钥；“验证”只检查这里填写的自定义密钥。")
                         .font(.caption)
                         .foregroundColor(theme.textSecondary)
+
+                    Link("请往TMDB官网注册获取api：https://www.themoviedb.org", destination: URL(string: "https://www.themoviedb.org")!)
+                        .font(.caption)
+                        .foregroundColor(theme.accent)
 
                     if trimmedTMDBApiKey.isEmpty, tmdbUsePublicSource {
                         Text("当前正在使用公共源 TMDB。共享额度可能波动，长期使用更建议配置自定义 API。")
@@ -192,6 +251,12 @@ struct SettingsView: View {
         .sheet(isPresented: $isShowingOpenSourceInfo) {
             OpenSourceInfoSheet(theme: theme)
         }
+        .onAppear {
+            guard focusTMDBApi else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                isTMDBApiFocused = true
+            }
+        }
         .onChange(of: appLanguage) { oldValue, newValue in
             UserDefaults.standard.set([newValue], forKey: "AppleLanguages")
             UserDefaults.standard.synchronize()
@@ -200,6 +265,13 @@ struct SettingsView: View {
 
     private var trimmedTMDBApiKey: String {
         tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var currentAppVersion: String {
+        let info = Bundle.main.infoDictionary
+        return (info?["CFBundleShortVersionString"] as? String)
+            ?? (info?["CFBundleVersion"] as? String)
+            ?? "dev"
     }
     
     private func validateTMDBApi() {
@@ -211,34 +283,159 @@ struct SettingsView: View {
         apiValidationColor = .secondary
         
         Task {
-            let url = URL(string: "https://api.themoviedb.org/3/configuration")!
-            var request = URLRequest(url: url)
-            
-            if customKey.count > 50 {
-                request.setValue("Bearer \(customKey)", forHTTPHeaderField: "Authorization")
-            } else {
-                request.url = URL(string: "https://api.themoviedb.org/3/configuration?api_key=\(customKey)")!
+            let result = await TMDBService.shared.checkConnection(customAPIInput: customKey)
+            await MainActor.run {
+                if result.isConnected {
+                    apiValidationMessage = "✅ 验证成功！API 状态正常。"
+                    apiValidationColor = .green
+                } else {
+                    apiValidationMessage = "❌ 验证失败：\(result.message)"
+                    apiValidationColor = .red
+                }
+                isValidatingAPI = false
             }
-            
+        }
+    }
+
+    private func checkForUpdates(install: Bool) {
+        isCheckingForUpdate = true
+        updateStatusMessage = install ? "正在获取最新版本..." : "正在检查 GitHub 最新版本..."
+        updateStatusColor = .secondary
+
+        Task {
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
-                await MainActor.run {
-                    if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-                        apiValidationMessage = "✅ 验证成功！API 状态正常。"
-                        apiValidationColor = .green
-                    } else {
-                        apiValidationMessage = "❌ 验证失败：密钥无效或受限。"
-                        apiValidationColor = .red
+                let release = try await fetchLatestRelease()
+                guard !release.isEmpty else {
+                    await MainActor.run {
+                        isCheckingForUpdate = false
                     }
-                    isValidatingAPI = false
+                    return
+                }
+                let tagName = (release["tag_name"] as? String) ?? ""
+                let htmlURL = (release["html_url"] as? String) ?? "\(githubRepositoryURL)/releases/latest"
+                let isNewer = isVersion(tagName, newerThan: currentAppVersion)
+
+                if !install {
+                    await MainActor.run {
+                        updateStatusMessage = isNewer
+                            ? "发现新版本 \(tagName)，可点击“直接更新”。"
+                            : "当前已是最新版本（\(currentAppVersion)）。"
+                        updateStatusColor = isNewer ? .orange : .green
+                        isCheckingForUpdate = false
+                    }
+                    return
+                }
+
+                guard isNewer else {
+                    await MainActor.run {
+                        updateStatusMessage = "当前已是最新版本（\(currentAppVersion)）。"
+                        updateStatusColor = .green
+                        isCheckingForUpdate = false
+                    }
+                    return
+                }
+
+                guard let asset = preferredUpdateAsset(from: release["assets"] as? [[String: Any]]) else {
+                    await MainActor.run {
+                        updateStatusMessage = "未找到适合当前 Mac 的安装包，已打开 GitHub Release 页面。"
+                        updateStatusColor = .orange
+                        isCheckingForUpdate = false
+                        openExternalURL(htmlURL)
+                    }
+                    return
+                }
+
+                let fileURL = try await downloadUpdateAsset(asset)
+                await MainActor.run {
+                    updateStatusMessage = "已下载 \(fileURL.lastPathComponent)，正在打开安装包。"
+                    updateStatusColor = .green
+                    isCheckingForUpdate = false
+                    NSWorkspace.shared.open(fileURL)
                 }
             } catch {
                 await MainActor.run {
-                    apiValidationMessage = "❌ 网络错误：无法连接到 TMDB (\(error.localizedDescription))"
-                    apiValidationColor = .red
-                    isValidatingAPI = false
+                    updateStatusMessage = "检查更新失败：\(error.localizedDescription)"
+                    updateStatusColor = .red
+                    isCheckingForUpdate = false
                 }
             }
         }
+    }
+
+    private func fetchLatestRelease() async throws -> [String: Any] {
+        guard let url = URL(string: githubLatestReleaseAPI) else { return [:] }
+        var request = URLRequest(url: url)
+        request.setValue("OmniPlay", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+            await MainActor.run {
+                updateStatusMessage = "GitHub 仓库暂未发布 Release，已打开仓库页面。"
+                updateStatusColor = .orange
+                openExternalURL(githubRepositoryURL)
+            }
+            return [:]
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "OmniPlayUpdate", code: 1, userInfo: [NSLocalizedDescriptionKey: "GitHub 返回内容无法解析。"])
+        }
+        return object
+    }
+
+    private func preferredUpdateAsset(from assets: [[String: Any]]?) -> (name: String, url: URL)? {
+        guard let assets else { return nil }
+        let candidates = assets.compactMap { asset -> (name: String, url: URL, score: Int)? in
+            guard let name = asset["name"] as? String,
+                  let urlString = asset["browser_download_url"] as? String,
+                  let url = URL(string: urlString) else { return nil }
+            let lower = name.lowercased()
+            guard lower.hasSuffix(".dmg") || lower.hasSuffix(".zip") || lower.hasSuffix(".pkg") else { return nil }
+            var score = 0
+            if lower.contains("mac") || lower.contains("darwin") || lower.contains("osx") { score += 3 }
+            if lower.contains("universal") { score += 2 }
+            #if arch(arm64)
+            if lower.contains("arm64") || lower.contains("aarch64") || lower.contains("apple") { score += 4 }
+            if lower.contains("x64") || lower.contains("x86_64") || lower.contains("intel") { score -= 3 }
+            #else
+            if lower.contains("x64") || lower.contains("x86_64") || lower.contains("intel") { score += 4 }
+            if lower.contains("arm64") || lower.contains("aarch64") { score -= 3 }
+            #endif
+            return (name, url, score)
+        }
+        return candidates.max { $0.score < $1.score }.map { ($0.name, $0.url) }
+    }
+
+    private func downloadUpdateAsset(_ asset: (name: String, url: URL)) async throws -> URL {
+        let (temporaryURL, _) = try await URLSession.shared.download(from: asset.url)
+        let downloadDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let destination = downloadDirectory.appendingPathComponent(asset.name)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
+    }
+
+    private func isVersion(_ candidate: String, newerThan current: String) -> Bool {
+        let lhs = versionParts(candidate)
+        let rhs = versionParts(current)
+        guard !lhs.isEmpty else { return false }
+        let count = max(lhs.count, rhs.count)
+        for index in 0..<count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left > right }
+        }
+        return false
+    }
+
+    private func versionParts(_ value: String) -> [Int] {
+        value.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "v "))
+            .split { !$0.isNumber }
+            .compactMap { Int($0) }
+    }
+
+    private func openExternalURL(_ value: String) {
+        guard let url = URL(string: value) else { return }
+        NSWorkspace.shared.open(url)
     }
 }

@@ -22,7 +22,7 @@ namespace OmniPlay.Setup;
 
 internal static class Program
 {
-    private const string ProductName = "览影";
+    private const string ProductName = "觅影";
     private const string LegacyProductName = "OmniPlay";
     private const string AppExeName = "OmniPlay.Desktop.exe";
     private const string InstalledSetupExeName = "setup.exe";
@@ -52,7 +52,7 @@ internal static class Program
             if (options.Uninstall)
             {
                 Uninstall(options);
-                Notify("览影已卸载。", options.Quiet, isError: false);
+                Notify("觅影已卸载。", options.Quiet, isError: false);
                 return 0;
             }
 
@@ -61,12 +61,12 @@ internal static class Program
                 return 0;
             }
 
-            Notify("览影安装完成。", options.Quiet, isError: false);
+            Notify("觅影安装完成。", options.Quiet, isError: false);
             return 0;
         }
         catch (Exception ex)
         {
-            Notify("览影安装程序运行失败：\n\n" + ex.Message, options.Quiet, isError: true);
+            Notify("觅影安装程序运行失败：\n\n" + ex.Message, options.Quiet, isError: true);
             return 1;
         }
     }
@@ -403,7 +403,7 @@ internal static class Program
                 if (options.Quiet)
                 {
                     throw new InvalidOperationException(
-                        $"已检测到览影安装在：{registeredInstallRoot}\n静默安装不允许安装到不同目录，避免产生重复安装。请使用已安装目录，或先卸载旧版本。");
+                        $"已检测到觅影安装在：{registeredInstallRoot}\n静默安装不允许安装到不同目录，避免产生重复安装。请使用已安装目录，或先卸载旧版本。");
                 }
 
                 var duplicateChoice = ShowDifferentInstallDirectoryDialog(registeredInstallRoot, requestedInstallRoot);
@@ -449,7 +449,7 @@ internal static class Program
     private static DuplicateInstallChoice ShowExistingInstallDialog(string registeredInstallRoot)
     {
         var result = MessageBox.Show(
-            $"检测到已安装的览影：\n\n{registeredInstallRoot}\n\n选择“是”升级现有安装。\n选择“否”选择其他目录。\n选择“取消”退出安装。",
+            $"检测到已安装的觅影：\n\n{registeredInstallRoot}\n\n选择“是”升级现有安装。\n选择“否”选择其他目录。\n选择“取消”退出安装。",
             ProductName,
             MessageBoxButtons.YesNoCancel,
             MessageBoxIcon.Information,
@@ -466,7 +466,7 @@ internal static class Program
     private static DuplicateInstallChoice ShowDifferentInstallDirectoryDialog(string registeredInstallRoot, string requestedInstallRoot)
     {
         var result = MessageBox.Show(
-            $"检测到已安装的览影：\n\n{registeredInstallRoot}\n\n当前指定的新目录为：\n\n{requestedInstallRoot}\n\n安装到新目录会保留旧版本，可能产生重复安装。\n\n选择“是”升级现有安装。\n选择“否”仍安装到新目录。\n选择“取消”退出安装。",
+            $"检测到已安装的觅影：\n\n{registeredInstallRoot}\n\n当前指定的新目录为：\n\n{requestedInstallRoot}\n\n安装到新目录会保留旧版本，可能产生重复安装。\n\n选择“是”升级现有安装。\n选择“否”仍安装到新目录。\n选择“取消”退出安装。",
             ProductName,
             MessageBoxButtons.YesNoCancel,
             MessageBoxIcon.Warning,
@@ -484,7 +484,7 @@ internal static class Program
     {
         using var form = new Form
         {
-            Text = "览影安装程序",
+            Text = "觅影安装程序",
             ClientSize = new Size(560, 214),
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
@@ -505,7 +505,7 @@ internal static class Program
             AutoSize = false,
             Location = new Point(16, 42),
             Size = new Size(528, 34),
-            Text = "如果选择的目录不是览影，将自动创建览影子目录。"
+            Text = "如果选择的目录不是觅影，将自动创建觅影子目录。"
         };
 
         var pathBox = new TextBox
@@ -549,7 +549,7 @@ internal static class Program
         {
             using var dialog = new FolderBrowserDialog
             {
-                Description = "选择览影安装目录",
+                Description = "选择觅影安装目录",
                 ShowNewFolderButton = true,
                 SelectedPath = GetNearestExistingDirectory(pathBox.Text) ?? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
             };
@@ -716,7 +716,7 @@ internal static class Program
         var leafName = Path.GetFileName(fullInstallRoot);
         if (!IsAllowedInstallLeaf(leafName))
         {
-            throw new InvalidOperationException("安装目录必须命名为览影，或选择一个可创建览影子目录的父目录。");
+            throw new InvalidOperationException("安装目录必须命名为觅影，或选择一个可创建觅影子目录的父目录。");
         }
 
         if (File.Exists(fullInstallRoot))

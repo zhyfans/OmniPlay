@@ -53,6 +53,7 @@ public static class ServiceRegistration
         });
         services.AddSingleton<SqliteDatabase>();
         services.AddSingleton<IMediaSourceRepository, MediaSourceRepository>();
+        services.AddSingleton<INetworkCredentialStore, NetworkCredentialStore>();
         services.AddSingleton<IMovieRepository, MovieRepository>();
         services.AddSingleton<ITvShowRepository, TvShowRepository>();
         services.AddSingleton<IVideoFileRepository, VideoFileRepository>();

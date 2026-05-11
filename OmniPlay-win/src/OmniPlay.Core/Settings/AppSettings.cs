@@ -6,6 +6,8 @@ public sealed record AppSettings
 
     public bool ShowMediaSourceRealPath { get; init; } = true;
 
+    public string OfflineCacheDirectory { get; init; } = string.Empty;
+
     public TmdbSettings Tmdb { get; init; } = new();
 
     public LocalMetadataSettings LocalMetadata { get; init; } = new();

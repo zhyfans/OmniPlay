@@ -1,6 +1,6 @@
 # OmniPlay Windows 开发说明
 
-`windows/` 是 OmniPlay 的 Windows 移植版工程目录。当前技术栈为 `Avalonia + .NET 10 + SQLite + libmpv`。
+当前仓库根目录是 OmniPlay 的 Windows 移植版工程目录。当前技术栈为 `Avalonia + .NET 10 + SQLite + libmpv`。
 
 ## 当前状态
 
@@ -32,7 +32,7 @@
 ## 目录结构
 
 ```text
-windows/
+./
   src/
     OmniPlay.Core/
     OmniPlay.Desktop/
@@ -41,51 +41,55 @@ windows/
     OmniPlay.UI/
   tests/
     OmniPlay.Tests/
+  installer/
+    OmniPlay.Setup/
+  dist/
   dev-build.ps1
   dev-run.ps1
+  package-setup.ps1
   OmniPlay.Windows.slnx
 ```
 
 ## 构建入口
 
-Windows 版当前统一以 [OmniPlay.Windows.slnx](C:/软件/OmniPlay开源-mac/windows/OmniPlay.Windows.slnx) 作为方案入口。
+Windows 版当前统一以 [OmniPlay.Windows.slnx](OmniPlay.Windows.slnx) 作为方案入口。
 
 这里的 “`.slnx` 构建链” 指的是：
 
-1. `dotnet restore .\windows\OmniPlay.Windows.slnx`
-2. `dotnet build .\windows\OmniPlay.Windows.slnx ...`
-3. `dotnet test .\windows\OmniPlay.Windows.slnx ...`
+1. `dotnet restore .\OmniPlay.Windows.slnx`
+2. `dotnet build .\OmniPlay.Windows.slnx ...`
+3. `dotnet test .\OmniPlay.Windows.slnx ...`
 
-当前 CLI 默认多节点调度下，裸跑 `dotnet build .\windows\OmniPlay.Windows.slnx -c Debug` 仍可能失败。稳定做法是显式加 `-m:1`，或者直接使用仓库内脚本。
+当前 CLI 默认多节点调度下，裸跑 `dotnet build .\OmniPlay.Windows.slnx -c Debug` 仍可能失败。稳定做法是显式加 `-m:1`，或者直接使用仓库内脚本。
 
 ## 推荐命令
 
 ### PowerShell
 
 ```powershell
-cd C:\软件\OmniPlay开源-mac
-$env:DOTNET_CLI_HOME='C:\软件\OmniPlay开源-mac\.dotnet'
+cd C:\软件\OmniPlay-win
+$env:DOTNET_CLI_HOME='C:\软件\OmniPlay-win\.dotnet'
 $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1'
 $env:DOTNET_NOLOGO='1'
 
-dotnet restore .\windows\OmniPlay.Windows.slnx
-dotnet build .\windows\OmniPlay.Windows.slnx -c Debug -m:1
-dotnet test .\windows\OmniPlay.Windows.slnx -c Debug -m:1
-dotnet run --project .\windows\src\OmniPlay.Desktop\OmniPlay.Desktop.csproj
+dotnet restore .\OmniPlay.Windows.slnx
+dotnet build .\OmniPlay.Windows.slnx -c Debug -m:1
+dotnet test .\OmniPlay.Windows.slnx -c Debug -m:1
+dotnet run --project .\src\OmniPlay.Desktop\OmniPlay.Desktop.csproj
 ```
 
 ### `cmd.exe`
 
 ```cmd
-cd /d C:\软件\OmniPlay开源-mac
-set DOTNET_CLI_HOME=C:\软件\OmniPlay开源-mac\.dotnet
+cd /d C:\软件\OmniPlay-win
+set DOTNET_CLI_HOME=C:\软件\OmniPlay-win\.dotnet
 set DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 set DOTNET_NOLOGO=1
 
-dotnet restore .\windows\OmniPlay.Windows.slnx
-dotnet build .\windows\OmniPlay.Windows.slnx -c Debug -m:1
-dotnet test .\windows\OmniPlay.Windows.slnx -c Debug -m:1
-dotnet run --project .\windows\src\OmniPlay.Desktop\OmniPlay.Desktop.csproj
+dotnet restore .\OmniPlay.Windows.slnx
+dotnet build .\OmniPlay.Windows.slnx -c Debug -m:1
+dotnet test .\OmniPlay.Windows.slnx -c Debug -m:1
+dotnet run --project .\src\OmniPlay.Desktop\OmniPlay.Desktop.csproj
 ```
 
 ## 推荐脚本
@@ -97,7 +101,7 @@ dotnet run --project .\windows\src\OmniPlay.Desktop\OmniPlay.Desktop.csproj
 ```powershell
 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
   -ExecutionPolicy Bypass `
-  -File .\windows\dev-build.ps1
+  -File .\dev-build.ps1
 ```
 
 `dev-build.ps1` 当前会：
@@ -112,10 +116,36 @@ C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
 ```powershell
 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
   -ExecutionPolicy Bypass `
-  -File .\windows\dev-run.ps1
+  -File .\dev-run.ps1
 ```
 
 `dev-run.ps1` 用于启动桌面程序，并保留常用开发环境变量。
+
+## 打包与安装
+
+生成当前 Windows 安装包：
+
+```powershell
+cd C:\软件\OmniPlay-win
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
+  -ExecutionPolicy Bypass `
+  -File .\package-setup.ps1 -Configuration Release -RuntimeIdentifier win-x64
+```
+
+默认输出：
+
+```text
+.\dist\览影-OmniPlay-x64-setup.exe
+```
+
+安装包可直接双击安装。常用命令行参数：
+
+```powershell
+.\dist\览影-OmniPlay-x64-setup.exe /quiet
+.\dist\览影-OmniPlay-x64-setup.exe /dir "C:\Program Files\览影"
+.\dist\览影-OmniPlay-x64-setup.exe /uninstall /quiet
+.\dist\览影-OmniPlay-x64-setup.exe /verify /quiet
+```
 
 ## 日志与运行目录
 
@@ -140,7 +170,7 @@ C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
 建议开发/诊断时显式指定根目录：
 
 ```powershell
-$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay开源-mac\windows\tmp\runtime-dev'
+$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay-win\tmp\runtime-dev'
 ```
 
 ### 实时看日志
@@ -160,18 +190,18 @@ Get-Content "$env:TEMP\OmniPlay\logs\app.log" -Wait
 ### 独立播放器窗口
 
 ```powershell
-$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay开源-mac\windows\tmp\runtime-standalone-verify'
-dotnet .\windows\src\OmniPlay.Desktop\bin\Debug\net10.0\OmniPlay.Desktop.dll `
-  --play-file "C:\软件\OmniPlay开源-mac\windows\tmp\playback-smoke.wav" `
+$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay-win\tmp\runtime-standalone-verify'
+dotnet .\src\OmniPlay.Desktop\bin\Debug\net10.0\OmniPlay.Desktop.dll `
+  --play-file "C:\软件\OmniPlay-win\tmp\playback-smoke.wav" `
   --close-after 6
 ```
 
 ### 详情页覆盖层
 
 ```powershell
-$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay开源-mac\windows\tmp\runtime-overlay-verify'
-dotnet .\windows\src\OmniPlay.Desktop\bin\Debug\net10.0\OmniPlay.Desktop.dll `
-  --overlay-play-file "C:\软件\OmniPlay开源-mac\windows\tmp\playback-smoke.wav" `
+$env:OMNIPLAY_APP_ROOT='C:\软件\OmniPlay-win\tmp\runtime-overlay-verify'
+dotnet .\src\OmniPlay.Desktop\bin\Debug\net10.0\OmniPlay.Desktop.dll `
+  --overlay-play-file "C:\软件\OmniPlay-win\tmp\playback-smoke.wav" `
   --close-after 6
 ```
 
@@ -230,13 +260,14 @@ SQLite 数据库默认位置：
 ## 已知事项
 
 - 当前目标框架是 `net10.0`，因为现有开发机安装的是 `.NET 10 SDK`。
-- `dotnet build .\windows\OmniPlay.Windows.slnx -c Debug` 默认不加 `-m:1` 仍不稳定。
-- 稳定入口优先使用 [dev-build.ps1](C:/软件/OmniPlay开源-mac/windows/dev-build.ps1) 或显式 `-m:1`。
+- `dotnet build .\OmniPlay.Windows.slnx -c Debug` 默认不加 `-m:1` 仍不稳定。
+- 稳定入口优先使用 [dev-build.ps1](dev-build.ps1) 或显式 `-m:1`。
 - 现阶段 TMDB 已支持自动补全、手动重匹配、锁定、语言设置和基础自动刮削控制；更细的规则仍待补齐。
 
 ## 相关文件
 
-- 方案入口：[OmniPlay.Windows.slnx](C:/软件/OmniPlay开源-mac/windows/OmniPlay.Windows.slnx)
-- 构建脚本：[dev-build.ps1](C:/软件/OmniPlay开源-mac/windows/dev-build.ps1)
-- 运行脚本：[dev-run.ps1](C:/软件/OmniPlay开源-mac/windows/dev-run.ps1)
-- 开发计划：[WINDOWS_PORT_DEVELOPMENT_PLAN.md](C:/软件/OmniPlay开源-mac/windows/WINDOWS_PORT_DEVELOPMENT_PLAN.md)
+- 方案入口：[OmniPlay.Windows.slnx](OmniPlay.Windows.slnx)
+- 构建脚本：[dev-build.ps1](dev-build.ps1)
+- 运行脚本：[dev-run.ps1](dev-run.ps1)
+- 打包脚本：[package-setup.ps1](package-setup.ps1)
+- 开发计划：[WINDOWS_PORT_DEVELOPMENT_PLAN.md](WINDOWS_PORT_DEVELOPMENT_PLAN.md)

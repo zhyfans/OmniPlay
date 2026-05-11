@@ -5,6 +5,7 @@ import Combine
 struct MovieCardView: View {
     let movie: Movie
     var isContinueWatchingContext: Bool = false
+    var isHomeCacheModeActive: Bool = false
     
     @AppStorage("appTheme") var appTheme = ThemeType.appleLight.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.appleLight.colors }
@@ -12,12 +13,9 @@ struct MovieCardView: View {
     
     @ObservedObject var cacheManager = OfflineCacheManager.shared
     
-    @State private var showCacheAlert = false
-    @State private var filesToCache: [VideoFile] = []
     @State private var showSearchModal = false
     @State private var showEditModal = false
     @State private var hasMissingFiles = false
-    @State private var hasRemoteUncacheableFiles = false
     
     @State private var isHovering = false
     @State private var isFullyWatched = false
@@ -31,7 +29,7 @@ struct MovieCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topTrailing) {
-                ZStack(alignment: .bottomLeading) {
+                ZStack {
                     
                     // 🌟 核心升级：替换为智能本地缓存海报组件
                     CachedPosterView(posterPath: movie.posterPath)
@@ -39,14 +37,29 @@ struct MovieCardView: View {
                         .cornerRadius(12)
                         .shadow(color: .black.opacity(0.1), radius: 8, y: 4)
                     
-                    if let vote = movie.voteAverage, vote > 0 {
-                        Text(String(format: "%.1f", vote))
-                            .font(.caption.bold())
-                            .padding(.horizontal, 6).padding(.vertical, 4)
-                            .background(Color.black.opacity(0.7))
-                            .foregroundColor(Color(hex: "FFD700"))
-                            .cornerRadius(6)
-                            .padding(8)
+                    VStack {
+                        Spacer()
+                        HStack {
+                            if let vote = movie.voteAverage, vote > 0 {
+                                Text(String(format: "%.1f", vote))
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 6).padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.7))
+                                    .foregroundColor(Color(hex: "FFD700"))
+                                    .cornerRadius(6)
+                                    .padding(8)
+                            }
+                            Spacer()
+                        }
+                    }
+
+                    if isHomeCacheModeActive {
+                        Button(action: { fetchFilesAndStartCache() }) {
+                            posterCacheOverlayContent
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!isCacheSupportedForAnyFile || isDownloadingAnyFile || allCacheableFilesCached)
+                        .conditionalHelp(cacheOverlayHelpText, show: enableFastTooltip)
                     }
                 }
                 
@@ -80,40 +93,12 @@ struct MovieCardView: View {
                 
                 Spacer(minLength: 0)
                 
-                // 缓存按钮 (受全局开关控制)
-                if cacheManager.isCacheModeActive {
-                    Button(action: { fetchFilesAndShowAlert() }) {
-                        Group {
-                            if isDownloadingAnyFile {
-                                ProgressView().controlSize(.small)
-                            } else if !isCacheSupportedForAnyFile {
-                                Image(systemName: "icloud.slash")
-                                    .font(.system(size: 13, weight: .bold))
-                            } else {
-                                Image(systemName: "icloud.and.arrow.down")
-                                    .font(.system(size: 13, weight: .bold))
-                            }
-                        }
-                        .foregroundColor(isCacheSupportedForAnyFile ? theme.accent : theme.textSecondary)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!isCacheSupportedForAnyFile)
-                    .conditionalHelp("远程源暂不支持离线缓存", show: enableFastTooltip && !isCacheSupportedForAnyFile)
-                }
-                
                 if hasMissingFiles {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 12))
                         .foregroundColor(.orange)
                         .conditionalHelp("部分源文件不存在，需重新连接外置硬盘/NAS 或使用本地缓存播放", show: enableFastTooltip)
                 }
-                if hasRemoteUncacheableFiles && cacheManager.isCacheModeActive {
-                    Image(systemName: "icloud.slash")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                        .conditionalHelp("包含远程源文件：当前版本不支持离线缓存下载", show: enableFastTooltip)
-                }
-                
                 // 标记已播/未播按钮
                 Button(action: toggleWatched) {
                     Image(systemName: isFullyWatched ? "checkmark.circle.fill" : "circle")
@@ -128,10 +113,6 @@ struct MovieCardView: View {
         .onReceive(cacheManager.$cachedFileKeys) { _ in checkFileAvailability() }
         .onReceive(cacheManager.$cachedFileNames) { _ in checkFileAvailability() }
         .onReceive(availabilityTimer) { _ in refreshAvailabilityWithoutDB() }
-        .alert("离线缓存确认", isPresented: $showCacheAlert) {
-            Button("取消", role: .cancel) { }
-            Button("确定缓存") { cacheAllFiles() }
-        } message: { Text("确定要将《\(movie.title)》包含的 \(filesToCache.count) 个视频文件加入后台缓存队列吗？") }
         .sheet(isPresented: $showSearchModal) { MovieSearchModalView(movie: movie) }
         .sheet(isPresented: $showEditModal) { MovieEditModalView(movie: movie) }
     }
@@ -142,6 +123,45 @@ struct MovieCardView: View {
 
     private var isCacheSupportedForAnyFile: Bool {
         sourcePairs.contains { _, source in cacheManager.supportsCaching(mediaSource: source) }
+    }
+
+    private var allCacheableFilesCached: Bool {
+        let cacheableFiles = sourcePairs.filter { _, source in cacheManager.supportsCaching(mediaSource: source) }.map(\.0)
+        return !cacheableFiles.isEmpty && cacheableFiles.allSatisfy { cacheManager.isCached($0) }
+    }
+
+    private var aggregateCacheProgress: Double? {
+        guard isDownloadingAnyFile else { return nil }
+        let cacheableFiles = sourcePairs.filter { _, source in cacheManager.supportsCaching(mediaSource: source) }.map(\.0)
+        guard !cacheableFiles.isEmpty else { return nil }
+        let total = cacheableFiles.reduce(0.0) { partial, file in
+            if cacheManager.isCached(file) { return partial + 1.0 }
+            return partial + (cacheManager.downloadProgress[file.id] ?? 0.0)
+        }
+        return total / Double(cacheableFiles.count)
+    }
+
+    private var cacheOverlayHelpText: String {
+        if allCacheableFilesCached { return "已缓存到本地" }
+        if !isCacheSupportedForAnyFile { return "该媒体源暂不支持离线缓存" }
+        if isDownloadingAnyFile { return "正在离线缓存" }
+        return "离线缓存整部影片或整部剧集"
+    }
+
+    @ViewBuilder
+    private var posterCacheOverlayContent: some View {
+        if let progress = aggregateCacheProgress {
+            OfflineCacheProgressBadge(progress: progress, tint: theme.accent)
+        } else {
+            ZStack {
+                Circle()
+                    .fill(Color.black.opacity(0.62))
+                    .frame(width: 52, height: 52)
+                Image(systemName: allCacheableFilesCached ? "checkmark.circle.fill" : (!isCacheSupportedForAnyFile ? "icloud.slash" : "arrow.down.circle.fill"))
+                    .font(.system(size: 25, weight: .bold))
+                    .foregroundColor(allCacheableFilesCached ? theme.accent : .white)
+            }
+        }
     }
     
     // ======== 私有数据库操作方法 ========
@@ -182,7 +202,7 @@ struct MovieCardView: View {
         }
     }
     
-    private func fetchFilesAndShowAlert() {
+    private func fetchFilesAndStartCache() {
         Task {
             do {
                 let pairs = try await AppDatabase.shared.dbQueue.read { db in
@@ -196,18 +216,13 @@ struct MovieCardView: View {
                 }.map(\.0)
                 await MainActor.run {
                     if cacheableFiles.isEmpty {
-                        cacheManager.cacheStatusMessage = "远程源暂不支持离线缓存"
+                        cacheManager.cacheStatusMessage = "该媒体源暂不支持离线缓存"
                     } else {
-                        self.filesToCache = cacheableFiles
-                        self.showCacheAlert = true
+                        cacheManager.startDownloads(files: cacheableFiles, groupTitle: movie.title)
                     }
                 }
             } catch {}
         }
-    }
-    
-    private func cacheAllFiles() {
-        for file in filesToCache { if !cacheManager.isCached(file) { cacheManager.startDownload(file: file) } }
     }
     
     private func checkFileAvailability() {
@@ -223,7 +238,6 @@ struct MovieCardView: View {
                     self.movieFiles = pairs.map(\.0)
                     self.sourcePairs = pairs
                     self.hasMissingFiles = evaluateMissingState(with: pairs)
-                    self.hasRemoteUncacheableFiles = evaluateRemoteUncacheableState(with: pairs)
                 }
             } catch {}
         }
@@ -240,13 +254,6 @@ struct MovieCardView: View {
     private func evaluateMissingState(with pairs: [(VideoFile, MediaSource?)]) -> Bool {
         pairs.contains { file, source in
             cacheManager.hasMissingSource(for: file, mediaSource: source)
-        }
-    }
-
-    private func evaluateRemoteUncacheableState(with pairs: [(VideoFile, MediaSource?)]) -> Bool {
-        pairs.contains { _, source in
-            guard let source else { return false }
-            return !cacheManager.supportsCaching(mediaSource: source)
         }
     }
 }

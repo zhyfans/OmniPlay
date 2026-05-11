@@ -1286,6 +1286,16 @@ public sealed class LibraryScanner : ILibraryScanner
         SearchMetadata metadata)
     {
         var fileMetadata = MediaNameParser.ExtractSearchMetadata(fileName);
+        if (sourceProtocol is MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin)
+        {
+            return UsableTitle(metadata.ChineseTitle)
+                   ?? UsableTitle(metadata.ForeignTitle)
+                   ?? UsableTitle(metadata.FullCleanTitle)
+                   ?? UsableTitle(fileMetadata.ChineseTitle)
+                   ?? UsableTitle(fileMetadata.ForeignTitle)
+                   ?? UsableTitle(fileMetadata.FullCleanTitle);
+        }
+
         return ResolveShowTitleFromRelativePath(relativePath, sourceProtocol)
                ?? MediaNameParser.ExtractedDisplayTitle(relativePath, fileName)
                ?? UsableTitle(metadata.ChineseTitle)

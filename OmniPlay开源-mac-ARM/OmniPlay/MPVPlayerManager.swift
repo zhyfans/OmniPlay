@@ -139,11 +139,29 @@ class MPVPlayerManager: ObservableObject {
         }
     }
 
-    private func mpvLoadArgument(for url: URL) -> String {
+    private func mpvLoadArgument(for url: URL, stripUserInfo: Bool = false) -> String {
         if url.isFileURL {
             return url.path
         }
+        if stripUserInfo,
+           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.user = nil
+            components.password = nil
+            return components.string ?? url.absoluteString
+        }
         return url.absoluteString
+    }
+
+    private func mpvStringArgument(_ value: String, stripUserInfo: Bool = false) -> String {
+        guard stripUserInfo,
+              var components = URLComponents(string: value),
+              let scheme = components.scheme,
+              scheme.caseInsensitiveCompare("file") != .orderedSame else {
+            return value
+        }
+        components.user = nil
+        components.password = nil
+        return components.string ?? value
     }
 
     private func mpvLogArgument(for url: URL) -> String {
@@ -157,6 +175,18 @@ class MPVPlayerManager: ObservableObject {
         components.password = nil
         redactSensitiveQueryItems(in: &components)
         return components.string ?? url.absoluteString
+    }
+
+    private func mpvLogArgument(for value: String) -> String {
+        guard var components = URLComponents(string: value),
+              let scheme = components.scheme,
+              scheme.caseInsensitiveCompare("file") != .orderedSame else {
+            return value
+        }
+        components.user = nil
+        components.password = nil
+        redactSensitiveQueryItems(in: &components)
+        return components.string ?? value
     }
 
     private func redactSensitiveQueryItems(in components: inout URLComponents) {
@@ -196,7 +226,28 @@ class MPVPlayerManager: ObservableObject {
         return nil
     }
 
-    private func applyRemotePlaybackHeaders(for urls: [URL]) {
+    private func basicAuthorizationHeader(from urls: [URL]) -> String? {
+        for url in urls where !url.isFileURL {
+            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  let username = components.user?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !username.isEmpty else {
+                continue
+            }
+            let password = components.password ?? ""
+            guard let data = "\(username):\(password)".data(using: .utf8) else { continue }
+            return "Authorization: Basic \(data.base64EncodedString())"
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func applyRemotePlaybackHeaders(for urls: [URL]) -> Bool {
+        if let header = basicAuthorizationHeader(from: urls) {
+            mpv_set_property_string(mpv, "http-header-fields", header)
+            log("applied Basic Authorization header for remote playback")
+            return true
+        }
+
         if let token = plexToken(from: urls) {
             let headers = [
                 "X-Plex-Product: OmniPlay",
@@ -208,7 +259,7 @@ class MPVPlayerManager: ObservableObject {
             ].joined(separator: ",")
             mpv_set_property_string(mpv, "http-header-fields", headers)
             log("applied Plex HTTP headers for remote playback")
-            return
+            return false
         }
 
         if let token = embyCompatibleToken(from: urls) {
@@ -218,10 +269,11 @@ class MPVPlayerManager: ObservableObject {
             ].joined(separator: ",")
             mpv_set_property_string(mpv, "http-header-fields", headers)
             log("applied Jellyfin/Emby HTTP headers for remote playback")
-            return
+            return false
         }
 
         mpv_set_property_string(mpv, "http-header-fields", "")
+        return false
     }
 
     private func applyPlaybackQualityModeAsOption() {
@@ -363,7 +415,7 @@ class MPVPlayerManager: ObservableObject {
                 self?.updatePlaybackState()
             }
         }
-        log("loadFiles urls=\(urls.count) first=\(mpvLogArgument(for: urls[0])) start=\(startPosition) isBluRay=\(isBluRay) blurayRoot=\(blurayRootPath ?? "nil")")
+        log("loadFiles urls=\(urls.count) first=\(mpvLogArgument(for: urls[0])) start=\(startPosition) isBluRay=\(isBluRay) blurayRoot=\(blurayRootPath.map { mpvLogArgument(for: $0) } ?? "nil")")
         hasAppliedDefaultSubtitleForCurrentLoad = false
         hasUserSelectedSubtitleTrack = false
         let firstName = urls[0].lastPathComponent.lowercased()
@@ -381,7 +433,7 @@ class MPVPlayerManager: ObservableObject {
             self.applyPlaybackQualityModeAtRuntime()
             mpv_set_property_string(self.mpv, "vd-lavc-o", isDolbyVisionLike ? "enable_dovi=0" : "")
             mpv_set_property_string(self.mpv, "hwdec", "videotoolbox")
-            self.applyRemotePlaybackHeaders(for: urls)
+            let shouldStripUserInfo = self.applyRemotePlaybackHeaders(for: urls)
             self.log("decode profile isDVLike=\(isDolbyVisionLike) hwdec=videotoolbox")
             self.pendingInitialSeekPosition = startPosition > 5.0 ? startPosition : nil
             self.pendingInitialSeekFilename = (startPosition > 5.0 && urls[0].isFileURL) ? urls[0].lastPathComponent : nil
@@ -389,12 +441,13 @@ class MPVPlayerManager: ObservableObject {
             mpv_set_property_string(self.mpv, "start", "0")
             
             if isBluRay, let rootPath = blurayRootPath {
-                mpv_set_property_string(self.mpv, "bluray-device", rootPath)
+                let rootArgument = self.mpvStringArgument(rootPath, stripUserInfo: shouldStripUserInfo)
+                mpv_set_property_string(self.mpv, "bluray-device", rootArgument)
                 self.executeMpvCommand(["loadfile", "bd://", "replace"])
             } else {
-                self.executeMpvCommand(["loadfile", self.mpvLoadArgument(for: urls[0]), "replace"])
+                self.executeMpvCommand(["loadfile", self.mpvLoadArgument(for: urls[0], stripUserInfo: shouldStripUserInfo), "replace"])
                 for url in urls.dropFirst() {
-                    self.executeMpvCommand(["loadfile", self.mpvLoadArgument(for: url), "append"])
+                    self.executeMpvCommand(["loadfile", self.mpvLoadArgument(for: url, stripUserInfo: shouldStripUserInfo), "append"])
                 }
             }
             
@@ -655,7 +708,7 @@ class MPVPlayerManager: ObservableObject {
 
                 if type == "audio" {
                     if !channels.isEmpty {
-                        let fmtCh = channels == "stereo" ? "2.0" : (channels == "mono" ? "1.0" : channels)
+                        let fmtCh = self.formatAudioChannels(channels)
                         niceCodec += " \(fmtCh)"
                     }
                     if baseName.isEmpty { baseName = "音轨 \(id)" }
@@ -708,7 +761,7 @@ class MPVPlayerManager: ObservableObject {
                 best = (track.id, score, index)
             }
         }
-        return best?.id
+        return best?.id ?? subtitleTracks.last?.id
     }
 
     nonisolated private static func subtitlePreferenceScore(defaultSub: String, lang: String, title: String) -> Int? {
@@ -829,6 +882,28 @@ class MPVPlayerManager: ObservableObject {
 
     private func translateLangCode(_ lang: String) -> String {
         Self.translatedLanguageLabel(lang)
+    }
+    private func formatAudioChannels(_ channels: String) -> String {
+        let normalized = channels.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "mono": return "1.0"
+        case "stereo": return "2.0"
+        default: break
+        }
+        if let count = Int(normalized) {
+            switch count {
+            case 1: return "1.0"
+            case 2: return "2.0"
+            case 3: return "3.0"
+            case 4: return "4.0"
+            case 5: return "5.0"
+            case 6: return "5.1"
+            case 7: return "6.1"
+            case 8: return "7.1"
+            default: return "\(count)ch"
+            }
+        }
+        return normalized.replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
     }
     private func formatCodec(_ codec: String) -> String { let c = codec.lowercased(); if c.contains("truehd") { return "TrueHD Atmos" }; if c.contains("dts-hd") || c.contains("dtshd") { return "DTS-HD MA" }; if c.contains("dts") { return "DTS" }; if c.contains("eac3") { return "E-AC3" }; if c.contains("ac3") { return "Dolby AC3" }; if c.contains("aac") { return "AAC" }; if c.contains("flac") { return "FLAC" }; if c.contains("pgs") { return "PGS 图形字幕" }; if c.contains("srt") || c.contains("subrip") { return "SRT" }; if c.contains("ass") { return "ASS" }; return c.uppercased() }
     private func getMpvStringProperty(_ name: String) -> String? { if let cString = mpv_get_property_string(mpv, name) { let result = String(cString: cString); mpv_free(UnsafeMutableRawPointer(mutating: cString)); return result }; return nil }

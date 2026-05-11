@@ -1022,6 +1022,7 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
     {
         return preferred with
         {
+            Id = preferred.Id > 0 ? preferred.Id : fallback.Id,
             Title = preferred.Title ?? fallback.Title,
             Name = preferred.Name ?? fallback.Name,
             OriginalTitle = preferred.OriginalTitle ?? fallback.OriginalTitle,

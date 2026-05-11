@@ -118,6 +118,9 @@ public sealed record MediaServerFileEntry(
                 var title = ((string?)video.Attribute("title"))?.Trim()
                             ?? ((string?)video.Attribute("grandparentTitle"))?.Trim()
                             ?? "Plex";
+                var seriesTitle = ((string?)video.Attribute("grandparentTitle"))?.Trim();
+                var seasonNumber = ParseNullableInt((string?)video.Attribute("parentIndex"));
+                var episodeNumber = ParseNullableInt((string?)video.Attribute("index"));
                 foreach (var part in video.Descendants("Part"))
                 {
                     var key = ((string?)part.Attribute("key"))?.Trim();
@@ -128,8 +131,12 @@ public sealed record MediaServerFileEntry(
 
                     var filePath = ((string?)part.Attribute("file"))?.Trim();
                     var fileName = ResolveFileName(filePath, title);
+                    var metadataPath = section.Type == "show"
+                        ? BuildTvEpisodeMetadataPath(seriesTitle, seasonNumber, episodeNumber, fileName)
+                          ?? (string.IsNullOrWhiteSpace(filePath) ? fileName : filePath)
+                        : string.IsNullOrWhiteSpace(filePath) ? fileName : filePath;
                     results.Add(new MediaServerFileEntry(
-                        string.IsNullOrWhiteSpace(filePath) ? fileName : filePath,
+                        metadataPath,
                         key.TrimStart('/'),
                         fileName,
                         ParseLong((string?)part.Attribute("size")),
@@ -146,9 +153,10 @@ public sealed record MediaServerFileEntry(
         CancellationToken cancellationToken)
     {
         var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(source.AuthConfig);
+        var queryFields = "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber";
         var queryPrefix = string.IsNullOrWhiteSpace(auth?.LibraryId)
-            ? "Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
-            : $"ParentId={Uri.EscapeDataString(auth.LibraryId!.Trim())}&Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources";
+            ? $"Recursive=true&IncludeItemTypes=Movie,Episode&Fields={queryFields}"
+            : $"ParentId={Uri.EscapeDataString(auth.LibraryId!.Trim())}&Recursive=true&IncludeItemTypes=Movie,Episode&Fields={queryFields}";
         var relativePath = string.IsNullOrWhiteSpace(auth?.UserId)
             ? $"Items?{queryPrefix}"
             : $"Users/{Uri.EscapeDataString(auth.UserId!)}/Items?{queryPrefix}";
@@ -172,8 +180,14 @@ public sealed record MediaServerFileEntry(
             }
 
             var mediaSource = item.MediaSources?.FirstOrDefault();
-            var metadataPath = mediaSource?.Path ?? item.Path ?? item.Name ?? item.Id;
-            var fileName = ResolveFileName(metadataPath, item.Name ?? item.Id);
+            var sourcePath = mediaSource?.Path ?? item.Path;
+            var fileName = ResolveFileName(sourcePath, item.Name ?? item.Id);
+            var metadataPath = string.Equals(item.Type, "Episode", StringComparison.OrdinalIgnoreCase)
+                ? BuildTvEpisodeMetadataPath(item.SeriesName, item.ParentIndexNumber, item.IndexNumber, fileName)
+                  ?? sourcePath
+                  ?? item.Name
+                  ?? item.Id
+                : sourcePath ?? item.Name ?? item.Id;
             results.Add(new MediaServerFileEntry(
                 metadataPath,
                 ResolveEmbyCompatiblePlaybackPath(item.Id, mediaSource?.Id, fileName, metadataPath, mediaSource?.Container),
@@ -645,6 +659,65 @@ public sealed record MediaServerFileEntry(
         return long.TryParse(value, out var parsed) ? parsed : 0;
     }
 
+    private static int? ParseNullableInt(string? value)
+    {
+        return int.TryParse(value, out var parsed) && parsed > 0 ? parsed : null;
+    }
+
+    private static string? BuildTvEpisodeMetadataPath(
+        string? seriesTitle,
+        int? seasonNumber,
+        int? episodeNumber,
+        string fallbackName)
+    {
+        var title = SanitizeVirtualPathSegment(seriesTitle);
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return null;
+        }
+
+        var extension = Path.GetExtension(fallbackName);
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            extension = ".mkv";
+        }
+
+        var episodeToken = seasonNumber.HasValue && episodeNumber.HasValue
+            ? $"S{seasonNumber.Value:00}E{episodeNumber.Value:00}"
+            : episodeNumber.HasValue
+                ? $"E{episodeNumber.Value:00}"
+                : null;
+        var fileStem = episodeToken is null
+            ? SanitizeVirtualPathSegment(Path.GetFileNameWithoutExtension(fallbackName))
+            : $"{title}.{episodeToken}";
+        if (string.IsNullOrWhiteSpace(fileStem))
+        {
+            fileStem = title;
+        }
+
+        var seasonFolder = seasonNumber.HasValue
+            ? $"Season {seasonNumber.Value}"
+            : "Season 1";
+        return $"{title}/{seasonFolder}/{fileStem}{extension}";
+    }
+
+    private static string? SanitizeVirtualPathSegment(string? value)
+    {
+        var trimmed = value?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return null;
+        }
+
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            trimmed = trimmed.Replace(invalid, ' ');
+        }
+
+        trimmed = trimmed.Replace('/', ' ').Replace('\\', ' ');
+        return string.Join(' ', trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
     private static string? FirstNonEmpty(params string?[] values)
     {
         return values.FirstOrDefault(static value => !string.IsNullOrWhiteSpace(value))?.Trim();
@@ -705,6 +778,12 @@ public sealed record MediaServerFileEntry(
         public string? Path { get; init; }
 
         public string? Type { get; init; }
+
+        public string? SeriesName { get; init; }
+
+        public int? ParentIndexNumber { get; init; }
+
+        public int? IndexNumber { get; init; }
 
         public List<EmbyMediaSource>? MediaSources { get; init; }
     }

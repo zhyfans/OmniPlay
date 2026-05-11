@@ -55,17 +55,18 @@ public static class MediaSourceNormalizer
             return value;
         }
 
+        var directorySeparators = new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, '\\', '/' };
         var pathRoot = Path.GetPathRoot(value);
         if (!string.IsNullOrWhiteSpace(pathRoot) &&
             string.Equals(
-                value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                pathRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                value.TrimEnd(directorySeparators),
+                pathRoot.TrimEnd(directorySeparators),
                 StringComparison.OrdinalIgnoreCase))
         {
             return pathRoot;
         }
 
-        return value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return value.TrimEnd(directorySeparators);
     }
 
     private static string NormalizeHttpUrl(string value, int? defaultHttpPort = null)

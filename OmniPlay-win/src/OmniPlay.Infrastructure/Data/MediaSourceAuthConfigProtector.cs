@@ -6,6 +6,7 @@ namespace OmniPlay.Infrastructure.Data;
 internal static class MediaSourceAuthConfigProtector
 {
     private const string DpapiPrefix = "dpapi:";
+    private const string PortablePrefix = "base64:";
     private const int CryptProtectUiForbidden = 0x1;
 
     public static string? ProtectForStorage(string? value)
@@ -19,6 +20,10 @@ internal static class MediaSourceAuthConfigProtector
         {
             return value;
         }
+        if (value.StartsWith(PortablePrefix, StringComparison.Ordinal))
+        {
+            return value;
+        }
 
         try
         {
@@ -28,7 +33,7 @@ internal static class MediaSourceAuthConfigProtector
         }
         catch (Exception ex) when (ex is PlatformNotSupportedException or InvalidOperationException or DllNotFoundException or EntryPointNotFoundException)
         {
-            return value;
+            return $"{PortablePrefix}{Convert.ToBase64String(Encoding.UTF8.GetBytes(value))}";
         }
     }
 
@@ -41,7 +46,19 @@ internal static class MediaSourceAuthConfigProtector
 
         if (!value.StartsWith(DpapiPrefix, StringComparison.Ordinal))
         {
-            return value;
+            if (!value.StartsWith(PortablePrefix, StringComparison.Ordinal))
+            {
+                return value;
+            }
+
+            try
+            {
+                return Encoding.UTF8.GetString(Convert.FromBase64String(value[PortablePrefix.Length..]));
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
         }
 
         try
