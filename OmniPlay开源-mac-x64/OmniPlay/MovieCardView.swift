@@ -168,13 +168,14 @@ struct MovieCardView: View {
     private func checkWatchedStatus() {
         Task {
             do {
-                let files = try await AppDatabase.shared.dbQueue.read {
-                    try VideoFile.filter(Column("movieId") == movie.id).fetchAll($0)
+                let movieId = movie.id
+                let files = try await AppDatabase.shared.dbQueue.read { db in
+                    try Self.fetchVisibleFiles(movieId: movieId, in: db)
                 }
-                let hasWatchedFile = files.contains { file in
+                let allFilesWatched = !files.isEmpty && files.allSatisfy { file in
                     file.duration > 0 && (file.playProgress / file.duration) >= 0.95
                 }
-                await MainActor.run { self.isFullyWatched = hasWatchedFile }
+                await MainActor.run { self.isFullyWatched = allFilesWatched }
             } catch {}
         }
     }
@@ -182,16 +183,19 @@ struct MovieCardView: View {
     private func toggleWatched() {
         Task {
             do {
+                let movieId = movie.id
                 try await AppDatabase.shared.dbQueue.write { db in
-                    let files = try VideoFile.filter(Column("movieId") == movie.id).fetchAll(db)
+                    let files = try Self.fetchVisibleFiles(movieId: movieId, in: db)
+                    let shouldMarkWatched = files.contains { file in
+                        !(file.duration > 0 && (file.playProgress / file.duration) >= 0.95)
+                    }
                     for var file in files {
-                        let isWatched = file.duration > 0 && (file.playProgress / file.duration) >= 0.95
-                        if isWatched {
-                            file.playProgress = 0
-                        } else {
+                        if shouldMarkWatched {
                             let duration = file.duration > 0 ? file.duration : 100
                             file.duration = duration
                             file.playProgress = duration
+                        } else {
+                            file.playProgress = 0
                         }
                         file.lastPlayedAt = nil
                         try file.update(db)
@@ -205,11 +209,9 @@ struct MovieCardView: View {
     private func fetchFilesAndStartCache() {
         Task {
             do {
+                let movieId = movie.id
                 let pairs = try await AppDatabase.shared.dbQueue.read { db in
-                    let files = try movie.request(for: Movie.videoFiles).fetchAll(db)
-                    return try files.map { file in
-                        (file, try file.request(for: VideoFile.mediaSource).fetchOne(db))
-                    }
+                    try Self.fetchVisibleSourcePairs(movieId: movieId, in: db)
                 }
                 let cacheableFiles = pairs.filter { file, source in
                     cacheManager.supportsCaching(mediaSource: source) && !cacheManager.isCached(file)
@@ -228,11 +230,9 @@ struct MovieCardView: View {
     private func checkFileAvailability() {
         Task {
             do {
+                let movieId = movie.id
                 let pairs = try await AppDatabase.shared.dbQueue.read { db in
-                    let files = try movie.request(for: Movie.videoFiles).fetchAll(db)
-                    return try files.map { file in
-                        (file, try file.request(for: VideoFile.mediaSource).fetchOne(db))
-                    }
+                    try Self.fetchVisibleSourcePairs(movieId: movieId, in: db)
                 }
                 await MainActor.run {
                     self.movieFiles = pairs.map(\.0)
@@ -254,6 +254,28 @@ struct MovieCardView: View {
     private func evaluateMissingState(with pairs: [(VideoFile, MediaSource?)]) -> Bool {
         pairs.contains { file, source in
             cacheManager.hasMissingSource(for: file, mediaSource: source)
+        }
+    }
+
+    nonisolated private static func fetchVisibleFiles(movieId: Int64?, in db: Database) throws -> [VideoFile] {
+        guard let movieId else { return [] }
+        return try VideoFile.fetchAll(
+            db,
+            sql: """
+            SELECT videoFile.*
+            FROM videoFile
+            JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+            WHERE videoFile.movieId = ?
+              AND COALESCE(mediaSource.isEnabled, 1) = 1
+            """,
+            arguments: [movieId]
+        )
+    }
+
+    nonisolated private static func fetchVisibleSourcePairs(movieId: Int64?, in db: Database) throws -> [(VideoFile, MediaSource?)] {
+        let files = try fetchVisibleFiles(movieId: movieId, in: db)
+        return try files.map { file in
+            (file, try file.request(for: VideoFile.mediaSource).fetchOne(db))
         }
     }
 }

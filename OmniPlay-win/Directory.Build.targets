@@ -1,0 +1,140 @@
+<Project>
+  <UsingTask
+    TaskName="SanitizeAppleDoubleAssetsFile"
+    TaskFactory="RoslynCodeTaskFactory"
+    AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <FilePath ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Linq" />
+      <Code Type="Class" Language="cs"><![CDATA[
+        using System;
+        using System.Collections.Generic;
+        using System.IO;
+        using Microsoft.Build.Framework;
+        using Microsoft.Build.Utilities;
+
+        public sealed class SanitizeAppleDoubleAssetsFile : Task
+        {
+            [Required]
+            public string FilePath { get; set; } = string.Empty;
+
+            public override bool Execute()
+            {
+                if (string.IsNullOrWhiteSpace(FilePath) || !File.Exists(FilePath))
+                {
+                    return true;
+                }
+
+                var text = File.ReadAllText(FilePath);
+                if (text.IndexOf("._", StringComparison.Ordinal) < 0)
+                {
+                    return true;
+                }
+
+                var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                var output = new List<string>(lines.Length);
+                var changed = false;
+
+                for (var index = 0; index < lines.Length; index++)
+                {
+                    var line = lines[index];
+                    if (!IsAppleDoubleJsonEntry(line))
+                    {
+                        output.Add(line);
+                        continue;
+                    }
+
+                    changed = true;
+                    var braceBalance = BraceBalance(line);
+                    while (braceBalance > 0 && index + 1 < lines.Length)
+                    {
+                        index++;
+                        braceBalance += BraceBalance(lines[index]);
+                    }
+                }
+
+                if (!changed)
+                {
+                    return true;
+                }
+
+                RemoveDanglingCommas(output);
+                File.WriteAllText(FilePath, string.Join(Environment.NewLine, output));
+                Log.LogMessage(MessageImportance.Low, $"Removed AppleDouble package entries from {FilePath}");
+                return true;
+            }
+
+            private static bool IsAppleDoubleJsonEntry(string line)
+            {
+                return line.IndexOf("/._", StringComparison.Ordinal) >= 0 ||
+                       line.TrimStart().StartsWith("\"._", StringComparison.Ordinal);
+            }
+
+            private static int BraceBalance(string line)
+            {
+                var balance = 0;
+                foreach (var character in line)
+                {
+                    if (character == '{')
+                    {
+                        balance++;
+                    }
+                    else if (character == '}')
+                    {
+                        balance--;
+                    }
+                }
+
+                return balance;
+            }
+
+            private static void RemoveDanglingCommas(List<string> lines)
+            {
+                for (var index = 0; index + 1 < lines.Count; index++)
+                {
+                    var current = lines[index].TrimEnd();
+                    var next = lines[index + 1].TrimStart();
+                    if (current.EndsWith(",", StringComparison.Ordinal) &&
+                        (next.StartsWith("}", StringComparison.Ordinal) ||
+                         next.StartsWith("]", StringComparison.Ordinal)))
+                    {
+                        lines[index] = lines[index].Substring(0, lines[index].LastIndexOf(','));
+                    }
+                }
+            }
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="SanitizeAppleDoublePackageAssets" BeforeTargets="ResolvePackageAssets" Condition="'$(ProjectAssetsFile)' != ''">
+    <SanitizeAppleDoubleAssetsFile FilePath="$(ProjectAssetsFile)" />
+  </Target>
+
+  <Target Name="RemoveAppleDoubleReferencesBeforeResolve" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="$([System.String]::Copy('%(Reference.Filename)').StartsWith('._'))" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveAppleDoubleReferencesBeforeDeps" BeforeTargets="GenerateBuildDependencyFile;GenerateDepsFile">
+    <ItemGroup>
+      <ReferencePath Remove="@(ReferencePath)" Condition="$([System.String]::Copy('%(ReferencePath.Filename)').StartsWith('._'))" />
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)" Condition="$([System.String]::Copy('%(ReferenceCopyLocalPaths.Filename)').StartsWith('._'))" />
+      <RuntimeCopyLocalItems Remove="@(RuntimeCopyLocalItems)" Condition="$([System.String]::Copy('%(RuntimeCopyLocalItems.Filename)').StartsWith('._'))" />
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="$([System.String]::Copy('%(ResolvedFileToPublish.Filename)').StartsWith('._'))" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveAppleDoubleAnalyzersBeforeCompile" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)" Condition="$([System.String]::Copy('%(Analyzer.Filename)').StartsWith('._'))" />
+      <AdditionalFiles Remove="@(AdditionalFiles)" Condition="$([System.String]::Copy('%(AdditionalFiles.Filename)').StartsWith('._'))" />
+    </ItemGroup>
+  </Target>
+</Project>

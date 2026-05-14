@@ -4,11 +4,16 @@ namespace OmniPlay.Core.Interfaces;
 
 public interface ITmdbMetadataClient
 {
+    Task<TmdbConnectionTestResult> TestConnectionAsync(
+        TmdbSettings settings,
+        CancellationToken cancellationToken = default);
+
     Task<TmdbMetadataMatch?> SearchAsync(
         string mediaType,
         string title,
         string? year,
         TmdbSettings settings,
+        string? secondaryQuery = null,
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<TmdbMetadataMatch>> SearchCandidatesAsync(
@@ -16,6 +21,7 @@ public interface ITmdbMetadataClient
         string title,
         string? year,
         TmdbSettings settings,
+        string? secondaryQuery = null,
         int limit = 8,
         CancellationToken cancellationToken = default);
 

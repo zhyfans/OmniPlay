@@ -66,6 +66,9 @@ public sealed class HlsSessionServiceTests : IDisposable
         Assert.False(capabilities.IsAvailable);
         Assert.Empty(capabilities.HardwareEncoders);
         Assert.Null(capabilities.PreferredHardwareEncoder);
+        Assert.Empty(capabilities.HardwareDecoders);
+        Assert.Null(capabilities.PreferredHardwareDecoder);
+        Assert.Empty(capabilities.HardwareAccelerators);
     }
 
     [Fact]
@@ -77,14 +80,35 @@ public sealed class HlsSessionServiceTests : IDisposable
         var service = new FfmpegHlsSessionService(paths, "ffmpeg");
         var file = new PlayableVideoFile("vf_preview", mediaPath, "sample file.mkv", "movie", 4, 0, null, "hevc", "dts", null);
 
-        var command = service.PreviewCommand(file, HlsPlaybackProfile.CreateTranscode("720p", audioTrackIndex: 1));
+        var command = service.PreviewCommand(
+            file,
+            HlsPlaybackProfile.CreateTranscode("720p", audioTrackIndex: 1, hardwareEncoder: "h264_vaapi"));
 
         Assert.Contains("ffmpeg", command);
         Assert.Contains("-i", command);
         Assert.Contains("sample file.mkv", command);
         Assert.Contains("-map 0:a:1?", command);
-        Assert.Contains("-c:v libx264", command);
+        Assert.Contains("-vaapi_device /dev/dri/renderD128", command);
+        Assert.Contains("-c:v h264_vaapi", command);
+        Assert.Contains("format=nv12,hwupload", command);
         Assert.False(Directory.Exists(paths.TranscodeDirectory));
+    }
+
+    [Fact]
+    public async Task EnsureSessionRejectsSoftwareVideoTranscode()
+    {
+        var mediaPath = Path.Combine(root, "media", "sample.mkv");
+        Touch(mediaPath);
+        var paths = new StoragePaths(Path.Combine(root, "software-block"));
+        paths.EnsureCreated();
+        var service = new FfmpegHlsSessionService(paths, "ffmpeg", TimeSpan.FromMilliseconds(50));
+        var file = new PlayableVideoFile("vf_software", mediaPath, "sample.mkv", "movie", 4, 0, null, "hevc", "dts", null);
+
+        var session = await service.EnsureSessionAsync(file, HlsPlaybackProfile.CreateTranscode("720p"));
+
+        Assert.False(session.IsReady);
+        Assert.False(session.IsRunning);
+        Assert.Contains("禁止软件转码", session.ErrorMessage);
     }
 
     [Fact]

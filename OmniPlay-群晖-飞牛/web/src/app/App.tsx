@@ -1,45 +1,50 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import {
   ArrowLeft,
+  Bug,
+  CheckCircle2,
+  Circle,
   CircleStop,
-  Cloud,
   FolderOpen,
   FolderPlus,
-  Lock,
+  LogOut,
+  Captions,
+  Music2,
+  Pause,
+  Pencil,
   Play,
   Save,
   Search,
   Settings,
   SlidersHorizontal,
+  SkipBack,
+  SkipForward,
+  Star,
   RefreshCw,
-  Sparkles,
   Trash2,
-  Unlock,
   X,
 } from "lucide-react";
 import {
   addLocalMediaSource,
-  addWebDavMediaSource,
   applyLibraryItemMetadata,
   AppSettingsSnapshot,
+  AuthStatus,
   BackgroundTaskSnapshot,
   BackgroundTaskStatus,
   browseLocalDirectories,
-  browseWebDavDirectories,
   CacheUsageSummary,
   CacheSettings,
   cancelLibraryScan,
-  cancelBackgroundTask,
   cancelMetadataEnrichment,
   cancelPlaybackCache,
   cleanupAssetCache,
   cleanupHlsCache,
-  cleanupWebDavCache,
   EpisodeDetail,
   FfmpegTranscodeCapabilities,
   getBackgroundTasks,
   getAppSettings,
+  getAuthStatus,
   getCacheStatus,
   getLibraryScanStatus,
   getMetadataEnrichmentStatus,
@@ -53,24 +58,26 @@ import {
   getLibraryItems,
   getMediaSources,
   LibraryItemDetail,
+  LibraryItemCustomMetadataUpdateRequest,
   LibraryItemSummary,
   LibraryMetadataEnrichmentStatus,
   LibraryScanStatus,
+  login,
   LocalDirectoryBrowseResult,
+  logout,
   MediaSourceSummary,
   PlaybackCacheStatus,
   PlaybackDiagnostics,
   PlaybackSubtitleTrack,
+  ProxyConnectionTestResult,
+  ProxySettings,
   RuntimeSelfCheckSnapshot,
   posterUrl,
   preparePlaybackCache,
+  registerAdmin,
   removeMediaSource,
-  rescrapeLibraryItem,
-  scrapeLibrary,
-  scanMediaSource,
   searchLibraryItemMetadata,
-  setWatchedStatus,
-  setLibraryItemLocked,
+  setLibraryItemWatchedStatus,
   scanLibrary,
   stopHlsSession,
   TmdbMetadataMatch,
@@ -79,12 +86,35 @@ import {
   updateAppSettings,
   updateMediaSource,
   updatePlaybackProgress,
-  testWebDavConnection,
+  testTmdbConnection,
+  testProxyConnection,
+  TmdbConnectionTestResult,
+  updateLibraryItemCustomMetadata,
   VideoFileSummary,
-  WebDavDirectoryBrowseResult,
 } from "../shared/api/client";
 
+type MetadataSearchState = {
+  item: LibraryItemSummary;
+  detail: LibraryItemDetail | null;
+  query: string;
+  year: string;
+  candidates: TmdbMetadataMatch[];
+  isLoadingDetail: boolean;
+  isSearching: boolean;
+  isApplying: boolean;
+  error: string;
+};
+
+type CustomMetadataEditState = {
+  detail: LibraryItemDetail;
+  isSaving: boolean;
+  error: string;
+};
+
 export function App() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
   const [items, setItems] = useState<LibraryItemSummary[]>([]);
   const [sources, setSources] = useState<MediaSourceSummary[]>([]);
   const [taskSnapshot, setTaskSnapshot] = useState<BackgroundTaskSnapshot | null>(null);
@@ -96,19 +126,25 @@ export function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [searchText, setSearchText] = useState("");
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isSortOpen, setIsSortOpen] = useState(false);
+  const [sortKey, setSortKey] = useState<"title" | "rating" | "year">("year");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [isLoading, setIsLoading] = useState(true);
   const [isScanning, setIsScanning] = useState(false);
   const [scanStatus, setScanStatus] = useState<LibraryScanStatus | null>(null);
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeStatus, setScrapeStatus] = useState<LibraryMetadataEnrichmentStatus | null>(null);
   const [selectedDetail, setSelectedDetail] = useState<LibraryItemDetail | null>(null);
-  const [metadataCandidates, setMetadataCandidates] = useState<TmdbMetadataMatch[]>([]);
+  const [metadataSearch, setMetadataSearch] = useState<MetadataSearchState | null>(null);
+  const [customMetadataEdit, setCustomMetadataEdit] = useState<CustomMetadataEditState | null>(null);
   const [playingFile, setPlayingFile] = useState<VideoFileSummary | null>(null);
   const [isDetailLoading, setIsDetailLoading] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [errorText, setErrorText] = useState("");
   const scanWasRunningRef = useRef(false);
   const scrapeWasRunningRef = useRef(false);
+  const scrapeLoadedUpdatedItemsRef = useRef(0);
   const cacheCleanupWasRunningRef = useRef(false);
   const sourceCleanupWasRunningRef = useRef(false);
   const selectedDetailRef = useRef<LibraryItemDetail | null>(null);
@@ -132,8 +168,10 @@ export function App() {
       setScanStatus(nextStatus);
       setIsScanning(nextStatus.isRunning);
       const nextStatusText = formatScanStatus(nextStatus);
-      if (nextStatusText) {
+      if (nextStatus.isRunning && nextStatusText) {
         setStatusText(nextStatusText);
+      } else if (!nextStatus.isRunning && !nextStatus.wasCanceled) {
+        setStatusText("");
       }
 
       if (scanWasRunningRef.current && !nextStatus.isRunning && !nextStatus.wasCanceled) {
@@ -150,11 +188,20 @@ export function App() {
       setScrapeStatus(nextStatus);
       setIsScraping(nextStatus.isRunning);
       const nextStatusText = formatScrapeStatus(nextStatus);
-      if (nextStatusText) {
+      if (nextStatus.isRunning && nextStatusText) {
         setStatusText(nextStatusText);
+      } else if (!nextStatus.isRunning && !nextStatus.wasCanceled) {
+        setStatusText("");
+      }
+
+      const updatedItems = nextStatus.progress?.updatedItemCount ?? 0;
+      if (nextStatus.isRunning && updatedItems > scrapeLoadedUpdatedItemsRef.current) {
+        scrapeLoadedUpdatedItemsRef.current = updatedItems;
+        void loadData().catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
       }
 
       if (scrapeWasRunningRef.current && !nextStatus.isRunning && !nextStatus.wasCanceled) {
+        scrapeLoadedUpdatedItemsRef.current = 0;
         void loadData().catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
         const detailId = selectedDetailRef.current?.id;
         if (!detailId || (nextStatus.targetLibraryItemId && nextStatus.targetLibraryItemId !== detailId)) {
@@ -165,6 +212,10 @@ export function App() {
         void getLibraryItemDetail(detailId)
           .then(setSelectedDetail)
           .catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
+      }
+
+      if (!nextStatus.isRunning) {
+        scrapeLoadedUpdatedItemsRef.current = 0;
       }
 
       scrapeWasRunningRef.current = nextStatus.isRunning;
@@ -194,16 +245,33 @@ export function App() {
   }
 
   useEffect(() => {
+    void getAuthStatus()
+      .then(setAuthStatus)
+      .catch((error: unknown) => setAuthError(error instanceof Error ? error.message : String(error)))
+      .finally(() => setIsAuthLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (!authStatus?.isAuthenticated) {
+      setIsLoading(false);
+      return;
+    }
+
+    setIsLoading(true);
     void loadData()
       .catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)))
       .finally(() => setIsLoading(false));
-  }, [loadData]);
+  }, [authStatus?.isAuthenticated, loadData]);
 
   useEffect(() => {
     selectedDetailRef.current = selectedDetail;
   }, [selectedDetail]);
 
   useEffect(() => {
+    if (!authStatus?.isAuthenticated) {
+      return;
+    }
+
     let disposed = false;
     let pollHandle = 0;
 
@@ -219,8 +287,8 @@ export function App() {
     }
 
     void pollStatus();
+    pollHandle = window.setInterval(() => void pollStatus(), 1500);
     if (typeof EventSource === "undefined") {
-      pollHandle = window.setInterval(() => void pollStatus(), 1500);
       return () => {
         disposed = true;
         window.clearInterval(pollHandle);
@@ -237,9 +305,6 @@ export function App() {
     });
     events.onerror = () => {
       events.close();
-      if (!disposed && pollHandle === 0) {
-        pollHandle = window.setInterval(() => void pollStatus(), 1500);
-      }
     };
 
     return () => {
@@ -249,9 +314,13 @@ export function App() {
         window.clearInterval(pollHandle);
       }
     };
-  }, [applyScanStatus]);
+  }, [applyScanStatus, authStatus?.isAuthenticated]);
 
   useEffect(() => {
+    if (!authStatus?.isAuthenticated) {
+      return;
+    }
+
     let disposed = false;
     let pollHandle = 0;
 
@@ -267,8 +336,8 @@ export function App() {
     }
 
     void pollStatus();
+    pollHandle = window.setInterval(() => void pollStatus(), 1500);
     if (typeof EventSource === "undefined") {
-      pollHandle = window.setInterval(() => void pollStatus(), 1500);
       return () => {
         disposed = true;
         window.clearInterval(pollHandle);
@@ -285,9 +354,6 @@ export function App() {
     });
     events.onerror = () => {
       events.close();
-      if (!disposed && pollHandle === 0) {
-        pollHandle = window.setInterval(() => void pollStatus(), 1500);
-      }
     };
 
     return () => {
@@ -297,9 +363,13 @@ export function App() {
         window.clearInterval(pollHandle);
       }
     };
-  }, [applyScrapeStatus]);
+  }, [applyScrapeStatus, authStatus?.isAuthenticated]);
 
   useEffect(() => {
+    if (!authStatus?.isAuthenticated) {
+      return;
+    }
+
     let disposed = false;
     let pollHandle = 0;
 
@@ -348,56 +418,70 @@ export function App() {
         window.clearInterval(pollHandle);
       }
     };
-	  }, []);
+	  }, [authStatus?.isAuthenticated]);
 
   const displayedItems = useMemo(() => {
     const normalizedSearch = searchText.trim().toLowerCase();
     return items
       .filter((item) => item.title.toLowerCase().includes(normalizedSearch))
-      .sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
-  }, [items, searchText]);
+      .sort((a, b) => compareLibraryItems(a, b, sortKey, sortDirection));
+  }, [items, searchText, sortDirection, sortKey]);
 
   const continueItems = useMemo(() => {
-    return items.filter((item) => item.maxProgressSeconds > 0 && item.maxDurationSeconds > 0).slice(0, 12);
+    return items
+      .filter((item) => !item.isWatched && item.maxProgressSeconds > 0 && item.maxDurationSeconds > 0)
+      .slice(0, 12);
   }, [items]);
   const scanPercent = scanProgressPercent(scanStatus);
   const scrapePercent = scrapeProgressPercent(scrapeStatus);
+  const topStatusText =
+    errorText ||
+    (scrapeStatus?.isRunning ? formatScrapeStatus(scrapeStatus) : "") ||
+    (scanStatus?.isRunning ? formatScanStatus(scanStatus) : "") ||
+    statusText;
 
-  async function handleCreateSource(path: string, name: string): Promise<boolean> {
-    setIsSavingSource(true);
-    setErrorText("");
-    setStatusText("正在添加媒体源");
-    try {
-      await addLocalMediaSource(path.trim(), name.trim() || undefined);
-      setSources(await getMediaSources());
-      setStatusText("媒体源已添加，可开始扫描");
-      return true;
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-      return false;
-    } finally {
-      setIsSavingSource(false);
-    }
+  async function handleAuthenticate(username: string, password: string) {
+    setAuthError("");
+    const nextStatus = authStatus?.isSetupRequired
+      ? await registerAdmin(username, password)
+      : await login(username, password);
+    setAuthStatus(nextStatus);
   }
 
-  async function handleCreateWebDavSource(
-    url: string,
-    name: string,
-    username: string,
-    password: string,
-  ): Promise<boolean> {
+  async function handleLogout() {
+    setErrorText("");
+    setStatusText("");
+    await logout();
+    setAuthStatus(await getAuthStatus());
+    setItems([]);
+    setSources([]);
+    setTaskSnapshot(null);
+    setCacheStatus(null);
+    setSelectedDetail(null);
+    setPlayingFile(null);
+  }
+
+  async function handleCreateSources(paths: string[]): Promise<boolean> {
+    const normalizedPaths = Array.from(new Set(paths.map((path) => path.trim()).filter(Boolean)));
+    if (normalizedPaths.length === 0) {
+      return false;
+    }
+
     setIsSavingSource(true);
     setErrorText("");
-    setStatusText("正在添加 WebDAV 媒体源");
+    setStatusText(normalizedPaths.length === 1 ? "正在添加媒体源" : `正在添加 ${normalizedPaths.length} 个媒体源`);
     try {
-      await addWebDavMediaSource(
-        url.trim(),
-        name.trim() || undefined,
-        username.trim() || undefined,
-        password || undefined,
-      );
+      for (const path of normalizedPaths) {
+        await addLocalMediaSource(path);
+      }
       setSources(await getMediaSources());
-      setStatusText("WebDAV 媒体源已添加");
+      if (isScanning || isScraping) {
+        setStatusText("媒体源已添加，当前扫描/刮削结束后可再次扫描");
+        return true;
+      }
+
+      setStatusText("媒体源已添加，正在自动扫描并刮削");
+      applyScanStatus(await scanLibrary(buildRefreshRequest()));
       return true;
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
@@ -413,7 +497,10 @@ export function App() {
     setStatusText("正在更新媒体源");
     try {
       const updated = await updateMediaSource(sourceId, { name: name.trim(), isEnabled });
+      const nextItems = await getLibraryItems();
       setSources((current) => current.map((source) => (source.id === updated.id ? updated : source)));
+      setItems(nextItems);
+      setSelectedDetail((current) => (current && nextItems.some((item) => item.id === current.id) ? current : null));
       setStatusText("媒体源已更新");
       return true;
     } catch (error) {
@@ -435,7 +522,8 @@ export function App() {
         tasks: [task, ...(snapshot?.tasks.filter((item) => item.id !== task.id) ?? [])],
         activeTask: task.isRunning ? task : snapshot?.activeTask ?? null,
       }));
-      setStatusText("媒体源清理已提交");
+      await loadData();
+      setStatusText(task.isRunning ? "媒体源已移除，正在清理索引" : "媒体源已移除");
       return true;
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
@@ -445,31 +533,20 @@ export function App() {
     }
   }
 
-  async function handleScan() {
-    setIsScanning(true);
-    setErrorText("");
-    setStatusText("正在扫描");
-    try {
-      applyScanStatus(await scanLibrary());
-      setStatusText("扫描已提交");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-      setIsScanning(false);
-    }
+  function buildRefreshRequest() {
+    return { sortKey, sortDirection };
   }
 
-  async function handleScanSource(sourceId: number): Promise<boolean> {
+  async function handleRefreshLibrary() {
     setIsScanning(true);
     setErrorText("");
-    setStatusText("正在扫描媒体源");
+    setStatusText("正在扫描并刮削");
     try {
-      applyScanStatus(await scanMediaSource(sourceId));
-      setStatusText("媒体源扫描已提交");
-      return true;
+      applyScanStatus(await scanLibrary(buildRefreshRequest()));
+      setStatusText("扫描并刮削已提交");
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
       setIsScanning(false);
-      return false;
     }
   }
 
@@ -483,19 +560,6 @@ export function App() {
     }
   }
 
-  async function handleScrape() {
-    setIsScraping(true);
-    setErrorText("");
-    setStatusText("正在刮削");
-    try {
-      applyScrapeStatus(await scrapeLibrary());
-      setStatusText("刮削已提交");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-      setIsScraping(false);
-    }
-  }
-
   async function handleCancelScrape() {
     setErrorText("");
     setStatusText("正在取消刮削");
@@ -503,6 +567,17 @@ export function App() {
       applyScrapeStatus(await cancelMetadataEnrichment());
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleCancelRefresh() {
+    if (isScanning) {
+      await handleCancelScan();
+      return;
+    }
+
+    if (isScraping) {
+      await handleCancelScrape();
     }
   }
 
@@ -540,18 +615,6 @@ export function App() {
     }
   }
 
-  async function handleCleanupWebDavCache() {
-    setErrorText("");
-    setStatusText("正在提交 WebDAV 缓存清理");
-    try {
-      const task = await cleanupWebDavCache();
-      pushBackgroundTask(task);
-      setStatusText("WebDAV 缓存清理已提交");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-    }
-  }
-
   async function handleSaveCacheSettings(
     hlsRetentionHours: number,
     imageCleanupScope: string,
@@ -583,12 +646,13 @@ export function App() {
     tmdb: AppSettingsSnapshot["tmdb"],
     cache: CacheSettings,
     playback: AppSettingsSnapshot["playback"],
+    proxy: ProxySettings,
   ) {
     setErrorText("");
     setStatusText("正在保存设置");
     setIsSavingSettings(true);
     try {
-      const nextSettings = await updateAppSettings({ tmdb, cache, playback });
+      const nextSettings = await updateAppSettings({ tmdb, cache, playback, proxy });
       setSettings(nextSettings);
       setStatusText("设置已保存");
       setIsSettingsOpen(false);
@@ -599,96 +663,143 @@ export function App() {
     }
   }
 
-  async function handleRescrapeCurrentDetail() {
-    if (!selectedDetail) {
-      return;
-    }
-
-    setIsScraping(true);
-    setErrorText("");
-    setStatusText("正在提交重刮削");
-    try {
-      applyScrapeStatus(await rescrapeLibraryItem(selectedDetail.id));
-      setStatusText("重刮削已提交");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-      setIsScraping(false);
-    }
-  }
-
-  async function handleSearchCurrentDetailMetadata() {
-    if (!selectedDetail) {
-      return;
-    }
-
-    const query = window.prompt("搜索 TMDB", selectedDetail.title);
-    if (!query?.trim()) {
-      return;
-    }
-
-    setErrorText("");
-    setStatusText("正在搜索匹配项");
-    try {
-      const candidates = await searchLibraryItemMetadata(
-        selectedDetail.id,
-        query.trim(),
-        selectedDetail.itemKind,
-        selectedDetail.releaseDate?.slice(0, 4),
-      );
-      setMetadataCandidates(candidates);
-      setStatusText(candidates.length === 0 ? "未找到匹配项" : `找到 ${candidates.length} 个匹配项`);
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  async function handleApplyMetadataCandidate(match: TmdbMetadataMatch) {
-    if (!selectedDetail) {
-      return;
-    }
-
-    setIsDetailLoading(true);
-    setErrorText("");
-    setStatusText("正在应用匹配项");
-    try {
-      const detail = await applyLibraryItemMetadata(selectedDetail.id, match);
+  function syncOpenDetail(detail: LibraryItemDetail) {
+    if (selectedDetailRef.current?.id === detail.id) {
       setSelectedDetail(detail);
       selectedDetailRef.current = detail;
-      setMetadataCandidates([]);
+    }
+  }
+
+  async function handleOpenMetadataSearch(item: LibraryItemSummary) {
+    setErrorText("");
+    setStatusText("");
+    setMetadataSearch({
+      item,
+      detail: null,
+      query: item.title,
+      year: item.releaseDate?.slice(0, 4) ?? "",
+      candidates: [],
+      isLoadingDetail: true,
+      isSearching: false,
+      isApplying: false,
+      error: "",
+    });
+
+    try {
+      const detail = await getLibraryItemDetail(item.id);
+      setMetadataSearch((current) =>
+        current?.item.id === item.id
+          ? {
+              ...current,
+              detail,
+              isLoadingDetail: false,
+              year: current.year || detail.releaseDate?.slice(0, 4) || "",
+            }
+          : current,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMetadataSearch((current) =>
+        current?.item.id === item.id ? { ...current, isLoadingDetail: false, error: message } : current,
+      );
+    }
+  }
+
+  async function handleSearchMetadataFromCard() {
+    if (!metadataSearch) {
+      return;
+    }
+
+    const query = metadataSearch.query.trim();
+    if (!query) {
+      setMetadataSearch({ ...metadataSearch, error: "请输入影视名称。" });
+      return;
+    }
+
+    setMetadataSearch({ ...metadataSearch, isSearching: true, error: "", candidates: [] });
+    try {
+      const candidates = await searchLibraryItemMetadata(
+        metadataSearch.item.id,
+        query,
+        "all",
+        metadataSearch.year.trim(),
+      );
+      setMetadataSearch((current) =>
+        current?.item.id === metadataSearch.item.id
+          ? {
+              ...current,
+              candidates,
+              isSearching: false,
+              error: candidates.length === 0 ? `未找到与「${query}」相关的影视。` : "",
+            }
+          : current,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMetadataSearch((current) =>
+        current?.item.id === metadataSearch.item.id ? { ...current, isSearching: false, error: message } : current,
+      );
+    }
+  }
+
+  async function handleApplyMetadataSearchCandidate(match: TmdbMetadataMatch) {
+    if (!metadataSearch) {
+      return;
+    }
+
+    setMetadataSearch({ ...metadataSearch, isApplying: true, error: "" });
+    try {
+      const detail = await applyLibraryItemMetadata(metadataSearch.item.id, match);
+      syncOpenDetail(detail);
+      setMetadataSearch(null);
       setStatusText("已应用匹配项并锁定元数据");
       await loadData();
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsDetailLoading(false);
+      const message = error instanceof Error ? error.message : String(error);
+      setMetadataSearch((current) =>
+        current?.item.id === metadataSearch.item.id ? { ...current, isApplying: false, error: message } : current,
+      );
     }
   }
 
-  async function handleToggleCurrentDetailLock() {
-    if (!selectedDetail) {
+  async function handleOpenCustomMetadataEdit(item: LibraryItemSummary) {
+    setErrorText("");
+    setStatusText("正在读取条目资料");
+    try {
+      const detail = await getLibraryItemDetail(item.id);
+      setCustomMetadataEdit({ detail, isSaving: false, error: "" });
+      setStatusText("");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleSaveCustomMetadata(request: LibraryItemCustomMetadataUpdateRequest) {
+    if (!customMetadataEdit) {
       return;
     }
 
-    setIsDetailLoading(true);
-    setErrorText("");
+    setCustomMetadataEdit({ ...customMetadataEdit, isSaving: true, error: "" });
     try {
-      const detail = await setLibraryItemLocked(selectedDetail.id, !selectedDetail.isLocked);
-      setSelectedDetail(detail);
-      selectedDetailRef.current = detail;
-      setStatusText(detail.isLocked ? "已锁定元数据" : "已解锁元数据");
+      const detail = await updateLibraryItemCustomMetadata(customMetadataEdit.detail.id, request);
+      syncOpenDetail(detail);
+      setCustomMetadataEdit(null);
+      setStatusText("已保存自定义资料并锁定元数据");
       await loadData();
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsDetailLoading(false);
+      const message = error instanceof Error ? error.message : String(error);
+      setCustomMetadataEdit((current) => (current ? { ...current, isSaving: false, error: message } : current));
     }
   }
 
-  async function handleCancelTask(taskId: string) {
+  async function toggleLibraryItemWatched(item: LibraryItemSummary) {
+    const nextWatched = !item.isWatched;
     setErrorText("");
     try {
-      await cancelBackgroundTask(taskId);
-      setTaskSnapshot(await getBackgroundTasks());
+      const detail = await setLibraryItemWatchedStatus(item.id, nextWatched);
+      syncOpenDetail(detail);
+      setStatusText(nextWatched ? "已标记为已看" : "已标记为未看");
+      await loadData();
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
     }
@@ -698,25 +809,12 @@ export function App() {
     setIsDetailLoading(true);
     setErrorText("");
     setPlayingFile(null);
-    setMetadataCandidates([]);
     try {
       setSelectedDetail(await getLibraryItemDetail(item.id));
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
     } finally {
       setIsDetailLoading(false);
-    }
-  }
-
-  async function toggleWatched(file: VideoFileSummary) {
-    try {
-      await setWatchedStatus(file.id, !file.isWatched, file.durationSeconds);
-      if (selectedDetail) {
-        setSelectedDetail(await getLibraryItemDetail(selectedDetail.id));
-      }
-      await loadData();
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -731,6 +829,17 @@ export function App() {
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  if (isAuthLoading || !authStatus?.isAuthenticated) {
+    return (
+      <AuthGate
+        errorText={authError}
+        isLoading={isAuthLoading}
+        isSetupRequired={authStatus?.isSetupRequired ?? false}
+        onSubmit={(username, password) => handleAuthenticate(username, password)}
+      />
+    );
   }
 
   if (selectedDetail && playingFile) {
@@ -751,23 +860,12 @@ export function App() {
       <DetailView
         detail={selectedDetail}
         errorText={errorText}
-        isRescraping={isScraping}
-        isRefreshing={isDetailLoading}
-        metadataCandidates={metadataCandidates}
+        showEpisodeDetails={settings?.playback.showEpisodeDetails ?? true}
         onBack={() => {
           setPlayingFile(null);
           setSelectedDetail(null);
-          setMetadataCandidates([]);
         }}
-        onApplyMetadataCandidate={(match) => void handleApplyMetadataCandidate(match)}
-        onCancelTask={(taskId) => void handleCancelTask(taskId)}
-        onSearchMetadata={() => void handleSearchCurrentDetailMetadata()}
         onPlay={(file) => setPlayingFile(file)}
-        onRescrape={() => void handleRescrapeCurrentDetail()}
-        onToggleMetadataLock={() => void handleToggleCurrentDetailLock()}
-        onToggleWatched={toggleWatched}
-        statusText={statusText}
-        taskSnapshot={taskSnapshot}
       />
     );
   }
@@ -775,53 +873,54 @@ export function App() {
   return (
     <main className="shell">
       <header className="topbar">
-        <div className="brand">OmniPlay NAS</div>
+        <div className="topStatus" aria-live="polite">
+          {topStatusText ? <strong className={errorText ? "error" : ""}>{topStatusText}</strong> : null}
+          <div>
+            {scanPercent !== null ? (
+              <progress aria-label="scan progress" className="scanProgress" max={100} value={scanPercent} />
+            ) : null}
+            {scrapePercent !== null ? (
+              <progress aria-label="scrape progress" className="scanProgress" max={100} value={scrapePercent} />
+            ) : null}
+          </div>
+        </div>
         <div className="toolbar" aria-label="library tools">
-          <button aria-label="search">
-            <Search size={19} />
+          <button
+            aria-label="media sources"
+            onClick={() => setIsSourceManagerOpen(true)}
+            title="媒体源"
+          >
+            <FolderPlus size={20} />
           </button>
-          <button aria-label="sort">
-            <SlidersHorizontal size={19} />
+          <button
+            aria-label="scan and scrape"
+            disabled={isScanning || isScraping || sources.length === 0}
+            onClick={handleRefreshLibrary}
+            title="扫描并刮削"
+          >
+            <RefreshCw size={19} className={isScanning || isScraping ? "spin" : ""} />
           </button>
-          <button aria-label="scan" disabled={isScanning || isScraping || sources.length === 0} onClick={handleScan}>
-            <RefreshCw size={19} className={isScanning ? "spin" : ""} />
-          </button>
-          {isScanning ? (
-            <button aria-label="cancel scan" disabled={isScraping} onClick={handleCancelScan}>
+          {isScanning || isScraping ? (
+            <button aria-label="cancel refresh" onClick={() => void handleCancelRefresh()} title="取消">
               <CircleStop size={19} />
             </button>
           ) : null}
-          <button aria-label="scrape" disabled={isScanning || isScraping || items.length === 0} onClick={handleScrape}>
-            <Sparkles size={19} className={isScraping ? "pulse" : ""} />
+          <button aria-label="settings" disabled={!settings} onClick={() => setIsSettingsOpen(true)} title="设置">
+            <Settings size={19} />
           </button>
-          {isScraping ? (
-            <button aria-label="cancel scrape" disabled={isScanning} onClick={handleCancelScrape}>
-              <CircleStop size={19} />
-            </button>
-          ) : null}
-	          <button
-	            aria-label="media sources"
-	            disabled={isScanning || isScraping}
-	            onClick={() => setIsSourceManagerOpen(true)}
-	            title="媒体源"
-	          >
-	            <FolderPlus size={20} />
-	          </button>
-	          <button aria-label="settings" disabled={!settings} onClick={() => setIsSettingsOpen(true)} title="设置">
-	            <Settings size={19} />
-	          </button>
+          <button aria-label="logout" onClick={() => void handleLogout()} title="退出登录">
+            <LogOut size={18} />
+          </button>
         </div>
       </header>
 
       {isSourceManagerOpen ? (
         <SourceManagerPanel
-          disabled={isScanning || isScraping || isSavingSource}
+          disabled={isSavingSource}
           isSaving={isSavingSource}
-          onAdd={(path, name) => handleCreateSource(path, name)}
-          onAddWebDav={(url, name, username, password) => handleCreateWebDavSource(url, name, username, password)}
+          onAdd={(paths) => handleCreateSources(paths)}
           onClose={() => setIsSourceManagerOpen(false)}
           onRemove={(sourceId) => handleRemoveSource(sourceId)}
-          onScan={(sourceId) => handleScanSource(sourceId)}
           onUpdate={(sourceId, name, isEnabled) => handleUpdateSource(sourceId, name, isEnabled)}
           scanStatus={scanStatus}
           sources={sources}
@@ -832,71 +931,245 @@ export function App() {
         <SettingsPanel
           isSaving={isSavingSettings}
           onClose={() => setIsSettingsOpen(false)}
-          onSave={(tmdb, cache, playback) => void handleSaveAppSettings(tmdb, cache, playback)}
+          onSave={(tmdb, cache, playback, proxy) => void handleSaveAppSettings(tmdb, cache, playback, proxy)}
           settings={settings}
+        />
+      ) : null}
+
+      {metadataSearch ? (
+        <MetadataSearchModal
+          state={metadataSearch}
+          onApply={(match) => void handleApplyMetadataSearchCandidate(match)}
+          onChangeQuery={(query) => setMetadataSearch((current) => (current ? { ...current, query } : current))}
+          onChangeYear={(year) => setMetadataSearch((current) => (current ? { ...current, year } : current))}
+          onClose={() => setMetadataSearch(null)}
+          onSearch={() => void handleSearchMetadataFromCard()}
+        />
+      ) : null}
+
+      {customMetadataEdit ? (
+        <CustomMetadataEditModal
+          errorText={customMetadataEdit.error}
+          isSaving={customMetadataEdit.isSaving}
+          detail={customMetadataEdit.detail}
+          onClose={() => setCustomMetadataEdit(null)}
+          onSave={(request) => void handleSaveCustomMetadata(request)}
         />
       ) : null}
 
       <section className="continue">
         <h1>继续播放</h1>
-        {continueItems.length === 0 ? (
-          <div className="emptyRow">
-            <Play size={22} />
-            <span>暂无续播</span>
-          </div>
-        ) : (
-          <div className="continueRail">
+        {continueItems.length > 0 ? (
+          <div className="posterGrid">
             {continueItems.map((item) => (
-              <PosterCard item={item} key={item.id} compact onOpen={openDetail} />
+              <PosterCard
+                item={item}
+                key={item.id}
+                onEdit={(target) => void handleOpenCustomMetadataEdit(target)}
+                onOpen={openDetail}
+                onSearchMetadata={(target) => void handleOpenMetadataSearch(target)}
+                onToggleWatched={(target) => void toggleLibraryItemWatched(target)}
+                showProgress
+              />
             ))}
           </div>
-        )}
+        ) : null}
       </section>
 
       <section className="library">
         <div className="sectionHeader">
           <h2>所有影视</h2>
-          <span>{displayedItems.length} items</span>
+          <div className="libraryHeaderActions">
+            <button aria-label="search library" onClick={() => setIsSearchOpen((current) => !current)} title="搜索">
+              <Search size={19} />
+            </button>
+            <div className="sortMenu">
+              <button aria-label="sort library" onClick={() => setIsSortOpen((current) => !current)} title="排序">
+                <SlidersHorizontal size={18} />
+              </button>
+              {isSortOpen ? (
+                <div className="sortOptions">
+                  {[
+                    ["title", "名称"],
+                    ["rating", "评分"],
+                    ["year", "上映年份"],
+                  ].map(([value, label]) => (
+                    <button
+                      className={sortKey === value ? "active" : ""}
+                      key={value}
+                      onClick={() => {
+                        setSortKey(value as "title" | "rating" | "year");
+                        setIsSortOpen(false);
+                      }}
+                      type="button"
+                    >
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+            <button
+              aria-label="toggle sort direction"
+              className="directionButton"
+              onClick={() => setSortDirection((current) => (current === "desc" ? "asc" : "desc"))}
+              title={sortDirection === "desc" ? "降序" : "升序"}
+            >
+              {sortDirection === "desc" ? "↓" : "↑"}
+            </button>
+          </div>
         </div>
-	        <div className="libraryControls">
-	          <input
-	            aria-label="search library"
-            onChange={(event) => setSearchText(event.target.value)}
-            placeholder="搜索"
-            value={searchText}
-          />
-          {statusText ? <span>{statusText}</span> : null}
-          {scanPercent !== null ? (
-            <progress aria-label="scan progress" className="scanProgress" max={100} value={scanPercent} />
-          ) : null}
-          {scrapePercent !== null ? (
-            <progress aria-label="scrape progress" className="scanProgress" max={100} value={scrapePercent} />
-	          ) : null}
-	          {errorText ? <strong>{errorText}</strong> : null}
-	        </div>
-	        <CacheMaintenance
-	          cacheStatus={cacheStatus}
-	          cacheSettings={settings?.cache ?? null}
-	          disabled={Boolean(taskSnapshot?.activeTask?.isRunning)}
-	          isSaving={isSavingCacheSettings}
-	          onCleanupAssets={() => void handleCleanupAssetCache()}
-	          onCleanupTranscode={() => void handleCleanupTranscodeCache()}
-	          onCleanupWebDav={() => void handleCleanupWebDavCache()}
-	          onSaveSettings={(hlsRetentionHours, imageCleanupScope, webDavRetentionHours, webDavMaxGb) =>
-	            void handleSaveCacheSettings(hlsRetentionHours, imageCleanupScope, webDavRetentionHours, webDavMaxGb)
-	          }
-	        />
-	        <TaskCenter snapshot={taskSnapshot} onCancel={(taskId) => void handleCancelTask(taskId)} />
+        {isSearchOpen ? (
+          <div className="librarySearchRow">
+            <input
+              aria-label="search library"
+              onChange={(event) => setSearchText(event.target.value)}
+              placeholder="搜索"
+              value={searchText}
+            />
+          </div>
+        ) : null}
         <div className="posterGrid">
           {isLoading ? <div className="emptyRow">加载中</div> : null}
           {!isLoading && displayedItems.length === 0 ? <div className="emptyRow">媒体库为空</div> : null}
           {displayedItems.map((item) => (
-            <PosterCard item={item} key={item.id} onOpen={openDetail} />
+            <PosterCard
+              item={item}
+              key={item.id}
+              onEdit={(target) => void handleOpenCustomMetadataEdit(target)}
+              onOpen={openDetail}
+              onSearchMetadata={(target) => void handleOpenMetadataSearch(target)}
+              onToggleWatched={(target) => void toggleLibraryItemWatched(target)}
+            />
           ))}
         </div>
       </section>
     </main>
   );
+}
+
+function AuthGate({
+  errorText,
+  isLoading,
+  isSetupRequired,
+  onSubmit,
+}: {
+  errorText: string;
+  isLoading: boolean;
+  isSetupRequired: boolean;
+  onSubmit: (username: string, password: string) => Promise<void>;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLocalError("");
+    setIsSubmitting(true);
+    try {
+      await onSubmit(username, password);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="authShell">
+      <form className="authPanel" onSubmit={handleSubmit}>
+        <header>
+          <h1>OmniPlay</h1>
+          <span>{isSetupRequired ? "注册管理员" : "登录"}</span>
+        </header>
+        <label>
+          <span>用户名</span>
+          <input
+            autoComplete="username"
+            disabled={isLoading || isSubmitting}
+            onChange={(event) => setUsername(event.target.value)}
+            value={username}
+          />
+        </label>
+        <label>
+          <span>密码</span>
+          <input
+            autoComplete={isSetupRequired ? "new-password" : "current-password"}
+            disabled={isLoading || isSubmitting}
+            onChange={(event) => setPassword(event.target.value)}
+            type="password"
+            value={password}
+          />
+        </label>
+        {errorText || localError ? <strong>{localError || errorText}</strong> : null}
+        <button disabled={isLoading || isSubmitting} type="submit">
+          <span>{isSubmitting ? "处理中" : isSetupRequired ? "注册" : "登录"}</span>
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function compareLibraryItems(
+  a: LibraryItemSummary,
+  b: LibraryItemSummary,
+  sortKey: "title" | "rating" | "year",
+  sortDirection: "asc" | "desc",
+): number {
+  const direction = sortDirection === "desc" ? -1 : 1;
+  let result = 0;
+
+  if (sortKey === "title") {
+    result = a.title.localeCompare(b.title, "zh-Hans");
+  } else if (sortKey === "rating") {
+    result = compareNullableNumber(a.voteAverage, b.voteAverage, direction);
+  } else {
+    result = compareNullableNumber(readReleaseYear(a.releaseDate), readReleaseYear(b.releaseDate), direction);
+  }
+
+  if (result === 0) {
+    result = a.title.localeCompare(b.title, "zh-Hans");
+  }
+
+  return sortKey === "title" ? result * direction : result;
+}
+
+function compareNullableNumber(a: number | null, b: number | null, direction: 1 | -1): number {
+  if (a === null && b === null) {
+    return 0;
+  }
+
+  if (a === null) {
+    return 1;
+  }
+
+  if (b === null) {
+    return -1;
+  }
+
+  return (a - b) * direction;
+}
+
+function readReleaseYear(releaseDate: string | null): number | null {
+  if (!releaseDate) {
+    return null;
+  }
+
+  const year = Number(releaseDate.slice(0, 4));
+  return Number.isFinite(year) ? year : null;
+}
+
+function formatUserVisibleError(message: string): string {
+  if (
+    message.includes("Received an unexpected EOF or 0 bytes from the transport stream") ||
+    message.toLowerCase().includes("unexpected eof")
+  ) {
+    return "网络连接提前断开（EOF）：通常是代理、TMDB/WebDAV 目标服务或中间网络中断导致，请检查代理、DNS/Host 和目标服务后重试。";
+  }
+
+  return message;
 }
 
 function formatScanStatus(status: LibraryScanStatus): string {
@@ -912,14 +1185,17 @@ function formatScanStatus(status: LibraryScanStatus): string {
 
     const phaseLabel =
       {
-        starting: "准备扫描",
+        starting: "正在启动扫描",
+        discovering: "扫描文件",
         probing: "探测媒体",
         indexing: "写入媒体库",
         "source-completed": "媒体源完成",
       }[progress.phase] ?? "正在扫描";
     const fileCount =
-      progress.totalVideoFileCount > 0
+      progress.phase !== "probing" && progress.totalVideoFileCount > 0
         ? `${Math.min(progress.processedVideoFileCount, progress.totalVideoFileCount)}/${progress.totalVideoFileCount}`
+        : progress.phase === "discovering" && progress.processedVideoFileCount > 0
+          ? `已发现 ${progress.processedVideoFileCount} 个视频`
         : "";
     const probeCount =
       progress.phase === "probing" && progress.probeCandidateCount > 0
@@ -934,11 +1210,11 @@ function formatScanStatus(status: LibraryScanStatus): string {
   }
 
   if (status.lastError) {
-    return status.lastError;
+    return formatUserVisibleError(status.lastError);
   }
 
   if (status.lastSummary) {
-    return `扫描完成：${status.lastSummary.newVideoFileCount} 个新视频`;
+    return `刷新完成：${status.lastSummary.newVideoFileCount} 个新视频`;
   }
 
   return "";
@@ -973,7 +1249,7 @@ function formatScrapeStatus(status: LibraryMetadataEnrichmentStatus): string {
         starting: "准备刮削",
         searching: "匹配元数据",
         "fetching-details": "精确刷新 TMDB",
-        "fetching-episodes": "刷新分集信息",
+        "fetching-episodes": "刷新分集信息和剧照",
         "downloading-poster": "下载海报",
         updating: "写入元数据",
       }[progress.phase] ?? "正在刮削";
@@ -990,7 +1266,7 @@ function formatScrapeStatus(status: LibraryMetadataEnrichmentStatus): string {
   }
 
   if (status.lastError) {
-    return status.lastError;
+    return formatUserVisibleError(status.lastError);
   }
 
   if (status.lastSummary) {
@@ -1013,43 +1289,32 @@ function SourceManagerPanel({
   disabled,
   isSaving,
   onAdd,
-  onAddWebDav,
   onClose,
   onRemove,
-  onScan,
   onUpdate,
   scanStatus,
   sources,
 }: {
   disabled: boolean;
   isSaving: boolean;
-  onAdd: (path: string, name: string) => Promise<boolean>;
-  onAddWebDav: (url: string, name: string, username: string, password: string) => Promise<boolean>;
+  onAdd: (paths: string[]) => Promise<boolean>;
   onClose: () => void;
   onRemove: (sourceId: number) => Promise<boolean>;
-  onScan: (sourceId: number) => Promise<boolean>;
   onUpdate: (sourceId: number, name: string, isEnabled: boolean) => Promise<boolean>;
   scanStatus: LibraryScanStatus | null;
   sources: MediaSourceSummary[];
 }) {
-  const [newName, setNewName] = useState("");
-  const [newPath, setNewPath] = useState("");
-  const [webDavName, setWebDavName] = useState("");
-  const [webDavUrl, setWebDavUrl] = useState("");
-  const [webDavUsername, setWebDavUsername] = useState("");
-  const [webDavPassword, setWebDavPassword] = useState("");
-  const [webDavBrowseResult, setWebDavBrowseResult] = useState<WebDavDirectoryBrowseResult | null>(null);
-  const [webDavStatus, setWebDavStatus] = useState("");
-  const [webDavError, setWebDavError] = useState("");
-  const [isWebDavBusy, setIsWebDavBusy] = useState(false);
   const [browsePath, setBrowsePath] = useState("");
   const [browseResult, setBrowseResult] = useState<LocalDirectoryBrowseResult | null>(null);
   const [browseError, setBrowseError] = useState("");
   const [isBrowsing, setIsBrowsing] = useState(false);
   const [draftNames, setDraftNames] = useState<Record<number, string>>({});
+  const [selectedLocalPaths, setSelectedLocalPaths] = useState<string[]>([]);
+  const [removedSourceIds, setRemovedSourceIds] = useState<number[]>([]);
 
   useEffect(() => {
     setDraftNames(Object.fromEntries(sources.map((source) => [source.id, source.name])));
+    setRemovedSourceIds((current) => current.filter((sourceId) => sources.some((source) => source.id === sourceId)));
   }, [sources]);
 
   useEffect(() => {
@@ -1081,96 +1346,44 @@ function SourceManagerPanel({
     }
   }
 
-  async function handleAdd(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!newPath.trim()) {
-      return;
-    }
-
-    const added = await onAdd(newPath, newName);
-    if (added) {
-      setNewName("");
-      setNewPath("");
-    }
-  }
-
-  async function handleAddWebDav(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!webDavUrl.trim()) {
-      return;
-    }
-
-    const added = await onAddWebDav(webDavUrl, webDavName, webDavUsername, webDavPassword);
-    if (added) {
-      setWebDavName("");
-      setWebDavUrl("");
-      setWebDavUsername("");
-      setWebDavPassword("");
-      setWebDavBrowseResult(null);
-      setWebDavStatus("");
-      setWebDavError("");
-    }
-  }
-
-  async function handleTestWebDav() {
-    if (!webDavUrl.trim()) {
-      return;
-    }
-
-    setIsWebDavBusy(true);
-    setWebDavStatus("正在测试 WebDAV");
-    setWebDavError("");
-    try {
-      const result = await testWebDavConnection(
-        webDavUrl.trim(),
-        webDavUsername.trim() || undefined,
-        webDavPassword || undefined,
-      );
-      setWebDavUrl(result.url);
-      setWebDavStatus(result.message);
-      if (!result.isReachable) {
-        setWebDavError(result.message);
-      }
-    } catch (error) {
-      setWebDavStatus("");
-      setWebDavError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsWebDavBusy(false);
-    }
-  }
-
-  async function handleBrowseWebDav(url = webDavUrl) {
-    if (!url.trim()) {
-      return;
-    }
-
-    setIsWebDavBusy(true);
-    setWebDavStatus("正在浏览 WebDAV");
-    setWebDavError("");
-    try {
-      const result = await browseWebDavDirectories(
-        url.trim(),
-        webDavUsername.trim() || undefined,
-        webDavPassword || undefined,
-      );
-      setWebDavBrowseResult(result);
-      setWebDavUrl(result.currentUrl);
-      setWebDavStatus(result.entries.length === 0 ? "当前目录没有子目录" : `发现 ${result.entries.length} 个子目录`);
-    } catch (error) {
-      setWebDavStatus("");
-      setWebDavError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsWebDavBusy(false);
-    }
-  }
-
   async function handleRemove(source: MediaSourceSummary) {
-    if (!window.confirm(`移除媒体源“${source.name}”？`)) {
+    if (!window.confirm(`移除媒体源“${formatMediaSourceDisplayName(source)}”？`)) {
       return;
     }
 
-    await onRemove(source.id);
+    if (await onRemove(source.id)) {
+      setRemovedSourceIds((current) => (current.includes(source.id) ? current : [...current, source.id]));
+    }
   }
+
+  function toggleLocalPath(path: string) {
+    setSelectedLocalPaths((current) =>
+      current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
+    );
+  }
+
+  async function handleMountSelected() {
+    const paths = selectedLocalPaths;
+    if (paths.length === 0) {
+      return;
+    }
+
+    const added = await onAdd(paths);
+    if (added) {
+      setSelectedLocalPaths([]);
+    }
+  }
+
+  const canMountSelected = selectedLocalPaths.length > 0;
+  const directoryEntries = (browseResult?.entries ?? [])
+    .slice()
+    .sort((left, right) => {
+      if (left.isReadable !== right.isReadable) {
+        return left.isReadable ? -1 : 1;
+      }
+
+      return left.name.localeCompare(right.name, "zh-CN", { sensitivity: "base", numeric: true });
+    });
 
   return (
     <div className="settingsOverlay" role="dialog" aria-label="media source manager" aria-modal="true">
@@ -1186,235 +1399,19 @@ function SourceManagerPanel({
           </button>
         </header>
 
-        <form className="sourceForm" onSubmit={(event) => void handleAdd(event)}>
-          <label className="settingsField">
-            <span>本地目录</span>
-            <input
-              disabled={disabled}
-              onChange={(event) => setNewPath(event.target.value)}
-              placeholder="/volume1/video"
-              value={newPath}
-            />
-          </label>
-          <label className="settingsField">
-            <span>名称</span>
-            <input
-              disabled={disabled}
-              onChange={(event) => setNewName(event.target.value)}
-              placeholder="自动使用目录名"
-              value={newName}
-            />
-          </label>
-          <button disabled={disabled || !newPath.trim()} type="submit">
-            <FolderPlus size={16} />
-            <span>{isSaving ? "添加中" : "添加"}</span>
-          </button>
-        </form>
-
-        <section className="directoryBrowser" aria-label="local directory browser">
-          <div className="directoryPath">
-            <input
-              aria-label="browse path"
-              disabled={disabled || isBrowsing}
-              onChange={(event) => setBrowsePath(event.target.value)}
-              value={browsePath}
-            />
-            <button
-              aria-label="open path"
-              disabled={disabled || isBrowsing || !browsePath.trim()}
-              onClick={() => void loadDirectory(browsePath)}
-              type="button"
-            >
-              <FolderOpen size={15} />
-            </button>
-            <button
-              aria-label="select current path"
-              disabled={disabled || !browseResult}
-              onClick={() => browseResult ? setNewPath(browseResult.currentPath) : undefined}
-              type="button"
-            >
-              <span>选择</span>
-            </button>
-          </div>
-          {browseError ? <strong>{browseError}</strong> : null}
-          <div className="directoryList">
-            {browseResult?.parentPath ? (
-              <button
-                className="directoryRow"
-                disabled={disabled || isBrowsing}
-                onClick={() => void loadDirectory(browseResult.parentPath ?? "")}
-                type="button"
-              >
-                <ArrowLeft size={15} />
-                <span>上级目录</span>
-              </button>
-            ) : null}
-            {browseResult?.entries.map((entry) => (
-              <button
-                className="directoryRow"
-                disabled={disabled || isBrowsing || !entry.isReadable}
-                key={entry.path}
-                onClick={() => void loadDirectory(entry.path)}
-                title={entry.path}
-                type="button"
-              >
-                <FolderOpen size={15} />
-                <span>{entry.name}</span>
-                {!entry.isReadable ? <em>不可访问</em> : null}
-              </button>
-            ))}
-            {!browseResult || browseResult.entries.length > 0 || browseResult.parentPath ? null : (
-              <div className="sourceEmpty">没有子目录</div>
-            )}
-          </div>
-        </section>
-
-        <form className="sourceForm webDavForm" onSubmit={(event) => void handleAddWebDav(event)}>
-          <label className="settingsField webDavUrlField">
-            <span>WebDAV 地址</span>
-            <input
-              disabled={disabled}
-              onChange={(event) => setWebDavUrl(event.target.value)}
-              placeholder="https://nas.example.com/dav"
-              value={webDavUrl}
-            />
-          </label>
-          <label className="settingsField">
-            <span>名称</span>
-            <input
-              disabled={disabled}
-              onChange={(event) => setWebDavName(event.target.value)}
-              placeholder="自动使用主机名"
-              value={webDavName}
-            />
-          </label>
-          <label className="settingsField">
-            <span>用户名</span>
-            <input
-              autoComplete="username"
-              disabled={disabled}
-              onChange={(event) => setWebDavUsername(event.target.value)}
-              placeholder="可留空"
-              value={webDavUsername}
-            />
-          </label>
-          <label className="settingsField">
-            <span>密码</span>
-            <input
-              autoComplete="current-password"
-              disabled={disabled}
-              onChange={(event) => setWebDavPassword(event.target.value)}
-              placeholder="可留空"
-              type="password"
-              value={webDavPassword}
-            />
-          </label>
-          <div className="webDavActions">
-            <button
-              disabled={disabled || isWebDavBusy || !webDavUrl.trim()}
-              onClick={() => void handleTestWebDav()}
-              type="button"
-            >
-              <Cloud size={16} />
-              <span>{isWebDavBusy ? "测试中" : "测试"}</span>
-            </button>
-            <button
-              disabled={disabled || isWebDavBusy || !webDavUrl.trim()}
-              onClick={() => void handleBrowseWebDav()}
-              type="button"
-            >
-              <FolderOpen size={16} />
-              <span>{isWebDavBusy ? "浏览中" : "浏览"}</span>
-            </button>
-            <button disabled={disabled || !webDavUrl.trim()} type="submit">
-              <Cloud size={16} />
-              <span>{isSaving ? "添加中" : "添加 WebDAV"}</span>
-            </button>
-          </div>
-        </form>
-
-        {webDavStatus || webDavError || webDavBrowseResult ? (
-          <section className="directoryBrowser webDavBrowser" aria-label="webdav directory browser">
-            {webDavStatus ? <span>{webDavStatus}</span> : null}
-            {webDavError ? <strong>{webDavError}</strong> : null}
-            {webDavBrowseResult ? (
-              <div className="directoryList">
-                {webDavBrowseResult.parentUrl ? (
-                  <button
-                    className="directoryRow"
-                    disabled={disabled || isWebDavBusy}
-                    onClick={() => void handleBrowseWebDav(webDavBrowseResult.parentUrl ?? "")}
-                    type="button"
-                  >
-                    <ArrowLeft size={15} />
-                    <span>上级目录</span>
-                  </button>
-                ) : null}
-                {webDavBrowseResult.entries.map((entry) => (
-                  <button
-                    className="directoryRow"
-                    disabled={disabled || isWebDavBusy || !entry.isReadable}
-                    key={entry.url}
-                    onClick={() => void handleBrowseWebDav(entry.url)}
-                    title={entry.url}
-                    type="button"
-                  >
-                    <FolderOpen size={15} />
-                    <span>{entry.name}</span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </section>
-        ) : null}
-
         <section className="sourceList">
-          {sources.length === 0 ? <div className="sourceEmpty">还没有媒体源</div> : null}
-          {sources.map((source) => {
+          {sources.filter((source) => !removedSourceIds.includes(source.id)).length === 0 ? (
+            <div className="sourceEmpty">还没有媒体源</div>
+          ) : null}
+          {sources.filter((source) => !removedSourceIds.includes(source.id)).map((source) => {
             const draftName = draftNames[source.id] ?? source.name;
-            const nameChanged = draftName.trim() !== source.name;
             const isSourceScanning = isScanningSource(scanStatus, source);
-            const normalizedKind = source.kind.toLowerCase();
-            const canScanSource = normalizedKind === "local" || normalizedKind === "webdav";
+            const displayName = formatMediaSourceDisplayName(source);
             return (
-              <article className="sourceRow" key={source.id}>
+              <article className="sourceRow compactSourceRow" key={source.id}>
                 <div className="sourceMeta">
-                  <div>
-                    <strong>{source.name}</strong>
-                    <span>
-                      {[
-                        formatSourceKind(source.kind),
-                        source.isEnabled ? "已启用" : "已停用",
-                        isSourceScanning ? formatSourceScanStatus(scanStatus) : null,
-                        canScanSource
-                          ? source.lastScannedAt
-                            ? `上次扫描 ${formatDateTime(source.lastScannedAt)}`
-                            : "未扫描"
-                          : "待接入扫描",
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </span>
-                  </div>
-                  <p>{source.baseUrl}</p>
-                </div>
-                <div className="sourceEdit">
-                  <input
-                    aria-label={`rename ${source.name}`}
-                    disabled={disabled}
-                    onChange={(event) =>
-                      setDraftNames((current) => ({ ...current, [source.id]: event.target.value }))
-                    }
-                    value={draftName}
-                  />
-                  <button
-                    aria-label={`save ${source.name}`}
-                    disabled={disabled || !nameChanged || !draftName.trim()}
-                    onClick={() => void onUpdate(source.id, draftName, source.isEnabled)}
-                    type="button"
-                  >
-                    <Save size={15} />
-                  </button>
+                  <strong>{displayName}</strong>
+                  {isSourceScanning ? <span>{formatSourceScanStatus(scanStatus)}</span> : null}
                 </div>
                 <div className="sourceActions">
                   <label className="sourceToggle">
@@ -1427,43 +1424,94 @@ function SourceManagerPanel({
                     <span>{source.isEnabled ? "启用" : "停用"}</span>
                   </label>
                   <button
-                    aria-label={`remove ${source.name}`}
+                    aria-label={`remove ${displayName}`}
                     disabled={disabled}
                     onClick={() => void handleRemove(source)}
                     type="button"
                   >
                     <Trash2 size={15} />
                   </button>
-                  <button
-                    aria-label={`scan ${source.name}`}
-                    disabled={disabled || !source.isEnabled || !canScanSource}
-                    onClick={() => void onScan(source.id)}
-                    title={canScanSource ? "扫描媒体源" : "该媒体源类型暂不支持扫描"}
-                    type="button"
-                  >
-                    <RefreshCw size={15} className={isSourceScanning ? "spin" : ""} />
-                  </button>
                 </div>
               </article>
             );
           })}
+        </section>
+
+        <section className="directoryBrowser" aria-label="local directory browser">
+          <div className="directoryPath">
+            <span className="currentDirectoryPath">{browseResult?.currentPath ?? (browsePath || "/")}</span>
+            <button
+              aria-label="mount selected paths"
+              disabled={disabled || !canMountSelected}
+              onClick={() => void handleMountSelected()}
+              type="button"
+            >
+              <FolderPlus size={15} />
+              <span>
+                {isSaving ? "挂载中" : selectedLocalPaths.length > 0 ? `挂载 ${selectedLocalPaths.length}` : "挂载"}
+              </span>
+            </button>
+          </div>
+          {browseError ? <strong>{browseError}</strong> : null}
+          <div className="directoryList">
+            {browseResult?.parentPath ? (
+              <div
+                className="directoryRow"
+                key="parent"
+              >
+                <button
+                  className="directoryOpenButton"
+                  disabled={disabled || isBrowsing}
+                  onClick={() => void loadDirectory(browseResult.parentPath ?? "")}
+                  type="button"
+                >
+                  <ArrowLeft size={15} />
+                  <span>上级目录</span>
+                </button>
+              </div>
+            ) : null}
+            {directoryEntries.map((entry) => (
+              <div
+                className="directoryRow"
+                key={entry.path}
+                title={entry.path}
+              >
+                <button
+                  className="directoryOpenButton"
+                  disabled={disabled || isBrowsing || !entry.isReadable}
+                  onClick={() => void loadDirectory(entry.path)}
+                  type="button"
+                >
+                  <FolderOpen size={15} />
+                  <span>{entry.name}</span>
+                </button>
+                {!entry.isReadable ? <em>不可访问</em> : null}
+                <button
+                  aria-label={selectedLocalPaths.includes(entry.path) ? `取消标星 ${entry.name}` : `标星 ${entry.name}`}
+                  className={selectedLocalPaths.includes(entry.path) ? "starButton selected" : "starButton"}
+                  disabled={disabled || !entry.isReadable}
+                  onClick={() => toggleLocalPath(entry.path)}
+                  title={selectedLocalPaths.includes(entry.path) ? "取消选择" : "选择挂载"}
+                  type="button"
+                >
+                  <Star size={15} />
+                </button>
+              </div>
+            ))}
+            {!browseResult || browseResult.entries.length > 0 || browseResult.parentPath ? null : (
+              <div className="sourceEmpty">没有子目录</div>
+            )}
+          </div>
         </section>
       </aside>
     </div>
   );
 }
 
-function formatSourceKind(kind: string): string {
-  const normalized = kind.toLowerCase();
-  if (normalized === "local") {
-    return "本地目录";
-  }
-
-  if (normalized === "webdav") {
-    return "WebDAV";
-  }
-
-  return kind;
+function formatMediaSourceDisplayName(source: MediaSourceSummary): string {
+  const path = source.baseUrl.replace(/\\/g, "/").replace(/\/+$/g, "");
+  const name = path.split("/").filter(Boolean).pop();
+  return name || source.name;
 }
 
 function isScanningSource(scanStatus: LibraryScanStatus | null, source: MediaSourceSummary): boolean {
@@ -1482,10 +1530,10 @@ function formatSourceScanStatus(scanStatus: LibraryScanStatus | null): string | 
   }
 
   if (progress.totalVideoFileCount > 0) {
-    return `扫描 ${Math.min(progress.processedVideoFileCount, progress.totalVideoFileCount)}/${progress.totalVideoFileCount}`;
+    return `刷新 ${Math.min(progress.processedVideoFileCount, progress.totalVideoFileCount)}/${progress.totalVideoFileCount}`;
   }
 
-  return "扫描中";
+  return "刷新中";
 }
 
 function formatDateTime(value: string): string {
@@ -1509,30 +1557,45 @@ function SettingsPanel({
     tmdb: AppSettingsSnapshot["tmdb"],
     cache: CacheSettings,
     playback: AppSettingsSnapshot["playback"],
+    proxy: ProxySettings,
   ) => void;
   settings: AppSettingsSnapshot;
 }) {
   const [tmdb, setTmdb] = useState(settings.tmdb);
+  const [tmdbCredential, setTmdbCredential] = useState(readTmdbCredential(settings.tmdb));
+  const [tmdbTest, setTmdbTest] = useState<TmdbConnectionTestResult | null>(null);
+  const [tmdbTestError, setTmdbTestError] = useState("");
+  const [isTestingTmdb, setIsTestingTmdb] = useState(false);
   const [cache, setCache] = useState(settings.cache);
-  const [playback, setPlayback] = useState(settings.playback);
+  const [playback, setPlayback] = useState(normalizePlaybackSettings(settings.playback));
+  const [proxy, setProxy] = useState(settings.proxy);
+  const [proxyTest, setProxyTest] = useState<ProxyConnectionTestResult | null>(null);
+  const [proxyTestError, setProxyTestError] = useState("");
+  const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [selfCheck, setSelfCheck] = useState<RuntimeSelfCheckSnapshot | null>(null);
   const [selfCheckError, setSelfCheckError] = useState("");
   const [isCheckingRuntime, setIsCheckingRuntime] = useState(false);
 
   useEffect(() => {
     setTmdb(settings.tmdb);
+    setTmdbCredential(readTmdbCredential(settings.tmdb));
+    setTmdbTest(null);
+    setTmdbTestError("");
     setCache(settings.cache);
-    setPlayback(settings.playback);
+    setPlayback(normalizePlaybackSettings(settings.playback));
+    setProxy(settings.proxy);
+    setProxyTest(null);
+    setProxyTestError("");
   }, [settings]);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     onSave(
       {
-        ...tmdb,
-        customApiKey: tmdb.customApiKey.trim(),
-        customAccessToken: tmdb.customAccessToken.trim(),
-        language: tmdb.language.trim() || "zh-CN",
+        ...applyTmdbCredential(tmdb, tmdbCredential),
+        enableMetadataEnrichment: true,
+        enablePosterDownloads: true,
+        language: "zh-CN",
       },
       {
         ...cache,
@@ -1541,7 +1604,28 @@ function SettingsPanel({
         webDavMaxGb: Math.min(1024, Math.max(1, Math.round(cache.webDavMaxGb || 20))),
       },
       playback,
+      normalizeProxySettings(proxy),
     );
+  }
+
+  async function handleTmdbTest() {
+    setTmdbTest(null);
+    setTmdbTestError("");
+    setIsTestingTmdb(true);
+    try {
+      setTmdbTest(
+        await testTmdbConnection({
+          ...applyTmdbCredential(tmdb, tmdbCredential),
+          enableMetadataEnrichment: true,
+          enablePosterDownloads: true,
+          language: "zh-CN",
+        }),
+      );
+    } catch (error) {
+      setTmdbTestError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsTestingTmdb(false);
+    }
   }
 
   async function handleRuntimeSelfCheck() {
@@ -1556,6 +1640,19 @@ function SettingsPanel({
     }
   }
 
+  async function handleProxyTest() {
+    setProxyTest(null);
+    setProxyTestError("");
+    setIsTestingProxy(true);
+    try {
+      setProxyTest(await testProxyConnection(normalizeProxySettings(proxy)));
+    } catch (error) {
+      setProxyTestError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsTestingProxy(false);
+    }
+  }
+
   const hasPlaybackStrategy = playback.directStream || playback.hlsRemux || playback.transcode;
 
   return (
@@ -1565,32 +1662,27 @@ function SettingsPanel({
         <header className="settingsHeader">
           <div>
             <h2>设置</h2>
-            <span>{settings.phase}</span>
           </div>
-          <button aria-label="close settings" onClick={onClose} type="button">
-            <X size={18} />
-          </button>
+          <div className="settingsHeaderActions">
+            <button disabled={isSaving || !hasPlaybackStrategy} form="app-settings-form" type="submit">
+              <Save size={15} />
+              <span>{isSaving ? "保存中" : "保存"}</span>
+            </button>
+            <button aria-label="close settings" onClick={onClose} type="button">
+              <X size={18} />
+            </button>
+          </div>
         </header>
 
-        <form className="settingsForm" onSubmit={handleSubmit}>
+        <form className="settingsForm" id="app-settings-form" onSubmit={handleSubmit}>
           <section className="settingsSection">
-            <h3>TMDB</h3>
-            <label className="settingsToggle">
-              <input
-                checked={tmdb.enableMetadataEnrichment}
-                onChange={(event) => setTmdb({ ...tmdb, enableMetadataEnrichment: event.target.checked })}
-                type="checkbox"
-              />
-              <span>元数据刮削</span>
-            </label>
-            <label className="settingsToggle">
-              <input
-                checked={tmdb.enablePosterDownloads}
-                onChange={(event) => setTmdb({ ...tmdb, enablePosterDownloads: event.target.checked })}
-                type="checkbox"
-              />
-              <span>下载海报</span>
-            </label>
+            <div className="settingsSectionHeader">
+              <h3>TMDB</h3>
+              <button disabled={isTestingTmdb} onClick={() => void handleTmdbTest()} type="button">
+                <RefreshCw size={15} className={isTestingTmdb ? "spin" : ""} />
+                <span>{isTestingTmdb ? "检测中" : "检测"}</span>
+              </button>
+            </div>
             <label className="settingsToggle">
               <input
                 checked={tmdb.enableBuiltInPublicSource}
@@ -1600,31 +1692,56 @@ function SettingsPanel({
               <span>内置公开源</span>
             </label>
             <label className="settingsField">
-              <span>语言</span>
-              <input
-                onChange={(event) => setTmdb({ ...tmdb, language: event.target.value })}
-                placeholder="zh-CN"
-                value={tmdb.language}
-              />
-            </label>
-            <label className="settingsField">
-              <span>API Key</span>
+              <span>API 凭据</span>
               <input
                 autoComplete="off"
-                onChange={(event) => setTmdb({ ...tmdb, customApiKey: event.target.value })}
+                onChange={(event) => setTmdbCredential(event.target.value)}
+                placeholder="API Key 或 Bearer Token"
                 type="password"
-                value={tmdb.customApiKey}
+                value={tmdbCredential}
               />
+            </label>
+            {tmdbTest ? (
+              <div className={`tmdbTestResult ${tmdbTest.isReachable ? "ok" : "error"}`}>
+                <strong>{tmdbTest.isReachable ? "连通" : "失败"}</strong>
+                <span>{[tmdbTest.source, tmdbTest.statusCode ? `HTTP ${tmdbTest.statusCode}` : null, tmdbTest.message].filter(Boolean).join(" · ")}</span>
+              </div>
+            ) : null}
+            {tmdbTestError ? <p className="runtimeCheckError">{tmdbTestError}</p> : null}
+          </section>
+
+          <section className="settingsSection">
+            <div className="settingsSectionHeader">
+              <h3>代理</h3>
+              <button disabled={isTestingProxy} onClick={() => void handleProxyTest()} type="button">
+                <RefreshCw size={15} className={isTestingProxy ? "spin" : ""} />
+                <span>{isTestingProxy ? "检测中" : "检测"}</span>
+              </button>
+            </div>
+            <label className="settingsToggle">
+              <input
+                checked={proxy.isEnabled}
+                onChange={(event) => setProxy({ ...proxy, isEnabled: event.target.checked })}
+                type="checkbox"
+              />
+              <span>启用代理</span>
             </label>
             <label className="settingsField">
-              <span>Access Token</span>
+              <span>代理地址</span>
               <input
                 autoComplete="off"
-                onChange={(event) => setTmdb({ ...tmdb, customAccessToken: event.target.value })}
-                type="password"
-                value={tmdb.customAccessToken}
+                onChange={(event) => setProxy({ ...proxy, url: event.target.value })}
+                placeholder="http://192.168.1.2:7890"
+                value={proxy.url}
               />
             </label>
+            {proxyTest ? (
+              <div className={`tmdbTestResult ${proxyTest.isReachable ? "ok" : "error"}`}>
+                <strong>{proxyTest.isReachable ? "可用" : "失败"}</strong>
+                <span>{[proxyTest.proxyUrl, proxyTest.statusCode ? `HTTP ${proxyTest.statusCode}` : null, proxyTest.message].filter(Boolean).join(" · ")}</span>
+              </div>
+            ) : null}
+            {proxyTestError ? <p className="runtimeCheckError">{proxyTestError}</p> : null}
           </section>
 
           <section className="settingsSection">
@@ -1637,26 +1754,6 @@ function SettingsPanel({
                 onChange={(event) => setCache({ ...cache, hlsRetentionHours: Number(event.target.value) })}
                 type="number"
                 value={cache.hlsRetentionHours}
-              />
-            </label>
-            <label className="settingsField">
-              <span>WebDAV 保留小时</span>
-              <input
-                max={720}
-                min={1}
-                onChange={(event) => setCache({ ...cache, webDavRetentionHours: Number(event.target.value) })}
-                type="number"
-                value={cache.webDavRetentionHours}
-              />
-            </label>
-            <label className="settingsField">
-              <span>WebDAV 上限 GB</span>
-              <input
-                max={1024}
-                min={1}
-                onChange={(event) => setCache({ ...cache, webDavMaxGb: Number(event.target.value) })}
-                type="number"
-                value={cache.webDavMaxGb}
               />
             </label>
             <label className="settingsField">
@@ -1695,7 +1792,15 @@ function SettingsPanel({
                 onChange={(event) => setPlayback({ ...playback, transcode: event.target.checked })}
                 type="checkbox"
               />
-              <span>HLS 转码</span>
+              <span>HLS 硬件转码</span>
+            </label>
+            <label className="settingsToggle">
+              <input
+                checked={playback.showEpisodeDetails}
+                onChange={(event) => setPlayback({ ...playback, showEpisodeDetails: event.target.checked })}
+                type="checkbox"
+              />
+              <span>分集详情</span>
             </label>
             {!hasPlaybackStrategy ? <strong className="settingsWarning">至少保留一种播放策略</strong> : null}
           </section>
@@ -1725,22 +1830,59 @@ function SettingsPanel({
                 ))}
               </div>
             ) : (
-              <p className="runtimeCheckHint">检查 FFmpeg、监听端口、缓存目录、SQLite、WebDAV Range 和硬件编码。</p>
+              <p className="runtimeCheckHint">检查 FFmpeg、监听端口、缓存目录、SQLite 和硬件解码/编码。</p>
             )}
           </section>
-
-          <footer className="settingsFooter">
-            <button onClick={onClose} type="button">
-              <span>取消</span>
-            </button>
-            <button disabled={isSaving || !hasPlaybackStrategy} type="submit">
-              <span>{isSaving ? "保存中" : "保存"}</span>
-            </button>
-          </footer>
         </form>
       </aside>
     </div>
   );
+}
+
+function readTmdbCredential(settings: AppSettingsSnapshot["tmdb"]): string {
+  return settings.customAccessToken || settings.customApiKey || "";
+}
+
+function applyTmdbCredential(
+  settings: AppSettingsSnapshot["tmdb"],
+  credential: string,
+): AppSettingsSnapshot["tmdb"] {
+  const normalizedCredential = credential.trim();
+  if (!normalizedCredential) {
+    return { ...settings, customApiKey: "", customAccessToken: "" };
+  }
+
+  if (looksLikeTmdbAccessToken(normalizedCredential)) {
+    return {
+      ...settings,
+      customApiKey: "",
+      customAccessToken: normalizedCredential.replace(/^Bearer\s+/i, "").trim(),
+    };
+  }
+
+  return { ...settings, customApiKey: normalizedCredential, customAccessToken: "" };
+}
+
+function looksLikeTmdbAccessToken(value: string): boolean {
+  const token = value.replace(/^Bearer\s+/i, "").trim();
+  return token.startsWith("eyJ") || token.length > 80;
+}
+
+function normalizePlaybackSettings(settings: AppSettingsSnapshot["playback"]): AppSettingsSnapshot["playback"] {
+  return {
+    ...settings,
+    showEpisodeDetails: settings.showEpisodeDetails ?? true,
+  };
+}
+
+function normalizeProxySettings(settings: ProxySettings): ProxySettings {
+  return {
+    ...settings,
+    url: settings.url.trim(),
+    username: "",
+    password: "",
+    bypassList: "",
+  };
 }
 
 function CacheMaintenance({
@@ -1750,7 +1892,6 @@ function CacheMaintenance({
   isSaving,
   onCleanupAssets,
   onCleanupTranscode,
-  onCleanupWebDav,
   onSaveSettings,
 }: {
   cacheStatus: CacheUsageSummary | null;
@@ -1759,7 +1900,6 @@ function CacheMaintenance({
   isSaving: boolean;
   onCleanupAssets: () => void;
   onCleanupTranscode: () => void;
-  onCleanupWebDav: () => void;
   onSaveSettings: (
     hlsRetentionHours: number,
     imageCleanupScope: string,
@@ -1769,8 +1909,6 @@ function CacheMaintenance({
 }) {
   const [hlsRetentionHours, setHlsRetentionHours] = useState(24);
   const [imageCleanupScope, setImageCleanupScope] = useState("orphans-and-untracked");
-  const [webDavRetentionHours, setWebDavRetentionHours] = useState(72);
-  const [webDavMaxGb, setWebDavMaxGb] = useState(20);
 
   useEffect(() => {
     if (!cacheSettings) {
@@ -1779,13 +1917,9 @@ function CacheMaintenance({
 
     setHlsRetentionHours(cacheSettings.hlsRetentionHours);
     setImageCleanupScope(cacheSettings.imageCleanupScope);
-    setWebDavRetentionHours(cacheSettings.webDavRetentionHours);
-    setWebDavMaxGb(cacheSettings.webDavMaxGb);
   }, [
     cacheSettings?.hlsRetentionHours,
     cacheSettings?.imageCleanupScope,
-    cacheSettings?.webDavMaxGb,
-    cacheSettings?.webDavRetentionHours,
   ]);
 
   if (!cacheStatus) {
@@ -1794,15 +1928,13 @@ function CacheMaintenance({
 
   const imageBytes = sumCacheBuckets(cacheStatus, ["posters", "thumbnails"]);
   const transcodeBytes = sumCacheBuckets(cacheStatus, ["transcode"]);
-  const webDavBytes = sumCacheBuckets(cacheStatus, ["webdav"]);
 
   return (
     <section className="cacheMaintenance" aria-label="cache maintenance">
       <div>
         <strong>{formatBytes(cacheStatus.totalBytes)}</strong>
         <span>
-          图片 {formatBytes(imageBytes)} · HLS {formatBytes(transcodeBytes)} · WebDAV {formatBytes(webDavBytes)} ·{" "}
-          WebDAV 上限 {formatBytes((cacheSettings?.webDavMaxGb ?? 20) * 1024 ** 3)} · {cacheStatus.totalFileCount} 文件
+          图片 {formatBytes(imageBytes)} · HLS {formatBytes(transcodeBytes)} · {cacheStatus.totalFileCount} 文件
         </span>
       </div>
       <div className="cacheActions">
@@ -1814,22 +1946,6 @@ function CacheMaintenance({
           type="number"
           value={hlsRetentionHours}
         />
-        <input
-          aria-label="webdav retention hours"
-          min={1}
-          max={720}
-          onChange={(event) => setWebDavRetentionHours(Number(event.target.value))}
-          type="number"
-          value={webDavRetentionHours}
-        />
-        <input
-          aria-label="webdav max gb"
-          min={1}
-          max={1024}
-          onChange={(event) => setWebDavMaxGb(Number(event.target.value))}
-          type="number"
-          value={webDavMaxGb}
-        />
         <select
           aria-label="image cleanup scope"
           onChange={(event) => setImageCleanupScope(event.target.value)}
@@ -1840,7 +1956,12 @@ function CacheMaintenance({
         </select>
         <button
           disabled={disabled || isSaving || !cacheSettings}
-          onClick={() => onSaveSettings(hlsRetentionHours, imageCleanupScope, webDavRetentionHours, webDavMaxGb)}
+          onClick={() => onSaveSettings(
+            hlsRetentionHours,
+            imageCleanupScope,
+            cacheSettings?.webDavRetentionHours ?? 72,
+            cacheSettings?.webDavMaxGb ?? 20,
+          )}
         >
           <span>{isSaving ? "保存中" : "保存"}</span>
         </button>
@@ -1851,10 +1972,6 @@ function CacheMaintenance({
         <button disabled={disabled} onClick={onCleanupTranscode}>
           <Trash2 size={15} />
           <span>HLS</span>
-        </button>
-        <button disabled={disabled} onClick={onCleanupWebDav}>
-          <Trash2 size={15} />
-          <span>WebDAV</span>
         </button>
       </div>
     </section>
@@ -1935,72 +2052,406 @@ function formatBackgroundTask(task: BackgroundTaskSnapshot["tasks"][number]): st
   }
 
   if (task.state === "failed") {
-    return task.errorMessage ?? "执行失败";
+    return task.errorMessage ? formatUserVisibleError(task.errorMessage) : "执行失败";
   }
 
   return task.progressText ?? task.state;
 }
 
-function PosterCard({
-  item,
-  compact = false,
-  onOpen,
+function MetadataSearchModal({
+  state,
+  onApply,
+  onChangeQuery,
+  onChangeYear,
+  onClose,
+  onSearch,
 }: {
-  item: LibraryItemSummary;
-  compact?: boolean;
-  onOpen?: (item: LibraryItemSummary) => void;
+  state: MetadataSearchState;
+  onApply: (match: TmdbMetadataMatch) => void;
+  onChangeQuery: (query: string) => void;
+  onChangeYear: (year: string) => void;
+  onClose: () => void;
+  onSearch: () => void;
 }) {
-  const year = item.releaseDate?.slice(0, 4) ?? "";
-  const badge = item.voteAverage ? item.voteAverage.toFixed(1) : item.itemKind === "tv" ? "TV" : "MOV";
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSearch();
+  }
 
   return (
-    <article className={compact ? "posterCard compact" : "posterCard"} onClick={() => onOpen?.(item)}>
+    <div className="settingsOverlay modalOverlay" role="dialog" aria-label="metadata search" aria-modal="true">
+      <button className="settingsBackdrop" aria-label="close metadata search" onClick={onClose} type="button" />
+      <section className="metadataDialog">
+        <header className="settingsHeader">
+          <div>
+            <h2>重新匹配 TMDB</h2>
+            <span>{state.item.title}</span>
+          </div>
+          <button aria-label="close metadata search" onClick={onClose} type="button">
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="metadataDialogBody">
+          <div className="sourceInfoBox">
+            <span>源文件名称</span>
+            <strong>{state.isLoadingDetail ? "正在读取源文件信息" : sourceFileLabel(state.detail)}</strong>
+          </div>
+
+          <form className="metadataSearchForm" onSubmit={handleSubmit}>
+            <input
+              aria-label="TMDB search query"
+              onChange={(event) => onChangeQuery(event.target.value)}
+              placeholder="输入正确的影视名称"
+              value={state.query}
+            />
+            <input
+              aria-label="TMDB search year"
+              inputMode="numeric"
+              onChange={(event) => onChangeYear(event.target.value)}
+              placeholder="年份"
+              value={state.year}
+            />
+            <button disabled={state.isSearching || state.isApplying || !state.query.trim()} type="submit">
+              <Search size={16} />
+              <span>{state.isSearching ? "搜索中" : "搜索"}</span>
+            </button>
+          </form>
+
+          {state.error ? <strong className="metadataDialogError">{state.error}</strong> : null}
+          {!state.error && state.candidates.length === 0 && !state.isSearching ? (
+            <div className="metadataDialogEmpty">暂无搜索结果，请输入关键字后回车开始匹配</div>
+          ) : null}
+          {state.isSearching ? <div className="metadataDialogEmpty">正在向 TMDB 请求数据</div> : null}
+
+          {state.candidates.length > 0 ? (
+            <div className="metadataDialogResults">
+              {state.candidates.map((candidate) => (
+                <article className="metadataCandidate" key={`${candidate.mediaType}-${candidate.id}`}>
+                  <div className="metadataPoster">
+                    {tmdbPosterUrl(candidate.posterPath) ? (
+                      <img alt="" src={tmdbPosterUrl(candidate.posterPath)!} />
+                    ) : (
+                      <span>TMDB</span>
+                    )}
+                  </div>
+                  <div>
+                    <h3>{candidate.title}</h3>
+                    <p>
+                      {[candidate.releaseDate?.slice(0, 4), candidate.voteAverage ? candidate.voteAverage.toFixed(1) : null]
+                        .filter(Boolean)
+                        .join(" · ") || "TMDB"}
+                    </p>
+                    <span>{candidate.overview || "暂无简介"}</span>
+                  </div>
+                  <button disabled={state.isApplying} onClick={() => onApply(candidate)} type="button">
+                    关联此项
+                  </button>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function CustomMetadataEditModal({
+  detail,
+  errorText,
+  isSaving,
+  onClose,
+  onSave,
+}: {
+  detail: LibraryItemDetail;
+  errorText: string;
+  isSaving: boolean;
+  onClose: () => void;
+  onSave: (request: LibraryItemCustomMetadataUpdateRequest) => void;
+}) {
+  const [title, setTitle] = useState(detail.title);
+  const [releaseDate, setReleaseDate] = useState(detail.releaseDate ?? "");
+  const [voteAverage, setVoteAverage] = useState(
+    typeof detail.voteAverage === "number" && Number.isFinite(detail.voteAverage) ? detail.voteAverage.toFixed(1) : "",
+  );
+  const [overview, setOverview] = useState(detail.overview ?? "");
+  const [posterFile, setPosterFile] = useState<File | null>(null);
+  const [posterPreview, setPosterPreview] = useState<string | null>(null);
+  const [localError, setLocalError] = useState("");
+
+  useEffect(() => {
+    if (!posterFile) {
+      setPosterPreview(null);
+      return;
+    }
+
+    const previewUrl = URL.createObjectURL(posterFile);
+    setPosterPreview(previewUrl);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [posterFile]);
+
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLocalError("");
+
+    const trimmedTitle = title.trim();
+    if (!trimmedTitle) {
+      setLocalError("请填写影视名称。");
+      return;
+    }
+
+    const trimmedVote = voteAverage.trim();
+    const parsedVote = trimmedVote ? Number(trimmedVote) : null;
+    if (parsedVote !== null && (!Number.isFinite(parsedVote) || parsedVote < 0 || parsedVote > 10)) {
+      setLocalError("评分需要在 0 到 10 之间。");
+      return;
+    }
+
+    onSave({
+      title: trimmedTitle,
+      releaseDate: releaseDate.trim() || null,
+      overview: overview.trim() || null,
+      voteAverage: parsedVote,
+      posterFile,
+    });
+  }
+
+  const currentPoster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
+
+  return (
+    <div className="settingsOverlay modalOverlay" role="dialog" aria-label="custom metadata editor" aria-modal="true">
+      <button className="settingsBackdrop" aria-label="close custom editor" onClick={onClose} type="button" />
+      <form className="metadataDialog editDialog" onSubmit={handleSubmit}>
+        <header className="settingsHeader">
+          <div>
+            <h2>手动编辑资料</h2>
+            <span>{detail.title}</span>
+          </div>
+          <button aria-label="close custom editor" onClick={onClose} type="button">
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="metadataDialogBody editDialogBody">
+          <section className="editSection">
+            <h3>源文件信息</h3>
+            <div className="sourceInfoBox compact">
+              <span>文件</span>
+              <strong>{sourceFileLabel(detail)}</strong>
+            </div>
+          </section>
+
+          <section className="editSection">
+            <h3>基础信息</h3>
+            <label className="settingsField">
+              <span>影视名称</span>
+              <input disabled={isSaving} onChange={(event) => setTitle(event.target.value)} value={title} />
+            </label>
+            <label className="settingsField">
+              <span>上映时间</span>
+              <input
+                disabled={isSaving}
+                onChange={(event) => setReleaseDate(event.target.value)}
+                placeholder="2025-01-01"
+                value={releaseDate}
+              />
+            </label>
+            <label className="settingsField">
+              <span>评分</span>
+              <input
+                disabled={isSaving}
+                inputMode="decimal"
+                onChange={(event) => setVoteAverage(event.target.value)}
+                placeholder="0.0 - 10.0"
+                value={voteAverage}
+              />
+            </label>
+          </section>
+
+          <section className="editSection">
+            <h3>剧情简介</h3>
+            <textarea disabled={isSaving} onChange={(event) => setOverview(event.target.value)} value={overview} />
+          </section>
+
+          <section className="editSection">
+            <h3>海报管理</h3>
+            <div className="posterEditRow">
+              <div className="posterPreview">
+                {posterPreview || currentPoster ? <img alt="" src={posterPreview ?? currentPoster!} /> : <span>暂无海报</span>}
+              </div>
+              <label className="settingsField">
+                <span>选择本地图片</span>
+                <input
+                  accept="image/png,image/jpeg,image/webp"
+                  disabled={isSaving}
+                  onChange={(event) => setPosterFile(event.target.files?.[0] ?? null)}
+                  type="file"
+                />
+              </label>
+            </div>
+          </section>
+
+          {localError || errorText ? <strong className="metadataDialogError">{localError || errorText}</strong> : null}
+        </div>
+
+        <footer className="settingsFooter">
+          <button disabled={isSaving} onClick={onClose} type="button">
+            取消
+          </button>
+          <button disabled={isSaving} type="submit">
+            <Save size={16} />
+            <span>{isSaving ? "保存中" : "保存修改并锁定"}</span>
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function sourceFileLabel(detail: LibraryItemDetail | null): string {
+  const file = detail?.videoFiles[0] ?? null;
+  if (!file) {
+    return "未找到关联的视频文件";
+  }
+
+  return file.relativePath || file.fileName || "未知文件名";
+}
+
+function PosterCard({
+  item,
+  onEdit,
+  onOpen,
+  onSearchMetadata,
+  onToggleWatched,
+  showProgress = false,
+}: {
+  item: LibraryItemSummary;
+  onEdit?: (item: LibraryItemSummary) => void;
+  onOpen?: (item: LibraryItemSummary) => void;
+  onSearchMetadata?: (item: LibraryItemSummary) => void;
+  onToggleWatched?: (item: LibraryItemSummary) => void;
+  showProgress?: boolean;
+}) {
+  const year = item.releaseDate?.slice(0, 4) ?? "";
+  const rating =
+    typeof item.voteAverage === "number" && Number.isFinite(item.voteAverage) ? item.voteAverage.toFixed(1) : null;
+  const progressPercent = playbackProgressPercent(item);
+
+  function handleCardAction(event: MouseEvent<HTMLButtonElement>, action?: (target: LibraryItemSummary) => void) {
+    event.preventDefault();
+    event.stopPropagation();
+    action?.(item);
+  }
+
+  return (
+    <article className="posterCard" onClick={() => onOpen?.(item)}>
       <div className="posterArt">
         {item.posterAssetId ? <img alt="" src={posterUrl(item.posterAssetId)} /> : null}
-        <span>{badge}</span>
+        {rating ? <span>{rating}</span> : null}
+        <div className="posterArtActions">
+          <button
+            aria-label={`搜索刮削 ${item.title}`}
+            onClick={(event) => handleCardAction(event, onSearchMetadata)}
+            title="搜索刮削"
+            type="button"
+          >
+            <Search size={16} />
+          </button>
+          <button
+            aria-label={`自定义编辑 ${item.title}`}
+            onClick={(event) => handleCardAction(event, onEdit)}
+            title="自定义编辑"
+            type="button"
+          >
+            <Pencil size={15} />
+          </button>
+        </div>
       </div>
-      <h3>{item.title}</h3>
-      <p>{[year, `${item.videoFileCount} 个视频`].filter(Boolean).join(" · ")}</p>
+      {showProgress ? (
+        <div
+          aria-label="播放进度"
+          aria-valuemax={100}
+          aria-valuemin={0}
+          aria-valuenow={progressPercent}
+          className="posterProgress"
+          role="progressbar"
+        >
+          <div className="posterProgressFill" style={{ width: `${progressPercent}%` }} />
+        </div>
+      ) : null}
+      <div className="posterTitleRow">
+        <h3>{item.title}</h3>
+        <button
+          aria-label={item.isWatched ? `标为未看 ${item.title}` : `标为已看 ${item.title}`}
+          className={item.isWatched ? "watchedButton watched" : "watchedButton"}
+          onClick={(event) => handleCardAction(event, onToggleWatched)}
+          title={item.isWatched ? "标为未看" : "标为已看"}
+          type="button"
+        >
+          {item.isWatched ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+        </button>
+      </div>
+      {year ? <p>{year}</p> : null}
     </article>
   );
+}
+
+function playbackProgressPercent(item: LibraryItemSummary): number {
+  if (item.maxDurationSeconds <= 0 || item.maxProgressSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.round((Math.min(item.maxProgressSeconds, item.maxDurationSeconds) / item.maxDurationSeconds) * 100);
 }
 
 function DetailView({
   detail,
   errorText,
-  isRescraping,
-  isRefreshing,
-  metadataCandidates,
+  showEpisodeDetails,
   onBack,
-  onApplyMetadataCandidate,
-  onCancelTask,
-  onSearchMetadata,
   onPlay,
-  onRescrape,
-  onToggleMetadataLock,
-  onToggleWatched,
-  statusText,
-  taskSnapshot,
 }: {
   detail: LibraryItemDetail;
   errorText: string;
-  isRescraping: boolean;
-  isRefreshing: boolean;
-  metadataCandidates: TmdbMetadataMatch[];
+  showEpisodeDetails: boolean;
   onBack: () => void;
-  onApplyMetadataCandidate: (match: TmdbMetadataMatch) => void;
-  onCancelTask: (taskId: string) => void;
-  onSearchMetadata: () => void;
   onPlay: (file: VideoFileSummary) => void;
-  onRescrape: () => void;
-  onToggleMetadataLock: () => void;
-  onToggleWatched: (file: VideoFileSummary) => void;
-  statusText: string;
-  taskSnapshot: BackgroundTaskSnapshot | null;
 }) {
   const poster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
   const year = detail.releaseDate?.slice(0, 4);
-  const mainFile = detail.videoFiles[0] ?? null;
+  const playableEpisodes = detail.seasons.flatMap((season) => season.episodes).filter((episode) => episode.videoFile);
+  const mainEpisode =
+    detail.itemKind === "tv"
+      ? playableEpisodes.find((episode) => hasUnfinishedProgress(episode.videoFile)) ??
+        playableEpisodes.find((episode) => episode.videoFile && !episode.videoFile.isWatched) ??
+        playableEpisodes[0] ??
+        null
+      : null;
+  const mainFile = mainEpisode?.videoFile ?? detail.videoFiles[0] ?? null;
+  const mainProgressPercent = fileProgressPercent(mainFile);
+  const mainStatusLabel = watchedStatusLabel(mainFile);
+  const mainElapsedLabel = mainFile ? formatPlaybackTime(mainFile.positionSeconds) : "0:00";
+  const mainDurationLabel = mainFile && mainFile.durationSeconds > 0 ? formatPlaybackTime(mainFile.durationSeconds) : "--:--";
+  const playButtonText = [
+    mainFile && mainFile.positionSeconds > 5 ? "继续播放" : "开始播放",
+    mainEpisode ? episodeDisplayLabel(mainEpisode.seasonNumber, mainEpisode.episodeNumber) : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const [selectedSeasonId, setSelectedSeasonId] = useState(detail.seasons[0]?.id ?? "");
+  const selectedSeason = detail.seasons.find((season) => season.id === selectedSeasonId) ?? detail.seasons[0] ?? null;
+
+  useEffect(() => {
+    if (detail.seasons.length === 0) {
+      setSelectedSeasonId("");
+      return;
+    }
+
+    if (!detail.seasons.some((season) => season.id === selectedSeasonId)) {
+      setSelectedSeasonId(detail.seasons[0].id);
+    }
+  }, [detail.id, detail.seasons, selectedSeasonId]);
 
   return (
     <main className="detailShell">
@@ -2009,107 +2460,76 @@ function DetailView({
         <button aria-label="back" onClick={onBack}>
           <ArrowLeft size={19} />
         </button>
-        <span>{isRefreshing ? "刷新中" : "详情"}</span>
-        <button aria-label="manual match" disabled={isRefreshing} onClick={onSearchMetadata} title="手动匹配">
-          <Search size={17} />
-        </button>
-        <button aria-label="rescrape" disabled={isRefreshing || isRescraping} onClick={onRescrape} title="重刮削">
-          <Sparkles size={17} className={isRescraping ? "pulse" : ""} />
-        </button>
-        <button
-          aria-label="toggle metadata lock"
-          disabled={isRefreshing}
-          onClick={onToggleMetadataLock}
-          title={detail.isLocked ? "解锁元数据" : "锁定元数据"}
-        >
-          {detail.isLocked ? <Lock size={17} /> : <Unlock size={17} />}
-        </button>
       </header>
 
       <section className="detailHero">
         <div className="detailPoster">
-          {poster ? <img alt="" src={poster} /> : <span>{detail.itemKind === "tv" ? "TV" : "MOV"}</span>}
+          {poster ? <img alt="" src={poster} /> : null}
         </div>
         <div className="detailMeta">
           <h1>{detail.title}</h1>
           <div className="detailFacts">
             {year ? <span>{year}</span> : null}
-            {detail.voteAverage ? <span>{detail.voteAverage.toFixed(1)}</span> : null}
-            {detail.isLocked ? <span>已锁定</span> : null}
-            {detail.tmdbId ? <span>TMDB {detail.tmdbId}</span> : null}
-            <span>{detail.videoFileCount} 个视频</span>
+            {detail.voteAverage ? <span>评分 {detail.voteAverage.toFixed(1)}</span> : null}
           </div>
           <p>{detail.overview || "暂无简介"}</p>
+          {errorText ? <strong className="detailError">{errorText}</strong> : null}
           {mainFile ? (
             <div className="detailActions">
               <button aria-label="play" onClick={() => onPlay(mainFile)}>
                 <Play size={18} />
+                <span>{playButtonText}</span>
               </button>
-              <button onClick={() => onToggleWatched(mainFile)}>{mainFile.isWatched ? "已播" : "未播"}</button>
+              <span className={mainStatusLabel === "已播" ? "detailWatchStatus watched" : "detailWatchStatus"}>
+                {mainStatusLabel}
+              </span>
+              <div className="detailTimelineAxis">
+                <span>{mainElapsedLabel}</span>
+                <div
+                  aria-label="播放进度"
+                  aria-valuemax={100}
+                  aria-valuemin={0}
+                  aria-valuenow={mainProgressPercent}
+                  className="detailTimeline"
+                  role="progressbar"
+                >
+                  <div style={{ width: `${mainProgressPercent}%` }} />
+                </div>
+                <span>{mainDurationLabel}</span>
+              </div>
             </div>
           ) : null}
         </div>
       </section>
 
-      {statusText || errorText || taskSnapshot?.tasks.length ? (
-        <section className="detailTasks">
-          {statusText ? <span>{statusText}</span> : null}
-          {errorText ? <strong>{errorText}</strong> : null}
-          <TaskCenter snapshot={taskSnapshot} onCancel={onCancelTask} />
-        </section>
-      ) : null}
-
-      {metadataCandidates.length > 0 ? (
-        <section className="metadataCandidates">
-          {metadataCandidates.map((candidate) => (
-            <article className="metadataCandidate" key={`${candidate.mediaType}-${candidate.id}`}>
-              <div className="metadataPoster">
-                {tmdbPosterUrl(candidate.posterPath) ? <img alt="" src={tmdbPosterUrl(candidate.posterPath)!} /> : <span>TMDB</span>}
-              </div>
-              <div>
-                <h3>{candidate.title}</h3>
-                <p>
-                  {[candidate.releaseDate?.slice(0, 4), candidate.voteAverage ? candidate.voteAverage.toFixed(1) : null]
-                    .filter(Boolean)
-                    .join(" · ") || "TMDB"}
-                </p>
-                <span>{candidate.overview || "暂无简介"}</span>
-              </div>
-              <button onClick={() => onApplyMetadataCandidate(candidate)}>应用</button>
-            </article>
-          ))}
-        </section>
-      ) : null}
-
-      {detail.itemKind === "tv" && detail.seasons.length > 0 ? (
+      {detail.itemKind === "tv" && selectedSeason ? (
         <section className="episodeSection">
-          {detail.seasons.map((season) => (
-            <div className="seasonBlock" key={season.id}>
-              <div className="seasonHeader">
-                {season.posterAssetId ? <img alt="" src={posterUrl(season.posterAssetId)} /> : null}
-                <h2>{season.title ?? (season.seasonNumber === 0 ? "特别篇" : `第 ${season.seasonNumber} 季`)}</h2>
-              </div>
-              <div className="episodeGrid">
-                {season.episodes.map((episode) => (
-                  <EpisodeCard
-                    episode={episode}
-                    key={episode.id}
-                    onPlay={onPlay}
-                    onToggleWatched={onToggleWatched}
-                  />
-                ))}
-              </div>
-            </div>
-          ))}
+          <div className="seasonHeader">
+            <select
+              aria-label="season"
+              onChange={(event) => setSelectedSeasonId(event.target.value)}
+              value={selectedSeason.id}
+            >
+              {detail.seasons.map((season) => (
+                <option key={season.id} value={season.id}>
+                  {season.title ?? (season.seasonNumber === 0 ? "特别篇" : `第 ${season.seasonNumber} 季`)}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="episodeGrid">
+            {selectedSeason.episodes.map((episode) => (
+              <EpisodeCard
+                episode={episode}
+                key={episode.id}
+                onPlay={onPlay}
+                poster={poster}
+                showDetails={showEpisodeDetails}
+              />
+            ))}
+          </div>
         </section>
-      ) : (
-        <section className="fileSection">
-          <h2>视频文件</h2>
-          {detail.videoFiles.map((file) => (
-            <FileRow file={file} key={file.id} onPlay={onPlay} onToggleWatched={onToggleWatched} />
-          ))}
-        </section>
-      )}
+      ) : null}
     </main>
   );
 }
@@ -2117,55 +2537,120 @@ function DetailView({
 function EpisodeCard({
   episode,
   onPlay,
-  onToggleWatched,
+  poster,
+  showDetails,
 }: {
   episode: EpisodeDetail;
   onPlay: (file: VideoFileSummary) => void;
-  onToggleWatched: (file: VideoFileSummary) => void;
+  poster: string | null;
+  showDetails: boolean;
 }) {
   const file = episode.videoFile;
-  const facts = [episode.airDate, file?.fileName].filter(Boolean).join(" · ");
+  const episodeLabel = episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber);
+  const facts = [episode.title ? episodeLabel : null, episode.airDate].filter(Boolean).join(" · ");
+  const progressPercent = fileProgressPercent(file);
+  const showProgress = progressPercent > 0 && progressPercent < 95;
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!file || (event.key !== "Enter" && event.key !== " ")) {
+      return;
+    }
+
+    event.preventDefault();
+    onPlay(file);
+  };
+
   return (
-    <article className="episodeCard">
-      {episode.stillAssetId ? <img alt="" className="episodeStill" src={thumbnailUrl(episode.stillAssetId)} /> : null}
-      <div>
-        <h3>{episode.title ?? `第 ${episode.episodeNumber} 集`}</h3>
-        <p>{facts || "暂无文件"}</p>
-        {episode.overview ? <span>{episode.overview}</span> : null}
-      </div>
-      {file ? (
-        <div className="rowActions">
-          <button aria-label="play episode" onClick={() => onPlay(file)}>
-            <Play size={16} />
-          </button>
-          <button onClick={() => onToggleWatched(file)}>{file.isWatched ? "已播" : "未播"}</button>
+    <article
+      className={[file ? "episodeCard clickableEpisode" : "episodeCard", showDetails ? "" : "simpleEpisode"]
+        .filter(Boolean)
+        .join(" ")}
+      onClick={file ? () => onPlay(file) : undefined}
+      onKeyDown={handleKeyDown}
+      role={file ? "button" : undefined}
+      tabIndex={file ? 0 : undefined}
+    >
+      {episode.stillAssetId ? (
+        <img alt="" className="episodeStill" src={thumbnailUrl(episode.stillAssetId)} />
+      ) : (
+        <div className="episodeStill episodeStillPlaceholder">
+          {poster ? <img alt="" src={poster} /> : null}
         </div>
-      ) : null}
+      )}
+      <div className="episodeBody">
+        <h3>{showDetails ? episode.title ?? episodeLabel : episodeLabel}</h3>
+        {showDetails && facts ? <p>{facts}</p> : null}
+        {showDetails && episode.overview ? <span>{episode.overview}</span> : null}
+        {showDetails && showProgress ? (
+          <div
+            aria-label="播放进度"
+            aria-valuemax={100}
+            aria-valuemin={0}
+            aria-valuenow={progressPercent}
+            className="episodeProgress"
+            role="progressbar"
+          >
+            <div style={{ width: `${progressPercent}%` }} />
+          </div>
+        ) : null}
+      </div>
     </article>
   );
+}
+
+function episodeDisplayLabel(seasonNumber: number, episodeNumber: number): string {
+  return seasonNumber === 0 ? `特别篇第 ${episodeNumber} 集` : `第 ${seasonNumber} 季第 ${episodeNumber} 集`;
+}
+
+function fileProgressPercent(file: VideoFileSummary | null): number {
+  if (!file || file.durationSeconds <= 0 || file.positionSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.round((Math.min(file.positionSeconds, file.durationSeconds) / file.durationSeconds) * 100);
+}
+
+function hasUnfinishedProgress(file: VideoFileSummary | null | undefined): boolean {
+  if (!file || file.positionSeconds <= 5) {
+    return false;
+  }
+
+  return file.durationSeconds <= 0 || fileProgressPercent(file) < 95;
+}
+
+function watchedStatusLabel(file: VideoFileSummary | null): string {
+  if (!file) {
+    return "未播";
+  }
+
+  if (file.isWatched || fileProgressPercent(file) >= 95) {
+    return "已播";
+  }
+
+  return file.positionSeconds > 5 ? "未播完" : "未播";
 }
 
 function FileRow({
   file,
   onPlay,
-  onToggleWatched,
 }: {
   file: VideoFileSummary;
   onPlay: (file: VideoFileSummary) => void;
-  onToggleWatched: (file: VideoFileSummary) => void;
 }) {
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+
+    event.preventDefault();
+    onPlay(file);
+  };
+
   return (
-    <div className="fileRow">
+    <div className="fileRow" onClick={() => onPlay(file)} onKeyDown={handleKeyDown} role="button" tabIndex={0}>
       <div>
         <strong>{file.fileName}</strong>
         <span>{file.relativePath}</span>
         <span>{formatMediaProbe(file)}</span>
-      </div>
-      <div className="rowActions">
-        <button aria-label="play file" onClick={() => onPlay(file)}>
-          <Play size={16} />
-        </button>
-        <button onClick={() => onToggleWatched(file)}>{file.isWatched ? "已播" : "未播"}</button>
       </div>
     </div>
   );
@@ -2235,6 +2720,7 @@ function PlayerView({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const lastSavedAtRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const controlsHideTimerRef = useRef(0);
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [playbackMode, setPlaybackMode] = useState<"direct" | "hls" | null>(null);
   const [playerStatus, setPlayerStatus] = useState("正在准备播放");
@@ -2243,7 +2729,7 @@ function PlayerView({
   const [audioTrack, setAudioTrack] = useState("auto");
   const [subtitleMode, setSubtitleMode] = useState("off");
   const [selectedSubtitleId, setSelectedSubtitleId] = useState("");
-  const [useHardware, setUseHardware] = useState(false);
+  const [useHardware, setUseHardware] = useState(true);
   const [capabilities, setCapabilities] = useState<FfmpegTranscodeCapabilities | null>(null);
   const [subtitles, setSubtitles] = useState<PlaybackSubtitleTrack[]>([]);
   const [cacheStatus, setCacheStatus] = useState<PlaybackCacheStatus | null>(null);
@@ -2251,8 +2737,12 @@ function PlayerView({
   const [diagnosticsError, setDiagnosticsError] = useState("");
   const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false);
   const [cleanupText, setCleanupText] = useState("");
-  const title = file.episodeTitle ?? detail.title;
-  const subTitle = [formatEpisode(file), file.fileName].filter(Boolean).join(" · ");
+  const [showPlayerControls, setShowPlayerControls] = useState(true);
+  const [isPaused, setIsPaused] = useState(true);
+  const [currentTime, setCurrentTime] = useState(file.positionSeconds);
+  const [duration, setDuration] = useState(file.durationSeconds);
+  const title = formatPlayerTitle(detail, file);
+  const subTitle = playerSubTitle(file);
   const selectedSubtitle = subtitles.find((subtitle) => subtitle.id === selectedSubtitleId) ?? null;
   const selectedEmbeddedSubtitle = selectedSubtitleId.startsWith("embedded_")
     ? file.subtitleStreams.find((stream) => `embedded_${stream.index}` === selectedSubtitleId) ?? null
@@ -2263,6 +2753,28 @@ function PlayerView({
     (!!selectedSubtitleId && subtitleMode === "burn");
   const isPlaybackCachePlayable =
     cacheStatus?.isReady || (!!cacheStatus?.canStreamDirect && !requiresFullCacheForPlayback) || false;
+  const seekSeconds = 10;
+  const progressValue = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+
+  const resetControlTimer = useCallback((forceVisible = true) => {
+    window.clearTimeout(controlsHideTimerRef.current);
+    if (forceVisible) {
+      setShowPlayerControls(true);
+    }
+
+    const video = videoRef.current;
+    if (!video || video.paused || playerStatus || playerError) {
+      return;
+    }
+
+    controlsHideTimerRef.current = window.setTimeout(() => {
+      setShowPlayerControls(false);
+    }, 3000);
+  }, [playerError, playerStatus]);
+
+  useEffect(() => {
+    return () => window.clearTimeout(controlsHideTimerRef.current);
+  }, []);
 
   const saveProgress = useCallback(
     async (force = false) => {
@@ -2522,16 +3034,106 @@ function PlayerView({
     };
   }, [playbackMode, playbackUrl]);
 
+  useEffect(() => {
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, select, textarea, button")) {
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        togglePlayPause();
+        return;
+      }
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        seekRelative(-seekSeconds);
+        return;
+      }
+
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        seekRelative(seekSeconds);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
+
   function handleLoadedMetadata() {
     const video = videoRef.current;
-    if (!video || file.positionSeconds <= 0) {
+    if (!video) {
       return;
     }
 
     const duration = Number.isFinite(video.duration) ? video.duration : file.durationSeconds;
+    setDuration(duration);
+    setIsPaused(video.paused);
     if (duration <= 0 || file.positionSeconds < duration - 8) {
       video.currentTime = file.positionSeconds;
+      setCurrentTime(file.positionSeconds);
     }
+  }
+
+  function handleTimeUpdate() {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    setCurrentTime(Number.isFinite(video.currentTime) ? video.currentTime : 0);
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      setDuration(video.duration);
+    }
+    void saveProgress(false);
+  }
+
+  function handlePlayStateChange(paused: boolean) {
+    setIsPaused(paused);
+    resetControlTimer(true);
+  }
+
+  function togglePlayPause() {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    if (video.paused) {
+      void video.play().catch((error: unknown) => {
+        setPlayerError(error instanceof Error ? error.message : String(error));
+      });
+    } else {
+      video.pause();
+    }
+    resetControlTimer(true);
+  }
+
+  function seekRelative(seconds: number) {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    const nextTime = Math.max(0, Math.min(duration || video.duration || 0, video.currentTime + seconds));
+    video.currentTime = nextTime;
+    setCurrentTime(nextTime);
+    resetControlTimer(true);
+  }
+
+  function handleSeekPercent(value: string) {
+    const video = videoRef.current;
+    if (!video || duration <= 0) {
+      return;
+    }
+
+    const nextTime = (Number(value) / 100) * duration;
+    video.currentTime = nextTime;
+    setCurrentTime(nextTime);
+    resetControlTimer(true);
   }
 
   async function handleBack() {
@@ -2586,130 +3188,148 @@ function PlayerView({
   }
 
   return (
-    <main className="playerShell">
-      <header className="playerTopbar">
-        <button aria-label="back" onClick={() => void handleBack()}>
-          <ArrowLeft size={19} />
-        </button>
-        <div>
-          <h1>{title}</h1>
-          <p>{subTitle}</p>
-        </div>
-        <div className="playerControls">
-          <select aria-label="quality" onChange={(event) => setQuality(event.target.value)} value={quality}>
-            <option value="original">原始</option>
-            <option value="1080p">1080p</option>
-            <option value="720p">720p</option>
-            <option value="480p">480p</option>
-            <option value="360p">360p</option>
-          </select>
-          <select aria-label="audio track" onChange={(event) => setAudioTrack(event.target.value)} value={audioTrack}>
-            <option value="auto">默认音轨</option>
-            {file.audioTracks.length > 0 ? (
-              file.audioTracks.map((track) => (
-                <option key={track.index} value={String(track.index)}>
-                  {formatAudioTrack(track)}
-                </option>
-              ))
-            ) : (
-              <>
-                <option value="0">音轨 1</option>
-                <option value="1">音轨 2</option>
-                <option value="2">音轨 3</option>
-                <option value="3">音轨 4</option>
-              </>
-            )}
-          </select>
-          <select
-            aria-label="subtitle"
-            onChange={(event) => {
-              setSelectedSubtitleId(event.target.value);
-              if (event.target.value.startsWith("embedded_")) {
-                setSubtitleMode("burn");
-              }
-            }}
-            value={selectedSubtitleId}
-          >
-            <option value="">无字幕</option>
-            {file.subtitleStreams.length > 0 ? (
-              <optgroup label="内嵌字幕">
-                {file.subtitleStreams.map((stream) => (
-                  <option key={stream.index} value={`embedded_${stream.index}`}>
-                    {formatSubtitleStream(stream)}
-                  </option>
-                ))}
-              </optgroup>
-            ) : null}
-            {subtitles.map((subtitle) => (
-              <option key={subtitle.id} value={subtitle.id}>
-                {subtitle.language ?? subtitle.fileName}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="subtitle mode"
-            disabled={!selectedSubtitleId}
-            onChange={(event) => setSubtitleMode(event.target.value)}
-            value={subtitleMode}
-          >
-            <option value="off">字幕关</option>
-            <option disabled={!!selectedEmbeddedSubtitle} value="web">外挂</option>
-            <option value="burn">烧录</option>
-          </select>
-          <label className="playerToggle">
-            <input
-              checked={useHardware}
-              disabled={!capabilities?.preferredHardwareEncoder}
-              onChange={(event) => setUseHardware(event.target.checked)}
-              type="checkbox"
-            />
-            硬件
-          </label>
-          <button aria-label="cleanup cache" onClick={() => void handleCleanupCache()}>
-            清理
-          </button>
-          <button aria-label="playback diagnostics" onClick={() => void handleLoadDiagnostics()}>
-            诊断
-          </button>
-        </div>
-      </header>
-      {cleanupText ? <div className="playerNotice">{cleanupText}</div> : null}
-      {isDiagnosticsOpen ? (
-        <section className="playbackDiagnostics" aria-label="playback diagnostics">
-          {diagnosticsError ? <p className="diagnosticsError">{diagnosticsError}</p> : null}
-          {diagnostics ? (
-            <>
-              <div className="diagnosticsSummary">
-                <strong>{diagnostics.effectiveMode}</strong>
-                <span>{diagnostics.reason}</span>
-              </div>
-              <div className="diagnosticsFlags">
-                <span>{diagnostics.sourceKind}</span>
-                <span>{diagnostics.usesWebDavRangeProxy ? "Range 代理" : diagnostics.usesHls ? "HLS" : "直出"}</span>
-                <span>{diagnostics.requiresFullCache ? "完整缓存" : "无需完整缓存"}</span>
-                {diagnostics.usesTranscode ? <span>转码</span> : null}
-                {diagnostics.burnsSubtitle ? <span>字幕烧录</span> : null}
-                {diagnostics.capabilities?.preferredHardwareEncoder ? <span>{diagnostics.capabilities.preferredHardwareEncoder}</span> : null}
-              </div>
-              <div className="diagnosticsSteps">
-                {diagnostics.steps.map((step) => (
-                  <article className={`diagnosticStep ${step.status}`} key={step.key}>
-                    <span>{step.label}</span>
-                    <p>{step.detail}</p>
-                  </article>
-                ))}
-              </div>
-              {diagnostics.ffmpegCommandPreview ? (
-                <pre className="diagnosticsCommand">{diagnostics.ffmpegCommandPreview}</pre>
-              ) : null}
-            </>
-          ) : diagnosticsError ? null : (
-            <p className="diagnosticsLoading">正在生成诊断</p>
-          )}
-        </section>
-      ) : null}
+    <main className="playerShell" onMouseMove={() => resetControlTimer(true)}>
+      <section className="playerStage" onClick={() => setShowPlayerControls((current) => !current)}>
+        <video
+          autoPlay
+          onClick={(event) => event.stopPropagation()}
+          onEnded={() => void saveProgress(true)}
+          onLoadedMetadata={handleLoadedMetadata}
+          onPause={() => {
+            handlePlayStateChange(true);
+            void saveProgress(true);
+          }}
+          onPlay={() => handlePlayStateChange(false)}
+          onTimeUpdate={handleTimeUpdate}
+          ref={videoRef}
+        >
+          {subtitleMode === "web" && selectedSubtitle?.webVttUrl ? (
+            <track default kind="subtitles" label={selectedSubtitle.language ?? selectedSubtitle.fileName} src={selectedSubtitle.webVttUrl} />
+          ) : null}
+        </video>
 
-      <section className="playerStage">
+        <div className={showPlayerControls ? "playerChrome visible" : "playerChrome"}>
+          <header className="playerTopbar">
+            <button aria-label="back" onClick={() => void handleBack()} type="button">
+              <ArrowLeft size={22} />
+            </button>
+            <div>
+              <h1>{title}</h1>
+              {subTitle ? <p>{subTitle}</p> : null}
+            </div>
+          </header>
+
+          <div className="playerBottomBar" onClick={(event) => event.stopPropagation()}>
+            {cleanupText ? <div className="playerNotice">{cleanupText}</div> : null}
+            <div className="playerTransport">
+              <button aria-label="backward" onClick={() => seekRelative(-seekSeconds)} type="button">
+                <SkipBack size={34} />
+              </button>
+              <button className="playerPlayButton" aria-label={isPaused ? "play" : "pause"} onClick={togglePlayPause} type="button">
+                {isPaused ? <Play size={58} /> : <Pause size={58} />}
+              </button>
+              <button aria-label="forward" onClick={() => seekRelative(seekSeconds)} type="button">
+                <SkipForward size={34} />
+              </button>
+            </div>
+
+            <div className="playerTimeline">
+              <span>{formatPlaybackTime(currentTime)}</span>
+              <input
+                aria-label="播放进度"
+                max={100}
+                min={0}
+                onChange={(event) => handleSeekPercent(event.target.value)}
+                step={0.1}
+                type="range"
+                value={progressValue}
+              />
+              <span>{duration > 0 ? `-${formatPlaybackTime(Math.max(0, duration - currentTime))}` : "--:--"}</span>
+            </div>
+
+            <div className="playerMenuBar">
+              <label title="清晰度">
+                <SlidersHorizontal size={16} />
+                <select aria-label="quality" onChange={(event) => setQuality(event.target.value)} value={quality}>
+                  <option value="original">原始</option>
+                  <option value="1080p">1080p</option>
+                  <option value="720p">720p</option>
+                  <option value="480p">480p</option>
+                  <option value="360p">360p</option>
+                </select>
+              </label>
+              <label title="音轨">
+                <Music2 size={16} />
+                <select aria-label="audio track" onChange={(event) => setAudioTrack(event.target.value)} value={audioTrack}>
+                  <option value="auto">默认音轨</option>
+                  {file.audioTracks.length > 0 ? (
+                    file.audioTracks.map((track) => (
+                      <option key={track.index} value={String(track.index)}>
+                        {formatAudioTrack(track)}
+                      </option>
+                    ))
+                  ) : (
+                    <>
+                      <option value="0">音轨 1</option>
+                      <option value="1">音轨 2</option>
+                      <option value="2">音轨 3</option>
+                      <option value="3">音轨 4</option>
+                    </>
+                  )}
+                </select>
+              </label>
+              <label title="字幕">
+                <Captions size={16} />
+                <select
+                  aria-label="subtitle"
+                  onChange={(event) => {
+                    setSelectedSubtitleId(event.target.value);
+                    if (event.target.value.startsWith("embedded_")) {
+                      setSubtitleMode("burn");
+                    }
+                  }}
+                  value={selectedSubtitleId}
+                >
+                  <option value="">关闭字幕</option>
+                  {file.subtitleStreams.length > 0 ? (
+                    <optgroup label="内嵌字幕">
+                      {file.subtitleStreams.map((stream) => (
+                        <option key={stream.index} value={`embedded_${stream.index}`}>
+                          {formatSubtitleStream(stream)}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                  {subtitles.map((subtitle) => (
+                    <option key={subtitle.id} value={subtitle.id}>
+                      {subtitle.language ?? subtitle.fileName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label title="字幕方式">
+                <Settings size={16} />
+                <select
+                  aria-label="subtitle mode"
+                  disabled={!selectedSubtitleId}
+                  onChange={(event) => setSubtitleMode(event.target.value)}
+                  value={subtitleMode}
+                >
+                  <option value="off">关闭</option>
+                  <option disabled={!!selectedEmbeddedSubtitle} value="web">外挂</option>
+                  <option value="burn">烧录</option>
+                </select>
+              </label>
+              <button aria-label="cleanup cache" onClick={() => void handleCleanupCache()} title="清理缓存" type="button">
+                <Trash2 size={16} />
+              </button>
+              <button aria-label="playback diagnostics" onClick={() => void handleLoadDiagnostics()} title="播放诊断" type="button">
+                <Bug size={16} />
+              </button>
+            </div>
+          </div>
+        </div>
+
         {playerStatus ? (
           <div className="playerOverlay">
             <span>{playerStatus}</span>
@@ -2721,28 +3341,66 @@ function PlayerView({
           </div>
         ) : null}
         {playerError ? <div className="playerOverlay error">{playerError}</div> : null}
-        <video
-          autoPlay
-          controls
-          onEnded={() => void saveProgress(true)}
-          onLoadedMetadata={handleLoadedMetadata}
-          onPause={() => void saveProgress(true)}
-          onTimeUpdate={() => void saveProgress(false)}
-          ref={videoRef}
-        >
-          {subtitleMode === "web" && selectedSubtitle?.webVttUrl ? (
-            <track default kind="subtitles" label={selectedSubtitle.language ?? selectedSubtitle.fileName} src={selectedSubtitle.webVttUrl} />
-          ) : null}
-        </video>
+
+        {isDiagnosticsOpen ? (
+          <section className="playbackDiagnostics" aria-label="playback diagnostics" onClick={(event) => event.stopPropagation()}>
+            {diagnosticsError ? <p className="diagnosticsError">{diagnosticsError}</p> : null}
+            {diagnostics ? (
+              <>
+                <div className="diagnosticsSummary">
+                  <strong>{diagnostics.effectiveMode}</strong>
+                  <span>{diagnostics.reason}</span>
+                </div>
+                <div className="diagnosticsFlags">
+                  <span>{diagnostics.sourceKind}</span>
+                  <span>{diagnostics.usesWebDavRangeProxy ? "Range 代理" : diagnostics.usesHls ? "HLS" : "直出"}</span>
+                  <span>{diagnostics.requiresFullCache ? "完整缓存" : "无需完整缓存"}</span>
+                  {diagnostics.usesTranscode ? <span>转码</span> : null}
+                  {diagnostics.burnsSubtitle ? <span>字幕烧录</span> : null}
+                  {diagnostics.capabilities?.preferredHardwareEncoder ? <span>{diagnostics.capabilities.preferredHardwareEncoder}</span> : null}
+                </div>
+                <div className="diagnosticsSteps">
+                  {diagnostics.steps.map((step) => (
+                    <article className={`diagnosticStep ${step.status}`} key={step.key}>
+                      <span>{step.label}</span>
+                      <p>{step.detail}</p>
+                    </article>
+                  ))}
+                </div>
+                {diagnostics.ffmpegCommandPreview ? (
+                  <pre className="diagnosticsCommand">{diagnostics.ffmpegCommandPreview}</pre>
+                ) : null}
+              </>
+            ) : diagnosticsError ? null : (
+              <p className="diagnosticsLoading">正在生成诊断</p>
+            )}
+          </section>
+        ) : null}
       </section>
     </main>
   );
 }
 
-function formatEpisode(file: VideoFileSummary): string | null {
+function formatPlayerTitle(detail: LibraryItemDetail, file: VideoFileSummary): string {
   if (file.seasonNumber === null || file.episodeNumber === null) {
-    return null;
+    return detail.title;
   }
 
-  return `S${String(file.seasonNumber).padStart(2, "0")}E${String(file.episodeNumber).padStart(2, "0")}`;
+  return `${detail.title} ${episodeDisplayLabel(file.seasonNumber, file.episodeNumber)}`;
+}
+
+function playerSubTitle(file: VideoFileSummary): string {
+  return [file.container, file.videoCodec, file.audioCodec].filter(Boolean).join(" · ");
+}
+
+function formatPlaybackTime(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const remainingSeconds = safeSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
 }

@@ -42,16 +42,24 @@ public sealed class LibraryScanner : ILibraryScanner
 
     public async Task<LibraryScanSummary> ScanAllAsync(CancellationToken cancellationToken = default)
     {
-        return await ScanAllAsync(null, cancellationToken);
+        return await ScanAllAsync(null, hideNewItemsUntilScraped: false, cancellationToken);
     }
 
     public async Task<LibraryScanSummary> ScanAllAsync(
         IProgress<LibraryScanProgress>? progress,
         CancellationToken cancellationToken = default)
     {
+        return await ScanAllAsync(progress, hideNewItemsUntilScraped: false, cancellationToken);
+    }
+
+    public async Task<LibraryScanSummary> ScanAllAsync(
+        IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
+        CancellationToken cancellationToken = default)
+    {
         using var connection = database.OpenConnection();
         var sources = await GetEnabledSourcesAsync(connection, cancellationToken);
-        return await ScanSourcesAsync(connection, sources, progress, cancellationToken);
+        return await ScanSourcesAsync(connection, sources, progress, hideNewItemsUntilScraped, cancellationToken);
     }
 
     public async Task<LibraryScanSummary> ScanSourceAsync(
@@ -59,15 +67,25 @@ public sealed class LibraryScanner : ILibraryScanner
         IProgress<LibraryScanProgress>? progress,
         CancellationToken cancellationToken = default)
     {
+        return await ScanSourceAsync(sourceId, progress, hideNewItemsUntilScraped: false, cancellationToken);
+    }
+
+    public async Task<LibraryScanSummary> ScanSourceAsync(
+        long sourceId,
+        IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
+        CancellationToken cancellationToken = default)
+    {
         using var connection = database.OpenConnection();
         var sources = await GetEnabledSourcesAsync(connection, sourceId, cancellationToken);
-        return await ScanSourcesAsync(connection, sources, progress, cancellationToken);
+        return await ScanSourcesAsync(connection, sources, progress, hideNewItemsUntilScraped, cancellationToken);
     }
 
     private async Task<LibraryScanSummary> ScanSourcesAsync(
         SqliteConnection connection,
         IReadOnlyList<MediaSource> sources,
         IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
         CancellationToken cancellationToken)
     {
         var newMovies = 0;
@@ -87,6 +105,7 @@ public sealed class LibraryScanner : ILibraryScanner
                 sources.Count,
                 completedSourceCount,
                 progress,
+                hideNewItemsUntilScraped,
                 cancellationToken);
             newMovies += summary.NewMovieCount;
             newTvShows += summary.NewTvShowCount;
@@ -112,6 +131,7 @@ public sealed class LibraryScanner : ILibraryScanner
         int sourceCount,
         int completedSourceCount,
         IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
         CancellationToken cancellationToken)
     {
         var shouldProbe = false;
@@ -123,13 +143,41 @@ public sealed class LibraryScanner : ILibraryScanner
                 return new LibraryScanSummary(1, 0, 0, 0, 0, [$"已跳过媒体源“{source.Name}”：目录不存在。"]);
             }
 
-            scannedFiles = EnumerateLocalVideoFiles(source.BaseUrl, cancellationToken);
-            shouldProbe = true;
+            ReportProgress(
+                progress,
+                "discovering",
+                sourceCount,
+                completedSourceCount,
+                source.Name,
+                0,
+                0,
+                0,
+                0,
+                null);
+            scannedFiles = EnumerateLocalVideoFiles(
+                source.BaseUrl,
+                progress,
+                sourceCount,
+                completedSourceCount,
+                source.Name,
+                cancellationToken);
+            shouldProbe = !hideNewItemsUntilScraped;
         }
         else if (string.Equals(source.Kind, "webdav", StringComparison.OrdinalIgnoreCase))
         {
             try
             {
+                ReportProgress(
+                    progress,
+                    "discovering",
+                    sourceCount,
+                    completedSourceCount,
+                    source.Name,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null);
                 scannedFiles = await EnumerateWebDavVideoFilesAsync(source, cancellationToken);
             }
             catch (Exception ex) when (ex is ArgumentException
@@ -154,17 +202,21 @@ public sealed class LibraryScanner : ILibraryScanner
 
         List<string> diagnostics = [];
         var existing = await GetExistingVideoFilesAsync(connection, source.Id, cancellationToken);
-        ReportProgress(
-            progress,
-            "probing",
-            sourceCount,
-            completedSourceCount,
-            source.Name,
-            scannedFiles.Count,
-            0,
-            0,
-            0,
-            null);
+        if (shouldProbe)
+        {
+            ReportProgress(
+                progress,
+                "probing",
+                sourceCount,
+                completedSourceCount,
+                source.Name,
+                scannedFiles.Count,
+                0,
+                0,
+                0,
+                null);
+        }
+
         var probes = shouldProbe
             ? await ProbeScannedFilesAsync(
                 scannedFiles,
@@ -227,6 +279,7 @@ public sealed class LibraryScanner : ILibraryScanner
                     title,
                     metadata.Year,
                     now,
+                    isVisible: !hideNewItemsUntilScraped,
                     cancellationToken))
             {
                 if (isTv)
@@ -424,6 +477,10 @@ public sealed class LibraryScanner : ILibraryScanner
 
     private static IReadOnlyList<ScannedVideoFile> EnumerateLocalVideoFiles(
         string sourceRoot,
+        IProgress<LibraryScanProgress>? progress,
+        int sourceCount,
+        int completedSourceCount,
+        string sourceName,
         CancellationToken cancellationToken)
     {
         var options = new EnumerationOptions
@@ -443,13 +500,40 @@ public sealed class LibraryScanner : ILibraryScanner
             }
 
             var fullPath = Path.GetFullPath(absolutePath);
+            var relativePath = MediaNameParser.NormalizeRelativePath(Path.GetRelativePath(sourceRoot, fullPath));
             scannedFiles.Add(new ScannedVideoFile(
                 fullPath,
-                MediaNameParser.NormalizeRelativePath(Path.GetRelativePath(sourceRoot, fullPath)),
+                relativePath,
                 Path.GetFileName(fullPath),
                 TryGetFileSize(fullPath),
                 TryGetModifiedAt(fullPath)));
+            if (scannedFiles.Count % 100 == 0)
+            {
+                ReportProgress(
+                    progress,
+                    "discovering",
+                    sourceCount,
+                    completedSourceCount,
+                    sourceName,
+                    0,
+                    scannedFiles.Count,
+                    0,
+                    0,
+                    relativePath);
+            }
         }
+
+        ReportProgress(
+            progress,
+            "discovering",
+            sourceCount,
+            completedSourceCount,
+            sourceName,
+            scannedFiles.Count,
+            scannedFiles.Count,
+            0,
+            0,
+            scannedFiles.LastOrDefault()?.RelativePath);
 
         return ResolvePrimaryVideoFiles(scannedFiles);
     }
@@ -605,6 +689,7 @@ public sealed class LibraryScanner : ILibraryScanner
         string title,
         string? releaseYear,
         string now,
+        bool isVisible,
         CancellationToken cancellationToken)
     {
         using var existsCommand = connection.CreateCommand();
@@ -617,13 +702,18 @@ public sealed class LibraryScanner : ILibraryScanner
         insert.Transaction = transaction;
         insert.CommandText = """
             INSERT INTO library_items (
-                id, item_kind, title, sort_title, release_date, overview, poster_asset_id, vote_average, is_locked, created_at, updated_at)
+                id, item_kind, title, sort_title, release_date, overview, poster_asset_id, vote_average, is_locked, is_visible, created_at, updated_at)
             VALUES (
-                $id, $itemKind, $title, $sortTitle, $releaseDate, NULL, NULL, NULL, 0, $now, $now)
+                $id, $itemKind, $title, $sortTitle, $releaseDate, NULL, NULL, NULL, 0, $isVisible, $now, $now)
             ON CONFLICT(id) DO UPDATE SET
                 title = CASE WHEN library_items.is_locked = 1 THEN library_items.title ELSE excluded.title END,
                 sort_title = CASE WHEN library_items.is_locked = 1 THEN library_items.sort_title ELSE excluded.sort_title END,
-                release_date = COALESCE(library_items.release_date, excluded.release_date),
+                release_date = CASE
+                    WHEN library_items.release_date IS NULL THEN excluded.release_date
+                    WHEN excluded.release_date IS NULL THEN library_items.release_date
+                    WHEN excluded.release_date < library_items.release_date THEN excluded.release_date
+                    ELSE library_items.release_date
+                END,
                 updated_at = excluded.updated_at;
             """;
         insert.Parameters.AddWithValue("$id", id);
@@ -631,6 +721,7 @@ public sealed class LibraryScanner : ILibraryScanner
         insert.Parameters.AddWithValue("$title", title);
         insert.Parameters.AddWithValue("$sortTitle", NormalizeSortTitle(title));
         insert.Parameters.AddWithValue("$releaseDate", string.IsNullOrWhiteSpace(releaseYear) ? DBNull.Value : $"{releaseYear}-01-01");
+        insert.Parameters.AddWithValue("$isVisible", isVisible ? 1 : 0);
         insert.Parameters.AddWithValue("$now", now);
 
         await insert.ExecuteNonQueryAsync(cancellationToken);
@@ -828,11 +919,12 @@ public sealed class LibraryScanner : ILibraryScanner
 
     private static string ResolveShowTitle(string relativePath, SearchMetadata metadata)
     {
-        return ResolveShowTitleFromRelativePath(relativePath)
-               ?? metadata.ChineseTitle
-               ?? metadata.ForeignTitle
-               ?? metadata.FullCleanTitle
-               ?? "未命名剧集";
+        var title = ResolveShowTitleFromRelativePath(relativePath)
+                    ?? metadata.ChineseTitle
+                    ?? metadata.ForeignTitle
+                    ?? metadata.FullCleanTitle
+                    ?? "未命名剧集";
+        return MediaNameParser.NormalizeTvSeriesTitle(title);
     }
 
     private static string GetMovieGroupingKey(string relativePath, SearchMetadata metadata)
@@ -870,10 +962,11 @@ public sealed class LibraryScanner : ILibraryScanner
     private static string CleanFolderTitle(string folderName)
     {
         var metadata = MediaNameParser.ExtractSearchMetadata(folderName);
-        return metadata.ChineseTitle
-               ?? metadata.ForeignTitle
-               ?? metadata.FullCleanTitle
-               ?? folderName;
+        var title = metadata.ChineseTitle
+                    ?? metadata.ForeignTitle
+                    ?? metadata.FullCleanTitle
+                    ?? folderName;
+        return MediaNameParser.NormalizeTvSeriesTitle(title);
     }
 
     private static string NormalizeSortTitle(string title)

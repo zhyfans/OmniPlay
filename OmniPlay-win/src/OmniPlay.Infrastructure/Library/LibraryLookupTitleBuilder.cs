@@ -18,6 +18,11 @@ public static class LibraryLookupTitleBuilder
 
         AddIfPresent(titles, manualQuery);
 
+        if (!string.IsNullOrWhiteSpace(relativePath) || !string.IsNullOrWhiteSpace(fileName))
+        {
+            AddCombinedSearchMetadataCandidates(titles, relativePath, fileName);
+        }
+
         var isMediaServer = IsMediaServerProtocol(sourceProtocolType);
         if (isMediaServer)
         {
@@ -42,6 +47,23 @@ public static class LibraryLookupTitleBuilder
         return DeduplicateTitles(titles);
     }
 
+    private static void AddCombinedSearchMetadataCandidates(List<string> titles, string? relativePath, string? fileName)
+    {
+        var metadata = MediaNameParser.CombinedSearchMetadata(relativePath ?? string.Empty, fileName ?? string.Empty);
+
+        AddIfPresent(titles, metadata.ChineseTitle);
+        AddIfPresent(titles, metadata.ParentChineseTitle);
+
+        foreach (var foreignQuery in BuildForeignQueryCandidates(metadata.ForeignTitle))
+        {
+            AddIfPresent(titles, foreignQuery);
+        }
+
+        AddIfPresent(titles, BuildPureNameFallback(metadata.ForeignTitle));
+        AddIfPresent(titles, metadata.FullCleanTitle);
+        AddIfPresent(titles, BuildPureNameFallback(metadata.FullCleanTitle));
+    }
+
     private static void AddSearchMetadataCandidates(List<string> titles, string? rawPath, bool includeParentFolder)
     {
         if (string.IsNullOrWhiteSpace(rawPath))
@@ -62,6 +84,7 @@ public static class LibraryLookupTitleBuilder
             AddIfPresent(titles, foreignQuery);
         }
 
+        AddIfPresent(titles, BuildPureNameFallback(metadata.ForeignTitle));
         AddIfPresent(titles, metadata.FullCleanTitle);
         AddIfPresent(titles, BuildPureNameFallback(metadata.FullCleanTitle));
     }
@@ -152,6 +175,7 @@ public static class LibraryLookupTitleBuilder
     {
         List<string> titles = [];
         HashSet<string> seen = [];
+        HashSet<string> seenCompactFallbacks = [];
 
         foreach (var item in source)
         {
@@ -162,8 +186,18 @@ public static class LibraryLookupTitleBuilder
             }
 
             var key = NormalizeTitle(trimmed);
-            if (string.IsNullOrWhiteSpace(key) || !seen.Add(key))
+            if (string.IsNullOrWhiteSpace(key))
             {
+                continue;
+            }
+
+            if (!seen.Add(key))
+            {
+                if (IsCompactFallbackVariant(trimmed, titles, key) && seenCompactFallbacks.Add(key))
+                {
+                    titles.Add(trimmed);
+                }
+
                 continue;
             }
 
@@ -171,6 +205,14 @@ public static class LibraryLookupTitleBuilder
         }
 
         return titles;
+    }
+
+    private static bool IsCompactFallbackVariant(string value, IReadOnlyList<string> existingTitles, string normalizedKey)
+    {
+        return !value.Any(char.IsWhiteSpace) &&
+               existingTitles.Any(title =>
+                   title.Any(char.IsWhiteSpace) &&
+                   NormalizeTitle(title) == normalizedKey);
     }
 
     private static void AddIfPresent(List<string> titles, string? value)

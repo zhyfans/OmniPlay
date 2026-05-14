@@ -102,6 +102,14 @@ public sealed class LibraryMetadataEnrichmentJobServiceTests
             IProgress<LibraryMetadataEnrichmentProgress>? progress,
             CancellationToken cancellationToken = default)
         {
+            return await EnrichMissingAsync(progress, new LibraryRefreshRequest(), cancellationToken);
+        }
+
+        public async Task<LibraryMetadataEnrichmentSummary> EnrichMissingAsync(
+            IProgress<LibraryMetadataEnrichmentProgress>? progress,
+            LibraryRefreshRequest order,
+            CancellationToken cancellationToken = default)
+        {
             ReportStarted(progress);
             return await completion.Task.WaitAsync(cancellationToken);
         }

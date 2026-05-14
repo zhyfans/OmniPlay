@@ -444,7 +444,7 @@ public sealed class LibraryScanner : ILibraryScanner
                 continue;
             }
 
-            var metadata = MediaNameParser.ExtractSearchMetadata(scannedFile.MetadataPath);
+            var metadata = MediaNameParser.CombinedSearchMetadata(scannedFile.RelativePath, scannedFile.FileName);
             var isTv = string.Equals(scannedFile.MediaType, "tv", StringComparison.OrdinalIgnoreCase) ||
                        MediaNameParser.IsLikelyTvEpisodePath(scannedFile.RelativePath) ||
                        MediaNameParser.IsLikelyTvEpisodePath(scannedFile.FileName);
@@ -528,7 +528,11 @@ public sealed class LibraryScanner : ILibraryScanner
                 ? localMetadataSidecarService?.ReadMovieMetadata(scannedFile.MetadataPath)
                 : null;
             var importedMovieTitle = NormalizeText(localMovieMetadata?.Title);
-            var resolvedMovieTitle = ResolveMovieTitle(scannedFile.MetadataPath, scannedFile.FileName, metadata);
+            var resolvedMovieTitle = ResolveMovieTitle(
+                scannedFile.MetadataPath,
+                scannedFile.RelativePath,
+                scannedFile.FileName,
+                metadata);
             var shouldAttemptMovieScrape = importedMovieTitle is not null || resolvedMovieTitle is not null;
             var movieTitle = importedMovieTitle
                 ?? resolvedMovieTitle
@@ -1118,21 +1122,26 @@ public sealed class LibraryScanner : ILibraryScanner
             yield break;
         }
 
-        var maxSize = files.Max(static file => file.FileSize);
-        if (maxSize <= 0)
+        var candidates = files
+            .Select(static file => new MediaNameParser.BluRayStreamCandidate(
+                file.FileName,
+                file.FileSize,
+                Duration: 0))
+            .ToList();
+        var selectedIndexes = MediaNameParser.SelectedBluRayStreamIndices(
+            candidates,
+            includeExtras: false);
+        if (selectedIndexes.Count == 0)
         {
-            yield return files
-                .OrderBy(static file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
-                .First();
             yield break;
         }
 
-        var threshold = maxSize * 0.3;
-        foreach (var file in files
-                     .Where(file => file.FileSize >= threshold)
-                     .OrderBy(static file => file.RelativePath, StringComparer.OrdinalIgnoreCase))
+        foreach (var index in selectedIndexes)
         {
-            yield return file;
+            if (index >= 0 && index < files.Count)
+            {
+                yield return files[index];
+            }
         }
     }
 
@@ -1266,16 +1275,28 @@ public sealed class LibraryScanner : ILibraryScanner
         }
     }
 
-    private static string? ResolveMovieTitle(string absolutePath, string fileName, SearchMetadata metadata)
+    private static string? ResolveMovieTitle(
+        string metadataPath,
+        string relativePath,
+        string fileName,
+        MediaNameParser.CombinedSearchMetadataResult metadata)
     {
-        var fileMetadata = MediaNameParser.ExtractSearchMetadata(fileName);
-        return MediaNameParser.ExtractedDisplayTitle(absolutePath, fileName)
+        if (TryGetBdmvGroupKey(relativePath, out var bdmvGroupKey) &&
+            string.IsNullOrWhiteSpace(bdmvGroupKey))
+        {
+            var pathMetadata = MediaNameParser.CombinedSearchMetadata(metadataPath, fileName);
+            return MediaNameParser.ExtractedDisplayTitle(metadataPath, fileName)
+                   ?? UsableTitle(pathMetadata.ChineseTitle)
+                   ?? UsableTitle(pathMetadata.ParentChineseTitle)
+                   ?? UsableTitle(pathMetadata.ForeignTitle)
+                   ?? UsableTitle(pathMetadata.FullCleanTitle);
+        }
+
+        return MediaNameParser.ExtractedDisplayTitle(relativePath, fileName)
                ?? UsableTitle(metadata.ChineseTitle)
+               ?? UsableTitle(metadata.ParentChineseTitle)
                ?? UsableTitle(metadata.ForeignTitle)
-               ?? UsableTitle(fileMetadata.ChineseTitle)
-               ?? UsableTitle(fileMetadata.ForeignTitle)
-               ?? UsableTitle(metadata.FullCleanTitle)
-               ?? UsableTitle(fileMetadata.FullCleanTitle);
+               ?? UsableTitle(metadata.FullCleanTitle);
     }
 
     private static string? ResolveShowTitle(
@@ -1283,27 +1304,37 @@ public sealed class LibraryScanner : ILibraryScanner
         string relativePath,
         string fileName,
         MediaSourceProtocol? sourceProtocol,
-        SearchMetadata metadata)
+        MediaNameParser.CombinedSearchMetadataResult metadata)
     {
-        var fileMetadata = MediaNameParser.ExtractSearchMetadata(fileName);
         if (sourceProtocol is MediaSourceProtocol.Plex or MediaSourceProtocol.Emby or MediaSourceProtocol.Jellyfin)
         {
+            if (!MediaSourcePathResolver.IsMediaServerPlaybackEndpointPath(absolutePath))
+            {
+                var pathMetadata = MediaNameParser.CombinedSearchMetadata(absolutePath, fileName);
+                return ResolveShowTitleFromRelativePath(absolutePath, sourceProtocol: null)
+                       ?? MediaNameParser.ExtractedDisplayTitle(absolutePath, fileName)
+                       ?? UsableTitle(pathMetadata.ChineseTitle)
+                       ?? UsableTitle(pathMetadata.ParentChineseTitle)
+                       ?? UsableTitle(pathMetadata.ForeignTitle)
+                       ?? UsableTitle(pathMetadata.FullCleanTitle)
+                       ?? UsableTitle(metadata.ChineseTitle)
+                       ?? UsableTitle(metadata.ParentChineseTitle)
+                       ?? UsableTitle(metadata.ForeignTitle)
+                       ?? UsableTitle(metadata.FullCleanTitle);
+            }
+
             return UsableTitle(metadata.ChineseTitle)
+                   ?? UsableTitle(metadata.ParentChineseTitle)
                    ?? UsableTitle(metadata.ForeignTitle)
-                   ?? UsableTitle(metadata.FullCleanTitle)
-                   ?? UsableTitle(fileMetadata.ChineseTitle)
-                   ?? UsableTitle(fileMetadata.ForeignTitle)
-                   ?? UsableTitle(fileMetadata.FullCleanTitle);
+                   ?? UsableTitle(metadata.FullCleanTitle);
         }
 
         return ResolveShowTitleFromRelativePath(relativePath, sourceProtocol)
                ?? MediaNameParser.ExtractedDisplayTitle(relativePath, fileName)
                ?? UsableTitle(metadata.ChineseTitle)
+               ?? UsableTitle(metadata.ParentChineseTitle)
                ?? UsableTitle(metadata.ForeignTitle)
-               ?? UsableTitle(metadata.FullCleanTitle)
-               ?? UsableTitle(fileMetadata.ChineseTitle)
-               ?? UsableTitle(fileMetadata.ForeignTitle)
-               ?? UsableTitle(fileMetadata.FullCleanTitle);
+               ?? UsableTitle(metadata.FullCleanTitle);
     }
 
     private static string? ResolveShowTitleFromRelativePath(string relativePath, MediaSourceProtocol? sourceProtocol)
@@ -1409,7 +1440,8 @@ public sealed class LibraryScanner : ILibraryScanner
 
         var trimmed = folderName.Trim();
         var metadata = MediaNameParser.ExtractSearchMetadata(trimmed);
-        return UsableTitle(ExtractPrimaryCjkTitleSegment(metadata.FullCleanTitle))
+        return UsableTitle(ExtractPrimaryCjkTitleSegment(trimmed))
+               ?? UsableTitle(ExtractPrimaryCjkTitleSegment(metadata.FullCleanTitle))
                ?? UsableTitle(metadata.ChineseTitle)
                ?? UsableTitle(metadata.ForeignTitle)
                ?? UsableTitle(metadata.FullCleanTitle)
@@ -1429,7 +1461,7 @@ public sealed class LibraryScanner : ILibraryScanner
             return null;
         }
 
-        var match = Regex.Match(trimmed, @"^\s*([\p{IsCJKUnifiedIdeographs}\d]+)(?:\s+(\d{2,4}))?(?=\s|$)");
+        var match = Regex.Match(trimmed, @"^\s*([\p{IsCJKUnifiedIdeographs}\d]+)(?:\s+(\d{2,4}))?");
         if (!match.Success)
         {
             return null;

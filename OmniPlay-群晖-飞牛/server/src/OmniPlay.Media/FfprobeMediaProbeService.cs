@@ -156,7 +156,7 @@ public sealed class FfprobeMediaProbeService : IMediaProbeService
 
     private static string ResolveFfprobePath()
     {
-        return Environment.GetEnvironmentVariable("OMNIPLAY_FFPROBE_PATH") ?? "ffprobe";
+        return MediaToolPathResolver.ResolveFfprobePath();
     }
 
     private sealed record FfprobeResult(

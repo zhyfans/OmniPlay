@@ -79,7 +79,7 @@ public sealed class LibraryMetadataEnrichmentJobService : ILibraryMetadataEnrich
         }
         catch (Exception ex)
         {
-            statusStore.MarkFailed(ex.Message, DateTimeOffset.UtcNow);
+            statusStore.MarkFailed(UserFacingErrorMessages.FromException(ex), DateTimeOffset.UtcNow);
             throw;
         }
     }

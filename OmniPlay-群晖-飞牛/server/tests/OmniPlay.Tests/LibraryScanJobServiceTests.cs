@@ -12,11 +12,17 @@ public sealed class LibraryScanJobServiceTests
     {
         var scanner = new ControlledScanner();
         var statusStore = new InMemoryScanStatusStore();
-        var service = new LibraryScanJobService(new InMemoryBackgroundTaskCenter(), scanner, statusStore);
+        var metadataStatusStore = new InMemoryMetadataEnrichmentStatusStore();
+        var service = new LibraryScanJobService(
+            new InMemoryBackgroundTaskCenter(),
+            scanner,
+            statusStore,
+            new FakeMetadataEnricher(),
+            metadataStatusStore);
 
-        Assert.True(service.TryStartScan(out var started));
+        Assert.True(service.TryStartScan(new LibraryRefreshRequest(), out var started));
         Assert.True(started.IsRunning);
-        Assert.False(service.TryStartScan(out var duplicate));
+        Assert.False(service.TryStartScan(new LibraryRefreshRequest(), out var duplicate));
         Assert.True(duplicate.IsRunning);
 
         await scanner.WaitUntilStartedAsync();
@@ -34,9 +40,14 @@ public sealed class LibraryScanJobServiceTests
     {
         var scanner = new ControlledScanner();
         var statusStore = new InMemoryScanStatusStore();
-        var service = new LibraryScanJobService(new InMemoryBackgroundTaskCenter(), scanner, statusStore);
+        var service = new LibraryScanJobService(
+            new InMemoryBackgroundTaskCenter(),
+            scanner,
+            statusStore,
+            new FakeMetadataEnricher(),
+            new InMemoryMetadataEnrichmentStatusStore());
 
-        Assert.True(service.TryStartScan(out _));
+        Assert.True(service.TryStartScan(new LibraryRefreshRequest(), out _));
         await scanner.WaitUntilStartedAsync();
         Assert.True(service.RequestCancel(out var canceling));
         Assert.True(canceling.IsCancellationRequested || canceling.WasCanceled);
@@ -82,6 +93,14 @@ public sealed class LibraryScanJobServiceTests
             IProgress<LibraryScanProgress>? progress,
             CancellationToken cancellationToken = default)
         {
+            return await ScanAllAsync(progress, hideNewItemsUntilScraped: false, cancellationToken);
+        }
+
+        public async Task<LibraryScanSummary> ScanAllAsync(
+            IProgress<LibraryScanProgress>? progress,
+            bool hideNewItemsUntilScraped,
+            CancellationToken cancellationToken = default)
+        {
             progress?.Report(new LibraryScanProgress(
                 "probing",
                 SourceCount: 1,
@@ -105,6 +124,15 @@ public sealed class LibraryScanJobServiceTests
             return ScanAllAsync(progress, cancellationToken);
         }
 
+        public Task<LibraryScanSummary> ScanSourceAsync(
+            long sourceId,
+            IProgress<LibraryScanProgress>? progress,
+            bool hideNewItemsUntilScraped,
+            CancellationToken cancellationToken = default)
+        {
+            return ScanAllAsync(progress, hideNewItemsUntilScraped, cancellationToken);
+        }
+
         public Task WaitUntilStartedAsync()
         {
             return started.Task.WaitAsync(TimeSpan.FromSeconds(3));
@@ -113,6 +141,54 @@ public sealed class LibraryScanJobServiceTests
         public void Complete(LibraryScanSummary summary)
         {
             completion.TrySetResult(summary);
+        }
+    }
+
+    private sealed class FakeMetadataEnricher : ILibraryMetadataEnricher
+    {
+        public Task<LibraryMetadataEnrichmentSummary> EnrichMissingAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new LibraryMetadataEnrichmentSummary(0, 0, 0, 0));
+        }
+
+        public Task<LibraryMetadataEnrichmentSummary> EnrichMissingAsync(
+            IProgress<LibraryMetadataEnrichmentProgress>? progress,
+            CancellationToken cancellationToken = default)
+        {
+            return EnrichMissingAsync(progress, new LibraryRefreshRequest(), cancellationToken);
+        }
+
+        public Task<LibraryMetadataEnrichmentSummary> EnrichMissingAsync(
+            IProgress<LibraryMetadataEnrichmentProgress>? progress,
+            LibraryRefreshRequest order,
+            CancellationToken cancellationToken = default)
+        {
+            progress?.Report(new LibraryMetadataEnrichmentProgress(
+                "starting",
+                0,
+                0,
+                0,
+                0,
+                0,
+                null,
+                null,
+                DateTimeOffset.UtcNow));
+            return Task.FromResult(new LibraryMetadataEnrichmentSummary(0, 0, 0, 0));
+        }
+
+        public Task<LibraryMetadataEnrichmentSummary> EnrichItemAsync(
+            string libraryItemId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new LibraryMetadataEnrichmentSummary(0, 0, 0, 0));
+        }
+
+        public Task<LibraryMetadataEnrichmentSummary> EnrichItemAsync(
+            string libraryItemId,
+            IProgress<LibraryMetadataEnrichmentProgress>? progress,
+            CancellationToken cancellationToken = default)
+        {
+            return EnrichItemAsync(libraryItemId, cancellationToken);
         }
     }
 }

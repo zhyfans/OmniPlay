@@ -12,7 +12,7 @@ public sealed class RuntimeSelfCheckServiceTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), "omniplay-tests", Guid.NewGuid().ToString("N"));
 
     [Fact]
-    public async Task CheckReportsWritableRuntimeAndWarnsWhenNoWebDavVideoExists()
+    public async Task CheckReportsWritableRuntimeWithoutWebDavSection()
     {
         var paths = new StoragePaths(Path.Combine(root, "app"));
         var database = new SqliteDatabase(paths);
@@ -31,7 +31,7 @@ public sealed class RuntimeSelfCheckServiceTests : IDisposable
         Assert.Contains(snapshot.Items, item => item.Key == "sqlite-write" && item.Status == "ok");
         Assert.Contains(snapshot.Items, item => item.Key == "ffmpeg" && item.Status == "ok");
         Assert.Contains(snapshot.Items, item => item.Key == "hardware-encoding" && item.Status == "ok");
-        Assert.Contains(snapshot.Items, item => item.Key == "webdav-range" && item.Status == "warn");
+        Assert.DoesNotContain(snapshot.Items, item => item.Key == "webdav-range");
     }
 
     public void Dispose()
@@ -62,8 +62,11 @@ public sealed class RuntimeSelfCheckServiceTests : IDisposable
             return Task.FromResult(new FfmpegTranscodeCapabilities(
                 true,
                 "ffmpeg",
-                ["h264_vaapi"],
+                ["h264_vaapi", "hevc_vaapi"],
                 "h264_vaapi",
+                ["h264_vaapi", "hevc_vaapi", "vp9_vaapi", "av1_vaapi", "mpeg2_vaapi"],
+                "h264_vaapi",
+                ["vaapi"],
                 null,
                 DateTimeOffset.UtcNow));
         }

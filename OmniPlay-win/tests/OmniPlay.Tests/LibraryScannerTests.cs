@@ -404,6 +404,58 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task ScanAllAsync_BdmvSource_DropsSeparatedExtrasBelowMacMainFeatureCluster()
+    {
+        var discRoot = Path.Combine(libraryRootPath, "ConcertDisc");
+        CreateMediaFile(Path.Combine("ConcertDisc", "BDMV", "STREAM", "00000.m2ts"), 10_000);
+        CreateMediaFile(Path.Combine("ConcertDisc", "BDMV", "STREAM", "00001.m2ts"), 4_000);
+        CreateMediaFile(Path.Combine("ConcertDisc", "BDMV", "STREAM", "00020.m2ts"), 1_000);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "ConcertDisc",
+            ProtocolType = "local",
+            BaseUrl = discRoot
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(1, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        var relativePaths = (await connection.QueryAsync<string>(
+            "SELECT relativePath FROM videoFile ORDER BY relativePath")).ToList();
+        Assert.Equal(["BDMV/STREAM/00000.m2ts"], relativePaths);
+    }
+
+    [Fact]
+    public async Task ScanAllAsync_BdmvSource_KeepsSplitMainFeatureCluster()
+    {
+        var discRoot = Path.Combine(libraryRootPath, "SplitDisc");
+        CreateMediaFile(Path.Combine("SplitDisc", "BDMV", "STREAM", "00000.m2ts"), 10_000);
+        CreateMediaFile(Path.Combine("SplitDisc", "BDMV", "STREAM", "00001.m2ts"), 9_200);
+        CreateMediaFile(Path.Combine("SplitDisc", "BDMV", "STREAM", "00020.m2ts"), 1_000);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "SplitDisc",
+            ProtocolType = "local",
+            BaseUrl = discRoot
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        var relativePaths = (await connection.QueryAsync<string>(
+            "SELECT relativePath FROM videoFile ORDER BY relativePath")).ToList();
+        Assert.Equal(["BDMV/STREAM/00000.m2ts", "BDMV/STREAM/00001.m2ts"], relativePaths);
+    }
+
+    [Fact]
     public async Task ScanAllAsync_ImportsWebDavDirectoryIntoLibrary()
     {
         using var httpClient = new HttpClient(new FakeWebDavHttpMessageHandler())

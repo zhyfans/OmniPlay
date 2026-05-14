@@ -10,6 +10,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const packageName = 'OmniPlay';
 const infoTemplatePath = path.join(rootDir, 'packaging/synology/INFO.template');
 const synologyDir = path.join(rootDir, 'packaging/synology');
+const packageIconPath = path.join(rootDir, '1.png');
 const archInput = process.argv[2] ?? process.env.ARCH ?? 'x64';
 const buildDuringPublish = process.env.OMNIPLAY_DOTNET_BUILD === '1';
 const restoreDuringPublish = process.env.OMNIPLAY_DOTNET_RESTORE === '1';
@@ -40,16 +41,21 @@ if (!selectedArch) {
 }
 
 const spkArch = process.env.SPK_ARCH ?? selectedArch.spkArch;
+const createNoarchCompatSpk =
+  process.env.OMNIPLAY_COMPAT_NOARCH !== '0' && selectedArch.label === 'x64' && spkArch === 'x86_64';
 const buildDir = path.join(rootDir, 'build/synology', selectedArch.label);
 const publishDir = path.join(buildDir, 'publish');
 const dotnetPublishDir = path.relative(rootDir, publishDir);
 const packageDir = path.join(buildDir, 'package');
 const spkRoot = path.join(buildDir, 'spk-root');
 const distDir = path.join(rootDir, 'dist/synology');
-const spkPath = path.join(distDir, `${packageName}-${version}-${spkArch}.spk`);
+const spkPathForArch = (packageArch) => path.join(distDir, `${packageName}-${version}-${packageArch}.spk`);
 const prebuiltPublishDir = process.env.OMNIPLAY_PUBLISH_DIR
   ? path.resolve(rootDir, process.env.OMNIPLAY_PUBLISH_DIR)
   : path.join(rootDir, 'server/src/OmniPlay.Api/bin/Release/net10.0', selectedArch.rid);
+const mediaToolsSourceDir = process.env.OMNIPLAY_MEDIA_TOOLS_DIR
+  ? path.resolve(rootDir, process.env.OMNIPLAY_MEDIA_TOOLS_DIR)
+  : path.join(rootDir, 'packaging/media-tools', selectedArch.label);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -158,10 +164,39 @@ function createDefaultIcon(size) {
 
 function copyOrCreateIcon(sourcePath, targetPath, size) {
   if (existsSync(sourcePath)) {
+    if (resizeIcon(sourcePath, targetPath, size)) {
+      return;
+    }
+
     cpSync(sourcePath, targetPath);
     return;
   }
   writeFileSync(targetPath, createDefaultIcon(size));
+}
+
+function resizeIcon(sourcePath, targetPath, size) {
+  const attempts = [
+    ['sips', ['-z', String(size), String(size), sourcePath, '--out', targetPath]],
+    ['magick', [sourcePath, '-resize', `${size}x${size}!`, targetPath]],
+    ['convert', [sourcePath, '-resize', `${size}x${size}!`, targetPath]],
+  ];
+
+  for (const [command, args] of attempts) {
+    const result = spawnSync(command, args, {
+      cwd: rootDir,
+      env: {
+        ...process.env,
+        COPY_EXTENDED_ATTRIBUTES_DISABLE: '1',
+        COPYFILE_DISABLE: '1',
+      },
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    if (result.status === 0 && existsSync(targetPath)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function writeString(buffer, offset, length, value) {
@@ -275,6 +310,54 @@ function collectTarEntries(sourceDir, rootEntryNames) {
   return entries;
 }
 
+function calculateDirectorySize(directory) {
+  let totalSize = 0;
+  const visit = (absolutePath) => {
+    const stats = statSync(absolutePath);
+    if (stats.isDirectory()) {
+      for (const childName of readdirSync(absolutePath).filter((name) => name !== '.DS_Store')) {
+        visit(path.join(absolutePath, childName));
+      }
+      return;
+    }
+
+    if (stats.isFile()) {
+      totalSize += stats.size;
+    }
+  };
+  visit(directory);
+  return totalSize;
+}
+
+function upsertInfoField(info, fieldName, value) {
+  const line = `${fieldName}="${value}"`;
+  const pattern = new RegExp(`^${fieldName}=.*$`, 'm');
+  if (pattern.test(info)) {
+    return info.replace(pattern, line);
+  }
+
+  return `${info.trimEnd()}\n${line}\n`;
+}
+
+function normalizePayloadPermissions(directory) {
+  const executableNames = new Set(['OmniPlay.Api', 'createdump', 'ffmpeg', 'ffprobe']);
+  const visit = (absolutePath) => {
+    const stats = statSync(absolutePath);
+    if (stats.isDirectory()) {
+      chmodSync(absolutePath, 0o755);
+      for (const childName of readdirSync(absolutePath).filter((name) => name !== '.DS_Store')) {
+        visit(path.join(absolutePath, childName));
+      }
+      return;
+    }
+
+    if (stats.isFile()) {
+      chmodSync(absolutePath, executableNames.has(path.basename(absolutePath)) ? 0o755 : 0o644);
+    }
+  };
+  visit(directory);
+}
+
 console.log('==> Building Web UI');
 run('npm', ['--prefix', 'web', 'run', 'build']);
 
@@ -323,6 +406,26 @@ if (!existsSync(path.join(webDistDir, 'index.html'))) {
 rmSync(packageWwwroot, { recursive: true, force: true });
 cpSync(webDistDir, packageWwwroot, { recursive: true });
 chmodSync(path.join(packageDir, 'OmniPlay.Api'), 0o755);
+if (existsSync(mediaToolsSourceDir)) {
+  const packageMediaToolsDir = path.join(packageDir, 'tools/ffmpeg');
+  console.log(`==> Bundling media tools from ${mediaToolsSourceDir}`);
+  rmSync(packageMediaToolsDir, { recursive: true, force: true });
+  mkdirSync(path.dirname(packageMediaToolsDir), { recursive: true });
+  cpSync(mediaToolsSourceDir, packageMediaToolsDir, { recursive: true });
+  for (const executableName of ['ffmpeg', 'ffprobe']) {
+    const executablePath = path.join(packageMediaToolsDir, 'bin', executableName);
+    if (existsSync(executablePath)) {
+      chmodSync(executablePath, 0o755);
+    }
+  }
+}
+mkdirSync(path.join(packageDir, 'port_conf'), { recursive: true });
+cpSync(path.join(synologyDir, 'port_conf/OmniPlay.sc'), path.join(packageDir, 'port_conf/OmniPlay.sc'));
+cpSync(path.join(synologyDir, 'ui'), path.join(packageDir, 'ui'), { recursive: true });
+mkdirSync(path.join(packageDir, 'ui/images'), { recursive: true });
+for (const size of [16, 24, 32, 48, 64, 72, 96, 128, 256]) {
+  copyOrCreateIcon(packageIconPath, path.join(packageDir, `ui/images/omniplay_${size}.png`), size);
+}
 writeFileSync(
   path.join(packageDir, 'PACKAGE_NOTES.txt'),
   `OmniPlay NAS server payload.
@@ -331,26 +434,37 @@ Runtime data path on DSM:
 /var/packages/${packageName}/home
 
 Default listen URL:
-http://0.0.0.0:8096
+http://0.0.0.0:45721
 `,
 );
 
+normalizePayloadPermissions(packageDir);
+
 console.log('==> Creating package.tgz');
-const packageEntries = readdirSync(packageDir).filter((entry) => entry !== '.DS_Store').sort();
 const packageTgzPath = path.join(spkRoot, 'package.tgz');
-writeFileSync(packageTgzPath, gzipSync(createTarBuffer(collectTarEntries(packageDir, packageEntries)), { level: 9 }));
+rmSync(packageTgzPath, { force: true });
+writeFileSync(
+  packageTgzPath,
+  gzipSync(createTarBuffer(collectTarEntries(buildDir, ['package'])), {
+    level: 9,
+    mtime: 0,
+  }),
+);
 const packageChecksum = createHash('md5').update(readFileSync(packageTgzPath)).digest('hex');
+const packagePayloadSize = calculateDirectorySize(packageDir);
+const packageTgzSize = statSync(packageTgzPath).size;
+const extractSizeKb = Math.ceil((packagePayloadSize + packageTgzSize) / 1024);
 
 console.log('==> Creating SPK metadata');
-let info = infoTemplate
-  .replaceAll('{{ARCH}}', spkArch)
-  .replace(/^version=.*/m, `version="${version}"`);
-if (info.match(/^checksum=/m)) {
-  info = info.replace(/^checksum=.*/m, `checksum="${packageChecksum}"`);
-} else {
-  info = `${info.trimEnd()}\nchecksum="${packageChecksum}"\n`;
-}
-writeFileSync(path.join(spkRoot, 'INFO'), info);
+const createInfo = (packageArch) => {
+  let info = infoTemplate
+    .replaceAll('{{ARCH}}', packageArch)
+    .replace(/^version=.*/m, `version="${version}"`);
+  info = upsertInfoField(info, 'extractsize', extractSizeKb.toString());
+  info = upsertInfoField(info, 'checksum', packageChecksum);
+  return info;
+};
+writeFileSync(path.join(spkRoot, 'INFO'), createInfo(spkArch));
 
 mkdirSync(path.join(spkRoot, 'scripts'), { recursive: true });
 mkdirSync(path.join(spkRoot, 'conf'), { recursive: true });
@@ -360,28 +474,49 @@ for (const scriptName of readdirSync(path.join(spkRoot, 'scripts'))) {
 }
 cpSync(path.join(synologyDir, 'conf/privilege'), path.join(spkRoot, 'conf/privilege'));
 
-const iconPath = path.join(synologyDir, 'icons/PACKAGE_ICON.PNG');
-const largeIconPath = path.join(synologyDir, 'icons/PACKAGE_ICON_256.PNG');
+const iconPath = existsSync(packageIconPath) ? packageIconPath : path.join(synologyDir, 'icons/PACKAGE_ICON.PNG');
+const largeIconPath = existsSync(packageIconPath) ? packageIconPath : path.join(synologyDir, 'icons/PACKAGE_ICON_256.PNG');
 copyOrCreateIcon(iconPath, path.join(spkRoot, 'PACKAGE_ICON.PNG'), 64);
 copyOrCreateIcon(largeIconPath, path.join(spkRoot, 'PACKAGE_ICON_256.PNG'), 256);
 
-console.log(`==> Packing ${spkPath}`);
-rmSync(spkPath, { force: true });
-rmSync(`${spkPath}.sha256`, { force: true });
-const spkEntries = ['INFO', 'package.tgz', 'scripts', 'conf', 'PACKAGE_ICON.PNG', 'PACKAGE_ICON_256.PNG'];
-writeFileSync(spkPath, createTarBuffer(collectTarEntries(spkRoot, spkEntries)));
+const spkEntries = [
+  'INFO',
+  'package.tgz',
+  'scripts',
+  'conf',
+  'PACKAGE_ICON.PNG',
+  'PACKAGE_ICON_256.PNG',
+];
 
-const checksum = spawnSync('shasum', ['-a', '256', spkPath], {
-  cwd: rootDir,
-  encoding: 'utf8',
-  env: {
-    ...process.env,
-    COPY_EXTENDED_ATTRIBUTES_DISABLE: '1',
-    COPYFILE_DISABLE: '1',
-  },
-});
-if (checksum.status === 0 && checksum.stdout) {
-  writeFileSync(`${spkPath}.sha256`, checksum.stdout);
+function writeSpk(packageArch) {
+  const spkPath = spkPathForArch(packageArch);
+  writeFileSync(path.join(spkRoot, 'INFO'), createInfo(packageArch));
+  console.log(`==> Packing ${spkPath}`);
+  rmSync(spkPath, { force: true });
+  rmSync(`${spkPath}.sha256`, { force: true });
+  writeFileSync(spkPath, createTarBuffer(collectTarEntries(spkRoot, spkEntries)));
+
+  const checksum = spawnSync('shasum', ['-a', '256', spkPath], {
+    cwd: rootDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      COPY_EXTENDED_ATTRIBUTES_DISABLE: '1',
+      COPYFILE_DISABLE: '1',
+    },
+  });
+  if (checksum.status === 0 && checksum.stdout) {
+    writeFileSync(`${spkPath}.sha256`, checksum.stdout);
+  }
+
+  return spkPath;
 }
 
-console.log(`SPK created: ${spkPath}`);
+const createdSpks = [writeSpk(spkArch)];
+if (createNoarchCompatSpk) {
+  createdSpks.push(writeSpk('noarch'));
+}
+
+for (const createdSpk of createdSpks) {
+  console.log(`SPK created: ${createdSpk}`);
+}

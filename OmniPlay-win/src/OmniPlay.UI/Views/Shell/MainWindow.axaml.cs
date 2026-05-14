@@ -17,8 +17,21 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        ConfigureResizeCursors();
         AddHandler(PointerPressedEvent, MainWindow_OnPointerPressed, RoutingStrategies.Tunnel, true);
         DataContextChanged += MainWindow_OnDataContextChanged;
+    }
+
+    private void ConfigureResizeCursors()
+    {
+        ShellNorthResizeGrip.Cursor = new Cursor(StandardCursorType.TopSide);
+        ShellSouthResizeGrip.Cursor = new Cursor(StandardCursorType.BottomSide);
+        ShellWestResizeGrip.Cursor = new Cursor(StandardCursorType.LeftSide);
+        ShellEastResizeGrip.Cursor = new Cursor(StandardCursorType.RightSide);
+        ShellNorthWestResizeGrip.Cursor = new Cursor(StandardCursorType.TopLeftCorner);
+        ShellNorthEastResizeGrip.Cursor = new Cursor(StandardCursorType.TopRightCorner);
+        ShellSouthWestResizeGrip.Cursor = new Cursor(StandardCursorType.BottomLeftCorner);
+        ShellSouthEastResizeGrip.Cursor = new Cursor(StandardCursorType.BottomRightCorner);
     }
 
     private void MainWindow_OnPointerPressed(object? sender, PointerPressedEventArgs e)
@@ -53,33 +66,37 @@ public partial class MainWindow : Window
 
     private void ShellWindowControlsHotZone_OnPointerActivity(object? sender, PointerEventArgs e)
     {
+        UpdateShellWindowControlsCursor(e);
         ShowShellWindowControls();
     }
 
     private void ShellWindowControlsBar_OnPointerEntered(object? sender, PointerEventArgs e)
     {
+        UpdateShellWindowControlsCursor(e);
         ShowShellWindowControls();
     }
 
     private void ShellWindowControlsBar_OnPointerMoved(object? sender, PointerEventArgs e)
     {
+        UpdateShellWindowControlsCursor(e);
         ShowShellWindowControls();
     }
 
     private void ShellWindowControlsBar_OnPointerExited(object? sender, PointerEventArgs e)
     {
+        ResetShellWindowControlsCursor();
         UpdateShellWindowControlsVisibility();
     }
 
     private void ShellWindowControlsBar_OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (TryBeginShellResizeDrag(e))
+        if (IsWithinShellWindowButton(e.Source as Control) ||
+            !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
         {
             return;
         }
 
-        if (IsWithinShellWindowButton(e.Source as Control) ||
-            !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        if (TryBeginShellResizeDrag(e))
         {
             return;
         }
@@ -197,6 +214,45 @@ public partial class MainWindow : Window
         }
 
         return false;
+    }
+
+    private void UpdateShellWindowControlsCursor(PointerEventArgs e)
+    {
+        if (WindowState != WindowState.Normal ||
+            currentViewModel?.PosterWall.IsPlayerOverlayOpen == true ||
+            IsWithinShellWindowButton(e.Source as Control))
+        {
+            ResetShellWindowControlsCursor();
+            return;
+        }
+
+        var cursor = ResolveResizeCursor(ResolveResizeEdge(e.GetPosition(this)));
+        Cursor = cursor;
+        ShellWindowControlsLayer.Cursor = cursor;
+        ShellWindowControlsBar.Cursor = cursor;
+    }
+
+    private void ResetShellWindowControlsCursor()
+    {
+        Cursor = null;
+        ShellWindowControlsLayer.Cursor = null;
+        ShellWindowControlsBar.Cursor = null;
+    }
+
+    private static Cursor? ResolveResizeCursor(WindowEdge? edge)
+    {
+        return edge switch
+        {
+            WindowEdge.North => new Cursor(StandardCursorType.TopSide),
+            WindowEdge.South => new Cursor(StandardCursorType.BottomSide),
+            WindowEdge.West => new Cursor(StandardCursorType.LeftSide),
+            WindowEdge.East => new Cursor(StandardCursorType.RightSide),
+            WindowEdge.NorthWest => new Cursor(StandardCursorType.TopLeftCorner),
+            WindowEdge.NorthEast => new Cursor(StandardCursorType.TopRightCorner),
+            WindowEdge.SouthWest => new Cursor(StandardCursorType.BottomLeftCorner),
+            WindowEdge.SouthEast => new Cursor(StandardCursorType.BottomRightCorner),
+            _ => null
+        };
     }
 
     private void ShellMinimizeButton_OnClick(object? sender, RoutedEventArgs e)

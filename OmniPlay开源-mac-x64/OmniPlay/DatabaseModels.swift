@@ -354,3 +354,31 @@ struct VideoFile: Codable, FetchableRecord, PersistableRecord {
     
     static let mediaSource = belongsTo(MediaSource.self)
 }
+
+private enum LibraryVisibilitySQL {
+    static let enabledSourcePredicate = "COALESCE(mediaSource.isEnabled, 1) = 1"
+}
+
+extension VideoFile {
+    static func fetchVisibleFiles(movieId: Int64?, in db: Database) throws -> [VideoFile] {
+        guard let movieId else { return [] }
+        return try VideoFile.fetchAll(
+            db,
+            sql: """
+            SELECT videoFile.*
+            FROM videoFile
+            JOIN mediaSource ON mediaSource.id = videoFile.sourceId
+            WHERE videoFile.movieId = ?
+              AND \(LibraryVisibilitySQL.enabledSourcePredicate)
+            """,
+            arguments: [movieId]
+        )
+    }
+
+    static func fetchVisibleSourcePairs(movieId: Int64?, in db: Database) throws -> [(VideoFile, MediaSource?)] {
+        let files = try fetchVisibleFiles(movieId: movieId, in: db)
+        return try files.map { file in
+            (file, try file.request(for: VideoFile.mediaSource).fetchOne(db))
+        }
+    }
+}

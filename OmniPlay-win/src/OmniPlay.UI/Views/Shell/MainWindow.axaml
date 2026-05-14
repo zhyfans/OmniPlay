@@ -34,6 +34,18 @@
     <Style Selector="Button.WinCloseBtn:pointerover Path">
       <Setter Property="Fill" Value="White"/>
     </Style>
+    <Style Selector="Border.resizeGrip">
+      <Setter Property="Background" Value="#01000000"/>
+    </Style>
+    <Style Selector="Border.resizeGrip:pointerover">
+      <Setter Property="Background" Value="#18000000"/>
+    </Style>
+    <Style Selector="Border.resizeGrip:pressed">
+      <Setter Property="Background" Value="#260067C0"/>
+    </Style>
+    <Style Selector="Border.resizeCorner:pointerover">
+      <Setter Property="Background" Value="#220067C0"/>
+    </Style>
   </Window.Styles>
 
   <Grid>
@@ -44,59 +56,67 @@
         IsVisible="{Binding !PosterWall.IsPlayerOverlayOpen}"
         ZIndex="20">
       <Border
+          x:Name="ShellNorthResizeGrip"
+          Classes="resizeGrip"
           Height="6"
           VerticalAlignment="Top"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="North" />
       <Border
+          x:Name="ShellSouthResizeGrip"
+          Classes="resizeGrip"
           Height="6"
           VerticalAlignment="Bottom"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="South" />
       <Border
+          x:Name="ShellWestResizeGrip"
+          Classes="resizeGrip"
           Width="6"
           HorizontalAlignment="Left"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="West" />
       <Border
+          x:Name="ShellEastResizeGrip"
+          Classes="resizeGrip"
           Width="6"
           HorizontalAlignment="Right"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="East" />
       <Border
+          x:Name="ShellNorthWestResizeGrip"
+          Classes="resizeGrip resizeCorner"
           Width="14"
           Height="14"
           HorizontalAlignment="Left"
           VerticalAlignment="Top"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="NorthWest" />
       <Border
+          x:Name="ShellNorthEastResizeGrip"
+          Classes="resizeGrip resizeCorner"
           Width="14"
           Height="14"
           HorizontalAlignment="Right"
           VerticalAlignment="Top"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="NorthEast" />
       <Border
+          x:Name="ShellSouthWestResizeGrip"
+          Classes="resizeGrip resizeCorner"
           Width="14"
           Height="14"
           HorizontalAlignment="Left"
           VerticalAlignment="Bottom"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="SouthWest" />
       <Border
+          x:Name="ShellSouthEastResizeGrip"
+          Classes="resizeGrip resizeCorner"
           Width="14"
           Height="14"
           HorizontalAlignment="Right"
           VerticalAlignment="Bottom"
-          Background="#01000000"
           PointerPressed="ShellResizeBorder_OnPointerPressed"
           Tag="SouthEast" />
     </Grid>
@@ -142,5 +162,12 @@
         </StackPanel>
       </Border>
     </Grid>
+
+    <Border
+        BorderBrush="#FF000000"
+        BorderThickness="1"
+        IsHitTestVisible="False"
+        IsVisible="{Binding !PosterWall.IsPlayerOverlayOpen}"
+        ZIndex="90" />
   </Grid>
 </Window>

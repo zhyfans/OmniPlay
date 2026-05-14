@@ -22,6 +22,13 @@ export interface RuntimeSelfCheckItem {
   data: Record<string, string> | null;
 }
 
+export interface AuthStatus {
+  isSetupRequired: boolean;
+  isAuthenticated: boolean;
+  username: string | null;
+  role: string | null;
+}
+
 export interface MediaSourceSummary {
   id: number;
   name: string;
@@ -39,6 +46,7 @@ export interface AppSettingsSnapshot {
   tmdb: TmdbSettings;
   cache: CacheSettings;
   playback: PlaybackSettings;
+  proxy: ProxySettings;
 }
 
 export interface TmdbSettings {
@@ -48,6 +56,29 @@ export interface TmdbSettings {
   customApiKey: string;
   customAccessToken: string;
   language: string;
+}
+
+export interface TmdbConnectionTestResult {
+  isReachable: boolean;
+  source: string;
+  statusCode: number | null;
+  message: string;
+}
+
+export interface ProxySettings {
+  isEnabled: boolean;
+  url: string;
+  username: string;
+  password: string;
+  bypassList: string;
+}
+
+export interface ProxyConnectionTestResult {
+  isReachable: boolean;
+  proxyUrl: string;
+  targetUrl: string;
+  statusCode: number | null;
+  message: string;
 }
 
 export interface CacheSettings {
@@ -61,12 +92,19 @@ export interface PlaybackSettings {
   directStream: boolean;
   hlsRemux: boolean;
   transcode: boolean;
+  showEpisodeDetails: boolean;
 }
 
 export interface AppSettingsUpdateRequest {
   tmdb?: TmdbSettings;
   cache?: CacheSettings;
   playback?: PlaybackSettings;
+  proxy?: ProxySettings;
+}
+
+export interface LibraryRefreshRequest {
+  sortKey: "title" | "rating" | "year" | string;
+  sortDirection: "asc" | "desc" | string;
 }
 
 export interface MediaSourceUpdateRequest {
@@ -116,10 +154,19 @@ export interface LibraryItemSummary {
   posterAssetId: string | null;
   voteAverage: number | null;
   isLocked: boolean;
+  isWatched: boolean;
   videoFileCount: number;
   maxProgressSeconds: number;
   maxDurationSeconds: number;
   updatedAt: string;
+}
+
+export interface LibraryItemCustomMetadataUpdateRequest {
+  title: string;
+  releaseDate: string | null;
+  overview: string | null;
+  voteAverage: number | null;
+  posterFile?: File | null;
 }
 
 export interface LibraryItemDetail extends LibraryItemSummary {
@@ -348,6 +395,9 @@ export interface FfmpegTranscodeCapabilities {
   ffmpegPath: string;
   hardwareEncoders: string[];
   preferredHardwareEncoder: string | null;
+  hardwareDecoders: string[];
+  preferredHardwareDecoder: string | null;
+  hardwareAccelerators: string[];
   errorMessage: string | null;
   checkedAt: string;
 }
@@ -416,6 +466,33 @@ export async function getHealthStatus(): Promise<HealthStatus> {
   return response.json() as Promise<HealthStatus>;
 }
 
+export async function getAuthStatus(): Promise<AuthStatus> {
+  return readJson<AuthStatus>("/api/auth/status");
+}
+
+export async function registerAdmin(username: string, password: string): Promise<AuthStatus> {
+  const response = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  return readResponse<AuthStatus>(response);
+}
+
+export async function login(username: string, password: string): Promise<AuthStatus> {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  return readResponse<AuthStatus>(response);
+}
+
+export async function logout(): Promise<void> {
+  const response = await fetch("/api/auth/logout", { method: "POST" });
+  await readEmptyResponse(response);
+}
+
 export async function getMediaSources(): Promise<MediaSourceSummary[]> {
   return readJson<MediaSourceSummary[]>("/api/sources");
 }
@@ -444,6 +521,24 @@ export async function updateAppSettings(request: AppSettingsUpdateRequest): Prom
     body: JSON.stringify(request),
   });
   return readResponse<AppSettingsSnapshot>(response);
+}
+
+export async function testTmdbConnection(settings: TmdbSettings): Promise<TmdbConnectionTestResult> {
+  const response = await fetch("/api/settings/tmdb/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  return readResponse<TmdbConnectionTestResult>(response);
+}
+
+export async function testProxyConnection(settings: ProxySettings): Promise<ProxyConnectionTestResult> {
+  const response = await fetch("/api/settings/proxy/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  return readResponse<ProxyConnectionTestResult>(response);
 }
 
 export async function getCacheStatus(): Promise<CacheUsageSummary> {
@@ -508,8 +603,15 @@ export async function browseWebDavDirectories(
   return readResponse<WebDavDirectoryBrowseResult>(response);
 }
 
-export async function scanMediaSource(sourceId: number): Promise<LibraryScanStatus> {
-  const response = await fetch(`/api/sources/${encodeURIComponent(sourceId)}/scan`, { method: "POST" });
+export async function scanMediaSource(
+  sourceId: number,
+  request: LibraryRefreshRequest,
+): Promise<LibraryScanStatus> {
+  const response = await fetch(`/api/sources/${encodeURIComponent(sourceId)}/scan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
   return readResponse<LibraryScanStatus>(response);
 }
 
@@ -584,12 +686,36 @@ export async function setLibraryItemLocked(libraryItemId: string, isLocked: bool
   return readResponse<LibraryItemDetail>(response);
 }
 
+export async function updateLibraryItemCustomMetadata(
+  libraryItemId: string,
+  request: LibraryItemCustomMetadataUpdateRequest,
+): Promise<LibraryItemDetail> {
+  const body = new FormData();
+  body.set("title", request.title);
+  body.set("releaseDate", request.releaseDate ?? "");
+  body.set("overview", request.overview ?? "");
+  body.set("voteAverage", request.voteAverage === null ? "" : String(request.voteAverage));
+  if (request.posterFile) {
+    body.set("poster", request.posterFile);
+  }
+
+  const response = await fetch(`/api/library/items/${encodeURIComponent(libraryItemId)}/metadata/custom`, {
+    method: "PATCH",
+    body,
+  });
+  return readResponse<LibraryItemDetail>(response);
+}
+
 export async function getLibraryScanStatus(): Promise<LibraryScanStatus> {
   return readJson<LibraryScanStatus>("/api/library/scan/status");
 }
 
-export async function scanLibrary(): Promise<LibraryScanStatus> {
-  const response = await fetch("/api/library/scan", { method: "POST" });
+export async function scanLibrary(request: LibraryRefreshRequest): Promise<LibraryScanStatus> {
+  const response = await fetch("/api/library/scan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
   return readResponse<LibraryScanStatus>(response);
 }
 
@@ -605,6 +731,18 @@ export async function setWatchedStatus(videoFileId: string, isWatched: boolean, 
     body: JSON.stringify({ videoFileId, isWatched, durationSeconds }),
   });
   await readEmptyResponse(response);
+}
+
+export async function setLibraryItemWatchedStatus(
+  libraryItemId: string,
+  isWatched: boolean,
+): Promise<LibraryItemDetail> {
+  const response = await fetch(`/api/library/items/${encodeURIComponent(libraryItemId)}/watched`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ libraryItemId, isWatched }),
+  });
+  return readResponse<LibraryItemDetail>(response);
 }
 
 export async function updatePlaybackProgress(

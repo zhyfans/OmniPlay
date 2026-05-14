@@ -99,6 +99,38 @@ public sealed class PlaceholderTests
     }
 
     [Fact]
+    public void ExtractSearchMetadata_PrefersChineseTitleOverMixedChineseForeignTitle()
+    {
+        const string fileName = "乘风破浪的姐姐.Sisters.Who.Make.Waves.S07.2026.2160p.WEB-DL.H265.AAC-ADWeb";
+
+        var metadata = MediaNameParser.ExtractSearchMetadata(fileName);
+        var displayTitle = MediaNameParser.ExtractedDisplayTitle(fileName, fileName);
+        var titles = LibraryLookupTitleBuilder.Build(fileName, "local", @"D:\电影", fileName, fileName: fileName);
+
+        Assert.Equal("乘风破浪的姐姐", metadata.ChineseTitle);
+        Assert.Equal("Sisters Who Make Waves", metadata.ForeignTitle);
+        Assert.Equal("乘风破浪的姐姐", metadata.FullCleanTitle);
+        Assert.Equal("乘风破浪的姐姐", displayTitle);
+        Assert.Contains("乘风破浪的姐姐", titles);
+        Assert.DoesNotContain("乘风破浪的姐姐 Sisters Who Make Waves", titles);
+    }
+
+    [Fact]
+    public void ExtractSearchMetadata_UsesAncestorFolderForBdmvReleaseWrapper()
+    {
+        const string path = @"C:\电影\[后天].The.Day.After.Tomorrow.2004.Blu-ray.1080p.AVC.DTS-HD.MA.5.1-CMCT\DAT-CMCT\BDMV\STREAM\00001.m2ts";
+
+        var metadata = MediaNameParser.ExtractSearchMetadata(path);
+        var displayTitle = MediaNameParser.ExtractedDisplayTitle(path, "00001.m2ts");
+
+        Assert.Equal("后天", metadata.ChineseTitle);
+        Assert.Equal("The Day After Tomorrow", metadata.ForeignTitle);
+        Assert.Equal("后天", metadata.FullCleanTitle);
+        Assert.Equal("2004", metadata.Year);
+        Assert.Equal("后天", displayTitle);
+    }
+
+    [Fact]
     public void ExtractSearchMetadata_RemovesChineseEditionNoise()
     {
         var theatrical = MediaNameParser.ExtractSearchMetadata(
@@ -148,6 +180,37 @@ public sealed class PlaceholderTests
         var title = MediaNameParser.CleanedTitleSource(@"D:\Movies\Interstellar\BDMV\STREAM\00001.m2ts");
 
         Assert.Equal("Interstellar", title);
+    }
+
+    [Fact]
+    public void SelectedBluRayStreamIndices_UsesMacMainFeatureRules()
+    {
+        var singleMain = new[]
+        {
+            new MediaNameParser.BluRayStreamCandidate("00013.m2ts", 1_000),
+            new MediaNameParser.BluRayStreamCandidate("00000.m2ts", 10_000)
+        };
+
+        Assert.Equal([1], MediaNameParser.SelectedBluRayStreamIndices(singleMain, includeExtras: false));
+        Assert.Equal([1, 0], MediaNameParser.SelectedBluRayStreamIndices(singleMain, includeExtras: true));
+
+        var splitMain = new[]
+        {
+            new MediaNameParser.BluRayStreamCandidate("00000.m2ts", 10_000),
+            new MediaNameParser.BluRayStreamCandidate("00001.m2ts", 9_200),
+            new MediaNameParser.BluRayStreamCandidate("00020.m2ts", 1_000)
+        };
+
+        Assert.Equal([0, 1], MediaNameParser.SelectedBluRayStreamIndices(splitMain, includeExtras: false));
+
+        var separatedExtras = new[]
+        {
+            new MediaNameParser.BluRayStreamCandidate("00000.m2ts", 10_000),
+            new MediaNameParser.BluRayStreamCandidate("00001.m2ts", 4_000),
+            new MediaNameParser.BluRayStreamCandidate("00020.m2ts", 1_000)
+        };
+
+        Assert.Equal([0], MediaNameParser.SelectedBluRayStreamIndices(separatedExtras, includeExtras: false));
     }
 
     [Fact]
@@ -222,6 +285,19 @@ public sealed class PlaceholderTests
             0);
 
         Assert.True(episode.IsTvShow);
+        Assert.Null(episode.Subtitle);
+    }
+
+    [Fact]
+    public void ParseEpisodeInfo_DoesNotUseAudioChannelOrReleaseGroupAsSubtitle()
+    {
+        var episode = MediaNameParser.ParseEpisodeInfo(
+            "My.Mister.S01E01.2018.1080p.Blu-ray.REMUX.AVC.LPCM.2.0-WhaX.mkv",
+            0);
+
+        Assert.True(episode.IsTvShow);
+        Assert.Equal(1, episode.Season);
+        Assert.Equal(1, episode.Episode);
         Assert.Null(episode.Subtitle);
     }
 

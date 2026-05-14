@@ -2,10 +2,9 @@
   "id": "com.omniplay.nas",
   "name": "OmniPlay",
   "version": "0.1.0",
-  "description": "OmniPlay NAS media library and web player.",
+  "description": "一款带TMDB刮削海报墙播放器。",
   "service": {
     "port": 8096,
     "entry": "OmniPlay.Api"
   }
 }
-

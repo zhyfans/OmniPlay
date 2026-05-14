@@ -68,6 +68,7 @@ public partial class PosterWallViewModel : ObservableObject
     private PlaybackMode currentPlaybackMode;
     private double lastSyncedPlaybackPositionSeconds = double.NaN;
     private double lastSyncedPlaybackDurationSeconds = double.NaN;
+    private bool suppressSortPreferencePersistence;
 
     public PosterWallViewModel(
         IMovieRepository movieRepository,
@@ -207,6 +208,7 @@ public partial class PosterWallViewModel : ObservableObject
         Settings.SettingsSaved += OnSettingsSaved;
         Player.PropertyChanged += OnPlayerPropertyChanged;
         selectedSortOptionItem = SortOptions[0];
+        RefreshSortOptionSelectionStates();
         selectedMediaServerProtocolOption = MediaServerProtocolOptions[0];
     }
 
@@ -814,6 +816,8 @@ public partial class PosterWallViewModel : ObservableObject
         try
         {
             await Settings.LoadAsync();
+            ApplySavedLibraryViewPreferences();
+            _ = Settings.CheckForUpdatesOnStartupIfNeededAsync();
             ApplyPlaybackPreferencesToPlayer();
             await mediaSourceRepository.PurgeExpiredInactiveAsync(DateTimeOffset.UtcNow);
             OnPropertyChanged(nameof(ShowMediaSourceRealPath));
@@ -2992,19 +2996,63 @@ public partial class PosterWallViewModel : ObservableObject
         var year = ChoosePosterReleaseYear(candidate);
         if (string.IsNullOrWhiteSpace(year))
         {
-            return HasPosterTitleText(candidate) ? candidate : null;
+            return ExtractPreferredPosterTitle(candidate);
         }
 
         foreach (Match match in Regex.Matches(candidate, $@"(?<!\d){Regex.Escape(year)}(?!\d)"))
         {
             var prefix = NormalizePosterTitleCandidate(candidate[..match.Index]);
-            if (!string.IsNullOrWhiteSpace(prefix))
+            var preferredPrefix = ExtractPreferredPosterTitle(prefix);
+            if (!string.IsNullOrWhiteSpace(preferredPrefix))
             {
-                return prefix;
+                return preferredPrefix;
             }
         }
 
-        return null;
+        return ExtractPreferredPosterTitle(candidate);
+    }
+
+    private static string? ExtractPreferredPosterTitle(string value)
+    {
+        if (!HasPosterTitleText(value))
+        {
+            return null;
+        }
+
+        var chineseTitle = ExtractPosterChineseTitle(value);
+        return string.IsNullOrWhiteSpace(chineseTitle) ? value.Trim() : chineseTitle;
+    }
+
+    private static string? ExtractPosterChineseTitle(string value)
+    {
+        List<string> current = [];
+        var tokens = Regex.Split(value, @"\s+")
+            .Select(static token => token.Trim(' ', '.', '-', '_', '/', '\\', '(', ')', '[', ']', '{', '}', '（', '）', '【', '】'))
+            .Where(static token => token.Length > 0);
+
+        foreach (var token in tokens)
+        {
+            if (token.Any(IsCjkCharacter))
+            {
+                current.Add(token);
+                continue;
+            }
+
+            if (current.Count > 0 &&
+                Regex.IsMatch(token, @"^\d{1,3}$") &&
+                !Regex.IsMatch(token, @"^(19|20)\d{2}$"))
+            {
+                current.Add(token);
+                continue;
+            }
+
+            if (current.Count > 0)
+            {
+                break;
+            }
+        }
+
+        return current.Count == 0 ? null : string.Join(' ', current).Trim();
     }
 
     private static bool HasPosterTitleText(string value)
@@ -3024,7 +3072,10 @@ public partial class PosterWallViewModel : ObservableObject
         var bdmvIndex = Array.FindIndex(parts, static part => part.Equals("BDMV", StringComparison.OrdinalIgnoreCase));
         if (bdmvIndex > 0)
         {
-            return parts[bdmvIndex - 1];
+            var candidate = parts[bdmvIndex - 1];
+            return IsPosterReleaseGroupWrapperFolder(candidate, bdmvIndex > 1 ? parts[bdmvIndex - 2] : string.Empty)
+                ? parts[bdmvIndex - 2]
+                : candidate;
         }
 
         return Path.GetFileNameWithoutExtension(normalizedPath);
@@ -3091,9 +3142,9 @@ public partial class PosterWallViewModel : ObservableObject
                Regex.IsMatch(lower, @"^ep?\d{1,3}$") ||
                Regex.IsMatch(lower, @"^episode\d{1,3}$") ||
                Regex.IsMatch(lower, @"^\d{3,4}p$") ||
-               Regex.IsMatch(lower, @"^(4k|uhd|hdtv|uhdtv|hdr|dv|atmos|ddp\d*(\.\d+)?|aac\d*(\.\d+)?|ac3|eac3|dts|truehd|flac|lpcm|avc)$") ||
+               Regex.IsMatch(lower, @"^(4k|uhd|hdtv|uhdtv|hdr|hlg|dv|atmos|ddp\d*(\.\d+)?|aac\d*(\.\d+)?|ac3|eac3|dts|dts[- ]?hd|dts[- ]?x|dtsx|truehd|flac|lpcm|avc|hevc)$") ||
                Regex.IsMatch(lower, @"^(x|h)?26[45]$") ||
-               Regex.IsMatch(lower, @"^(web|webdl|webrip|bluray|bdrip|remux|blu-ray)$") ||
+               Regex.IsMatch(lower, @"^(web|web-?dl|webdl|webrip|bluray|bdrip|remux|blu-ray)$") ||
                Regex.IsMatch(lower, @"^(nf|amzn|netflix|dsnp|disney|hmax|max|atvp|hulu|cr)$") ||
                Regex.IsMatch(lower, @"^(bonus|extra|extras|featurette|trailer|sample|complete)$");
     }
@@ -3112,7 +3163,7 @@ public partial class PosterWallViewModel : ObservableObject
         normalized = Regex.Replace(normalized, @"(?i)\b[s]\d{1,2}[e][p]?\d{1,3}\b", " ");
         normalized = Regex.Replace(normalized, @"(?i)\b[s]\d{1,2}\b", " ");
         normalized = Regex.Replace(normalized, @"(?i)\bepisode\s*\d{1,3}\b", " ");
-        normalized = Regex.Replace(normalized, @"(?i)\b(?:1080p|2160p|720p|480p|4k|uhd|hdtv|uhdtv|blu[- ]?ray|bluray|web[- ]?dl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|hdr|dv|ddp\d*(?:\.\d+)?|dts(?:-hd)?|aac|atmos|avc|flac|lpcm|truehd|complete|nf)\b", " ");
+        normalized = Regex.Replace(normalized, @"(?i)\b(?:1080p|2160p|720p|480p|4k|uhd|hdtv|uhdtv|blu[- ]?ray|bluray|web[- ]?dl|webdl|webrip|remux|x264|x265|h\.?264|h\.?265|hevc|hdr|hlg|dv|ddp\d*(?:\.\d+)?|dts(?:-hd|-x)?|dtsx|aac|atmos|avc|flac|lpcm|truehd|complete|nf|cmct|hdsky|adweb)\b", " ");
         normalized = Regex.Replace(normalized, @"(?:剧场版|纪念版|花絮|特典|番外|幕后花絮)", " ");
 
         var withoutMovieSuffix = Regex.Replace(
@@ -3134,6 +3185,30 @@ public partial class PosterWallViewModel : ObservableObject
             @"[\[\(\{（【]\s*[^]\)\}）】]*(?:剧场版|纪念版|花絮|特典|番外|幕后花絮|anniversary|edition|featurette|bonus|extra|extras|trailer)[^]\)\}）】]*[\]\)\}）】]",
             " ",
             RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsPosterReleaseGroupWrapperFolder(string input, string ancestor)
+    {
+        if (string.IsNullOrWhiteSpace(input) ||
+            string.IsNullOrWhiteSpace(ancestor) ||
+            input.Any(IsCjkCharacter) ||
+            ChoosePosterReleaseYear(input) is not null ||
+            !HasLikelyPosterTitleSignal(ancestor))
+        {
+            return false;
+        }
+
+        var tokens = Regex
+            .Split(input.Trim(), @"[\s._\-@#]+")
+            .Where(static token => !string.IsNullOrWhiteSpace(token))
+            .ToArray();
+        return tokens.Length >= 2 &&
+               tokens.All(static token => Regex.IsMatch(token, @"^[A-Z0-9]{2,10}$", RegexOptions.CultureInvariant));
+    }
+
+    private static bool HasLikelyPosterTitleSignal(string value)
+    {
+        return value.Any(IsCjkCharacter) || ChoosePosterReleaseYear(value) is not null;
     }
 
     private string NormalizePosterYear()
@@ -3321,6 +3396,69 @@ public partial class PosterWallViewModel : ObservableObject
     private void ToggleSortDirection()
     {
         IsSortDescending = !IsSortDescending;
+    }
+
+    private void ApplySavedLibraryViewPreferences()
+    {
+        suppressSortPreferencePersistence = true;
+        try
+        {
+            var option = Settings.LibrarySortOption.Trim().ToLowerInvariant() switch
+            {
+                LibraryViewSettings.SortOptionYear => LibrarySortOption.Year,
+                LibraryViewSettings.SortOptionRating => LibrarySortOption.Rating,
+                _ => LibrarySortOption.Title
+            };
+
+            SelectedSortOption = option;
+            SelectedSortOptionItem = SortOptions.FirstOrDefault(item => item.Value == option) ?? SortOptions[0];
+            IsSortDescending = Settings.LibrarySortDescending;
+            RefreshSortOptionSelectionStates();
+        }
+        finally
+        {
+            suppressSortPreferencePersistence = false;
+        }
+    }
+
+    private void RefreshSortOptionSelectionStates()
+    {
+        foreach (var option in SortOptions)
+        {
+            option.IsSelected = option.Value == SelectedSortOption;
+        }
+    }
+
+    private void PersistLibraryViewPreferencesIfNeeded()
+    {
+        if (suppressSortPreferencePersistence)
+        {
+            return;
+        }
+
+        _ = PersistLibraryViewPreferencesAsync();
+    }
+
+    private async Task PersistLibraryViewPreferencesAsync()
+    {
+        try
+        {
+            await Settings.SaveLibraryViewPreferencesAsync(ToLibrarySortSetting(SelectedSortOption), IsSortDescending);
+        }
+        catch
+        {
+            // Sorting should stay responsive even if the settings file cannot be written.
+        }
+    }
+
+    private static string ToLibrarySortSetting(LibrarySortOption option)
+    {
+        return option switch
+        {
+            LibrarySortOption.Year => LibraryViewSettings.SortOptionYear,
+            LibrarySortOption.Rating => LibraryViewSettings.SortOptionRating,
+            _ => LibraryViewSettings.SortOptionTitle
+        };
     }
 
     private void SelectSeason(int? season)
@@ -4672,7 +4810,15 @@ public partial class PosterWallViewModel : ObservableObject
 
     partial void OnSelectedSortOptionChanged(LibrarySortOption value)
     {
+        var selectedItem = SortOptions.FirstOrDefault(option => option.Value == value) ?? SortOptions[0];
+        if (!ReferenceEquals(SelectedSortOptionItem, selectedItem))
+        {
+            SelectedSortOptionItem = selectedItem;
+        }
+
+        RefreshSortOptionSelectionStates();
         ApplyFilters();
+        PersistLibraryViewPreferencesIfNeeded();
     }
 
     partial void OnIsSortDescendingChanged(bool value)
@@ -4681,6 +4827,7 @@ public partial class PosterWallViewModel : ObservableObject
         OnPropertyChanged(nameof(SortDirectionLabel));
         OnPropertyChanged(nameof(SortDirectionToolTip));
         ApplyFilters();
+        PersistLibraryViewPreferencesIfNeeded();
     }
 
     partial void OnSelectedSortOptionItemChanged(LibrarySortOptionItem value)
@@ -4688,6 +4835,7 @@ public partial class PosterWallViewModel : ObservableObject
         if (value is not null)
         {
             SelectedSortOption = value.Value;
+            RefreshSortOptionSelectionStates();
         }
     }
 
@@ -4988,27 +5136,209 @@ public partial class PosterWallViewModel : ObservableObject
 
     private static IReadOnlyList<LibraryVideoItem> ApplyEpisodeDisplayDisambiguation(IReadOnlyList<LibraryVideoItem> files)
     {
-        var duplicateEpisodeKeys = files
+        var duplicateEpisodeGroups = files
             .Where(static file => file.IsTvEpisode)
             .GroupBy(static file => (file.SeasonNumber, file.EpisodeNumber))
             .Where(static group => group.Count() > 1)
+            .ToList();
+
+        var duplicateEpisodeKeys = duplicateEpisodeGroups
             .Select(static group => group.Key)
             .ToHashSet();
+
+        var prefixSuffixesByFileId = duplicateEpisodeGroups
+            .SelectMany(static group => BuildEpisodePrefixDisambiguationSuffixes(
+                group.Where(static file => string.IsNullOrWhiteSpace(file.CustomEpisodeSubtitle)).ToList()))
+            .ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
 
         return files
             .Select(file =>
             {
-                if (!file.IsTvEpisode ||
-                    duplicateEpisodeKeys.Contains((file.SeasonNumber, file.EpisodeNumber)) ||
-                    !string.IsNullOrWhiteSpace(file.CustomEpisodeSubtitle) ||
-                    string.IsNullOrWhiteSpace(file.EpisodeSubtitle))
+                if (!file.IsTvEpisode || !string.IsNullOrWhiteSpace(file.CustomEpisodeSubtitle))
                 {
                     return file;
+                }
+
+                if (duplicateEpisodeKeys.Contains((file.SeasonNumber, file.EpisodeNumber)) &&
+                    prefixSuffixesByFileId.TryGetValue(file.Id, out var suffix) &&
+                    !string.IsNullOrWhiteSpace(suffix))
+                {
+                    return CopyVideoItemWithEpisodeSubtitle(file, suffix);
                 }
 
                 return CopyVideoItemWithEpisodeSubtitle(file, null);
             })
             .ToList();
+    }
+
+    private static IReadOnlyDictionary<string, string> BuildEpisodePrefixDisambiguationSuffixes(
+        IReadOnlyList<LibraryVideoItem> files)
+    {
+        if (files.Count <= 1)
+        {
+            return new Dictionary<string, string>();
+        }
+
+        var tokenSets = files
+            .Select(static file => new
+            {
+                file.Id,
+                Tokens = EpisodePrefixTokens(file.FileName)
+            })
+            .ToList();
+        if (tokenSets.All(static item => item.Tokens.Count == 0))
+        {
+            return new Dictionary<string, string>();
+        }
+
+        var allTokens = tokenSets.Select(static item => item.Tokens).ToList();
+        var prefixCount = CommonPrefixTokenCount(allTokens);
+        var suffixCount = CommonSuffixTokenCount(allTokens, prefixCount);
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var item in tokenSets)
+        {
+            var end = Math.Max(prefixCount, item.Tokens.Count - suffixCount);
+            if (prefixCount >= end)
+            {
+                continue;
+            }
+
+            var differenceTokens = item.Tokens.Skip(prefixCount).Take(end - prefixCount).ToList();
+            var title = PreferredEpisodeDifferenceTitle(differenceTokens);
+            if (!string.IsNullOrWhiteSpace(title))
+            {
+                result[item.Id] = title;
+            }
+        }
+
+        return result;
+    }
+
+    private static List<string> EpisodePrefixTokens(string fileName)
+    {
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        if (string.IsNullOrWhiteSpace(stem))
+        {
+            return [];
+        }
+
+        var marker = Regex.Match(
+            stem,
+            @"[sS]\d{1,2}[eE][pP]?\d{1,3}|[eE][pP]?\d{1,3}|第\s*\d{1,3}\s*[集话]");
+        if (!marker.Success)
+        {
+            return [];
+        }
+
+        var prefix = stem[..marker.Index];
+        var normalized = Regex.Replace(prefix, @"[\[\]\(\)\{\}【】（）《》「」『』〔〕〖〗,:：]+", " ");
+        normalized = Regex.Replace(normalized, @"[._\-–—]+", " ");
+        normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return [];
+        }
+
+        return normalized
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(static token => !IsEpisodePrefixNoiseToken(token))
+            .ToList();
+    }
+
+    private static int CommonPrefixTokenCount(IReadOnlyList<List<string>> tokenSets)
+    {
+        if (tokenSets.Count == 0 || tokenSets[0].Count == 0)
+        {
+            return 0;
+        }
+
+        var count = 0;
+        while (count < tokenSets[0].Count)
+        {
+            var token = NormalizeEpisodeDifferenceToken(tokenSets[0][count]);
+            if (tokenSets.Any(tokens => tokens.Count <= count || NormalizeEpisodeDifferenceToken(tokens[count]) != token))
+            {
+                break;
+            }
+
+            count++;
+        }
+
+        return count;
+    }
+
+    private static int CommonSuffixTokenCount(IReadOnlyList<List<string>> tokenSets, int prefixCount)
+    {
+        var count = 0;
+        while (true)
+        {
+            string? candidate = null;
+            foreach (var tokens in tokenSets)
+            {
+                var index = tokens.Count - count - 1;
+                if (index < prefixCount)
+                {
+                    return count;
+                }
+
+                var token = NormalizeEpisodeDifferenceToken(tokens[index]);
+                if (candidate is not null && candidate != token)
+                {
+                    return count;
+                }
+
+                candidate ??= token;
+            }
+
+            count++;
+        }
+    }
+
+    private static string? PreferredEpisodeDifferenceTitle(IReadOnlyList<string> tokens)
+    {
+        var chineseTokens = tokens
+            .Where(static token => Regex.IsMatch(token, @"\p{IsCJKUnifiedIdeographs}"))
+            .ToList();
+        if (chineseTokens.Count > 0)
+        {
+            var title = string.Concat(chineseTokens).Trim();
+            return title.Length == 0 ? null : title;
+        }
+
+        var englishTokens = tokens
+            .Where(static token => Regex.IsMatch(token, @"[A-Za-z]") && !IsEpisodePrefixNoiseToken(token))
+            .ToList();
+        var englishTitle = string.Join(' ', englishTokens).Trim();
+        return englishTitle.Length == 0 ? null : englishTitle;
+    }
+
+    private static string NormalizeEpisodeDifferenceToken(string token)
+    {
+        return token.Trim().ToLowerInvariant();
+    }
+
+    private static bool IsEpisodePrefixNoiseToken(string token)
+    {
+        var lower = token.Trim().ToLowerInvariant();
+        if (lower.Length == 0) return true;
+        if (Regex.IsMatch(lower, @"^(19|20)\d{2}$")) return true;
+        if (Regex.IsMatch(lower, @"^\d+$")) return true;
+        if (Regex.IsMatch(lower, @"^\d+(\.\d+)?$")) return true;
+        if (Regex.IsMatch(lower, @"^(\d{3,4}p|[48]k|uhd|fhd|hd|sd)$")) return true;
+        if (Regex.IsMatch(lower, @"^(8|10|12)bit$")) return true;
+        if (Regex.IsMatch(lower, @"^(x|h)?26[45]$")) return true;
+        if (Regex.IsMatch(lower, @"^h\.?(264|265)$")) return true;
+        if (Regex.IsMatch(lower, @"^(aac|ac3|eac3|ddp|dts|truehd|lpcm|flac|mp3|opus)\d*(\.\d+)?$")) return true;
+
+        var releaseTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "blu", "ray", "bluray", "bdrip", "web", "dl", "webdl", "webrip", "hdtv", "uhdtv",
+            "remux", "avc", "hevc", "hdr", "dv", "dovi", "sdr", "hdr10", "hdr10plus",
+            "atmos", "nf", "netflix", "amzn", "amazon", "dsnp", "disney", "hulu", "atvp",
+            "max", "proper", "repack", "internal"
+        };
+        return releaseTokens.Contains(lower);
     }
 
     private static LibraryVideoItem CopyVideoItemWithEpisodeSubtitle(LibraryVideoItem file, string? episodeSubtitle)
@@ -5144,6 +5474,7 @@ public partial class PosterWallViewModel : ObservableObject
 
         SelectedSeason = resolvedSeason;
         selectedPlaybackNavigationSeason = preferred?.SeasonNumber ?? nextUp?.SeasonNumber ?? resolvedSeason;
+        OnPropertyChanged(nameof(SelectedSeasonOption));
         OnPropertyChanged(nameof(HasSeasonTabs));
     }
 

@@ -22,6 +22,10 @@ public interface ILibraryRepository
         LibraryItemMetadataApplyRequest request,
         CancellationToken cancellationToken = default);
 
+    Task<bool> UpdateCustomMetadataAsync(
+        LibraryItemCustomMetadataUpdateRequest request,
+        CancellationToken cancellationToken = default);
+
     Task<bool> SetLibraryItemLockedAsync(
         LibraryItemLockUpdateRequest request,
         CancellationToken cancellationToken = default);
@@ -32,5 +36,9 @@ public interface ILibraryRepository
 
     Task<bool> SetWatchedAsync(
         WatchedStatusUpdateRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> SetLibraryItemWatchedAsync(
+        LibraryItemWatchedStatusUpdateRequest request,
         CancellationToken cancellationToken = default);
 }

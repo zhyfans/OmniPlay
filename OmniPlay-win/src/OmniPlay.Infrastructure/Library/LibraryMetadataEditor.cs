@@ -904,6 +904,14 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
             return normalizedCurrentYear;
         }
 
+        var combinedYear = NormalizeSearchYear(MediaNameParser.CombinedSearchMetadata(
+            relativePath ?? string.Empty,
+            fileName ?? string.Empty).Year);
+        if (!string.IsNullOrWhiteSpace(combinedYear))
+        {
+            return combinedYear;
+        }
+
         var searchMetadataPath = ResolveSearchMetadataPath(
             sourceProtocolType,
             baseUrl,

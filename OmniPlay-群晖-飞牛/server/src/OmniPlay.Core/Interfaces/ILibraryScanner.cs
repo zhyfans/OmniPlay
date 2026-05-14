@@ -10,8 +10,19 @@ public interface ILibraryScanner
         IProgress<LibraryScanProgress>? progress,
         CancellationToken cancellationToken = default);
 
+    Task<LibraryScanSummary> ScanAllAsync(
+        IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
+        CancellationToken cancellationToken = default);
+
     Task<LibraryScanSummary> ScanSourceAsync(
         long sourceId,
         IProgress<LibraryScanProgress>? progress,
+        CancellationToken cancellationToken = default);
+
+    Task<LibraryScanSummary> ScanSourceAsync(
+        long sourceId,
+        IProgress<LibraryScanProgress>? progress,
+        bool hideNewItemsUntilScraped,
         CancellationToken cancellationToken = default);
 }

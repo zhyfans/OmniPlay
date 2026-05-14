@@ -501,6 +501,21 @@ class MPVPlayerManager: ObservableObject {
         }
     }
 
+    func setPaused(_ paused: Bool) {
+        guard !isStopping else { return }
+        DispatchQueue.main.async {
+            self.isPlaying = !paused
+        }
+        runOnControlQueue { [weak self] in
+            guard let self else { return }
+            var pause: Int32 = paused ? 1 : 0
+            mpv_set_property(self.mpv, "pause", MPV_FORMAT_FLAG, &pause)
+            DispatchQueue.main.async {
+                self.isPlaying = !paused
+            }
+        }
+    }
+
     func stop() {
         guard !isStopping else { return }
         traceLifecycle("stop begin")

@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
@@ -30,8 +31,16 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         IProgress<LibraryMetadataEnrichmentProgress>? progress,
         CancellationToken cancellationToken = default)
     {
-        var candidates = await LoadCandidatesAsync(libraryItemId: null, cancellationToken);
-        return await EnrichAsync(candidates, progress, cancellationToken);
+        return await EnrichMissingAsync(progress, new LibraryRefreshRequest(), cancellationToken);
+    }
+
+    public async Task<LibraryMetadataEnrichmentSummary> EnrichMissingAsync(
+        IProgress<LibraryMetadataEnrichmentProgress>? progress,
+        LibraryRefreshRequest order,
+        CancellationToken cancellationToken = default)
+    {
+        var candidates = await LoadCandidatesAsync(libraryItemId: null, order, cancellationToken);
+        return await EnrichAsync(candidates, progress, revealUnmatchedAtEnd: true, cancellationToken);
     }
 
     public async Task<LibraryMetadataEnrichmentSummary> EnrichItemAsync(
@@ -46,19 +55,25 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         IProgress<LibraryMetadataEnrichmentProgress>? progress,
         CancellationToken cancellationToken = default)
     {
-        var candidates = await LoadCandidatesAsync(libraryItemId, cancellationToken);
-        return await EnrichAsync(candidates, progress, cancellationToken);
+        var candidates = await LoadCandidatesAsync(libraryItemId, null, cancellationToken);
+        return await EnrichAsync(candidates, progress, revealUnmatchedAtEnd: false, cancellationToken);
     }
 
     private async Task<LibraryMetadataEnrichmentSummary> EnrichAsync(
         IReadOnlyList<LibraryMetadataCandidate> candidates,
         IProgress<LibraryMetadataEnrichmentProgress>? progress,
+        bool revealUnmatchedAtEnd,
         CancellationToken cancellationToken)
     {
         var settings = (await settingsRepository.GetAsync(cancellationToken)).Tmdb;
         if (!settings.EnableMetadataEnrichment && !settings.EnablePosterDownloads)
         {
             ReportProgress(progress, "disabled", candidates.Count, 0, 0, 0, 0, null);
+            if (revealUnmatchedAtEnd)
+            {
+                await RevealHiddenLibraryItemsAsync(cancellationToken);
+            }
+
             return new LibraryMetadataEnrichmentSummary(Diagnostics: ["TMDB 刮削已关闭。"]);
         }
 
@@ -67,6 +82,7 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         var downloadedPosters = 0;
         var processed = 0;
         List<string> diagnostics = [];
+        List<MatchedTvCandidate> matchedTvCandidates = [];
 
         ReportProgress(progress, "starting", candidates.Count, processed, matched, updated, downloadedPosters, null);
         foreach (var candidate in candidates)
@@ -104,8 +120,7 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
             matched++;
             if (string.Equals(candidate.ItemKind, "tv", StringComparison.OrdinalIgnoreCase))
             {
-                ReportProgress(progress, "fetching-episodes", candidates.Count, processed, matched, updated, downloadedPosters, candidate);
-                downloadedPosters += await RefreshTvEpisodeMetadataAsync(candidate.Id, match.Id, settings, cancellationToken);
+                matchedTvCandidates.Add(new MatchedTvCandidate(candidate.Id, candidate.Title, match.Id));
             }
 
             ReportProgress(progress, "downloading-poster", candidates.Count, processed, matched, updated, downloadedPosters, candidate);
@@ -122,6 +137,30 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
             updated++;
             processed++;
             ReportProgress(progress, "updating", candidates.Count, processed, matched, updated, downloadedPosters, candidate);
+        }
+
+        foreach (var tvCandidate in matchedTvCandidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var progressCandidate = new LibraryMetadataCandidate(
+                tvCandidate.Id,
+                "tv",
+                tvCandidate.Title,
+                null,
+                null,
+                null,
+                null,
+                tvCandidate.TmdbId,
+                null,
+                null);
+            ReportProgress(progress, "fetching-episodes", candidates.Count, processed, matched, updated, downloadedPosters, progressCandidate);
+            downloadedPosters += await RefreshTvEpisodeMetadataAsync(tvCandidate.Id, tvCandidate.TmdbId, settings, cancellationToken);
+            ReportProgress(progress, "fetching-episodes", candidates.Count, processed, matched, updated, downloadedPosters, progressCandidate);
+        }
+
+        if (revealUnmatchedAtEnd)
+        {
+            await RevealHiddenLibraryItemsAsync(cancellationToken);
         }
 
         return new LibraryMetadataEnrichmentSummary(
@@ -146,22 +185,123 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 cancellationToken);
         }
 
-        var year = candidate.ReleaseDate?.Length >= 4 ? candidate.ReleaseDate[..4] : null;
+        var sourceMetadata = ResolveSourceMetadata(candidate);
+        var searchTitle = ResolveSearchTitle(candidate, sourceMetadata);
+        var preferredSeason = ResolvePreferredSeason(candidate);
+        var secondaryQuery = BuildSecondaryQuery(
+            searchTitle,
+            sourceMetadata?.ForeignTitle,
+            sourceMetadata?.ChineseTitle,
+            sourceMetadata?.ParentChineseTitle,
+            sourceMetadata?.FullCleanTitle);
+        var year = string.Equals(candidate.ItemKind, "tv", StringComparison.OrdinalIgnoreCase) && preferredSeason is 0 or > 1
+            ? null
+            : ResolveSearchYear(candidate.ReleaseDate, sourceMetadata?.Year);
         return await tmdbClient.SearchAsync(
             candidate.ItemKind,
-            candidate.Title,
+            searchTitle,
             year,
             settings,
+            secondaryQuery,
             cancellationToken);
+    }
+
+    private static MediaNameParser.CombinedSearchMetadataResult? ResolveSourceMetadata(LibraryMetadataCandidate candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate.SourceRelativePath) &&
+            string.IsNullOrWhiteSpace(candidate.SourceFileName))
+        {
+            return null;
+        }
+
+        return MediaNameParser.CombinedSearchMetadata(
+            candidate.SourceRelativePath ?? string.Empty,
+            string.IsNullOrWhiteSpace(candidate.SourceFileName)
+                ? Path.GetFileName(candidate.SourceRelativePath) ?? string.Empty
+                : candidate.SourceFileName);
+    }
+
+    private static string ResolveSearchTitle(
+        LibraryMetadataCandidate candidate,
+        MediaNameParser.CombinedSearchMetadataResult? sourceMetadata)
+    {
+        if (MediaNameParser.IsUsableLibraryDisplayTitle(candidate.Title))
+        {
+            return candidate.Title.Trim();
+        }
+
+        return sourceMetadata?.ChineseTitle
+               ?? sourceMetadata?.ParentChineseTitle
+               ?? sourceMetadata?.ForeignTitle
+               ?? sourceMetadata?.FullCleanTitle
+               ?? candidate.Title.Trim();
+    }
+
+    private static int? ResolvePreferredSeason(LibraryMetadataCandidate candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate.SourceRelativePath) &&
+            string.IsNullOrWhiteSpace(candidate.SourceFileName))
+        {
+            return null;
+        }
+
+        return MediaNameParser.ResolvePreferredSeason(
+            candidate.SourceRelativePath ?? string.Empty,
+            string.IsNullOrWhiteSpace(candidate.SourceFileName)
+                ? Path.GetFileName(candidate.SourceRelativePath) ?? string.Empty
+                : candidate.SourceFileName);
+    }
+
+    private static string? BuildSecondaryQuery(string primaryQuery, params string?[] candidates)
+    {
+        var normalizedPrimary = NormalizeSearchKey(primaryQuery);
+        foreach (var candidate in candidates)
+        {
+            var trimmed = candidate?.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed))
+            {
+                continue;
+            }
+
+            if (!string.Equals(NormalizeSearchKey(trimmed), normalizedPrimary, StringComparison.Ordinal))
+            {
+                return trimmed;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ResolveSearchYear(string? currentReleaseDate, string? sourceYear)
+    {
+        var currentYear = NormalizeYear(currentReleaseDate);
+        return string.IsNullOrWhiteSpace(currentYear) ? NormalizeYear(sourceYear) : currentYear;
+    }
+
+    private static string? NormalizeYear(string? value)
+    {
+        var trimmed = value?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return null;
+        }
+
+        return trimmed.Length >= 4 ? trimmed[..4] : trimmed;
+    }
+
+    private static string NormalizeSearchKey(string value)
+    {
+        return Regex.Replace(value.Trim().ToLowerInvariant(), @"[^\p{L}\p{Nd}]+", string.Empty);
     }
 
     private async Task<IReadOnlyList<LibraryMetadataCandidate>> LoadCandidatesAsync(
         string? libraryItemId,
+        LibraryRefreshRequest? order,
         CancellationToken cancellationToken)
     {
         using var connection = database.OpenConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             SELECT li.id,
                    li.item_kind,
                    li.title,
@@ -172,13 +312,29 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                    CASE
                        WHEN li.item_kind = 'tv' THEN tv.tmdb_id
                        ELSE m.tmdb_id
-                   END AS tmdb_id
+                   END AS tmdb_id,
+                   (
+                       SELECT vf.relative_path
+                       FROM video_files vf
+                       WHERE vf.library_item_id = li.id
+                         AND vf.missing_at IS NULL
+                       ORDER BY vf.relative_path COLLATE NOCASE ASC
+                       LIMIT 1
+                   ) AS source_relative_path,
+                   (
+                       SELECT vf.file_name
+                       FROM video_files vf
+                       WHERE vf.library_item_id = li.id
+                         AND vf.missing_at IS NULL
+                       ORDER BY vf.relative_path COLLATE NOCASE ASC
+                       LIMIT 1
+                   ) AS source_file_name
             FROM library_items li
             LEFT JOIN movies m ON m.library_item_id = li.id
             LEFT JOIN tv_shows tv ON tv.library_item_id = li.id
             WHERE li.is_locked = 0
               AND ($id IS NULL OR li.id = $id)
-            ORDER BY li.updated_at ASC;
+            ORDER BY {BuildCandidateOrderBy(order)};
             """;
         command.Parameters.AddWithValue("$id", string.IsNullOrWhiteSpace(libraryItemId) ? DBNull.Value : libraryItemId);
 
@@ -194,7 +350,9 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 reader.IsDBNull(4) ? null : reader.GetString(4),
                 reader.IsDBNull(5) ? null : reader.GetString(5),
                 reader.IsDBNull(6) ? null : reader.GetDouble(6),
-                reader.IsDBNull(7) ? null : reader.GetInt32(7)));
+                reader.IsDBNull(7) ? null : reader.GetInt32(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9)));
         }
 
         return candidates;
@@ -240,6 +398,7 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
                 overview = COALESCE($overview, overview),
                 poster_asset_id = COALESCE($posterAssetId, poster_asset_id),
                 vote_average = COALESCE($voteAverage, vote_average),
+                is_visible = 1,
                 updated_at = $updatedAt
             WHERE id = $id AND is_locked = 0;
             """;
@@ -525,6 +684,38 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         return string.IsNullOrWhiteSpace(value) ? DBNull.Value : value.Trim();
     }
 
+    private async Task RevealHiddenLibraryItemsAsync(CancellationToken cancellationToken)
+    {
+        using var connection = database.OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE library_items
+            SET is_visible = 1,
+                updated_at = $updatedAt
+            WHERE is_visible = 0;
+            """;
+        command.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static string BuildCandidateOrderBy(LibraryRefreshRequest? order)
+    {
+        var sortKey = order?.SortKey?.Trim().ToLowerInvariant();
+        var descending = !string.Equals(order?.SortDirection, "asc", StringComparison.OrdinalIgnoreCase);
+        return sortKey switch
+        {
+            "title" => descending
+                ? "li.sort_title COLLATE NOCASE DESC, li.updated_at ASC"
+                : "li.sort_title COLLATE NOCASE ASC, li.updated_at ASC",
+            "rating" => descending
+                ? "li.vote_average IS NULL ASC, li.vote_average DESC, li.sort_title COLLATE NOCASE ASC"
+                : "li.vote_average IS NULL ASC, li.vote_average ASC, li.sort_title COLLATE NOCASE ASC",
+            _ => descending
+                ? "li.release_date IS NULL ASC, li.release_date DESC, li.sort_title COLLATE NOCASE ASC"
+                : "li.release_date IS NULL ASC, li.release_date ASC, li.sort_title COLLATE NOCASE ASC"
+        };
+    }
+
     private sealed record LibraryMetadataCandidate(
         string Id,
         string ItemKind,
@@ -533,7 +724,11 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
         string? Overview,
         string? PosterAssetId,
         double? VoteAverage,
-        int? TmdbId);
+        int? TmdbId,
+        string? SourceRelativePath,
+        string? SourceFileName);
+
+    private sealed record MatchedTvCandidate(string Id, string Title, int TmdbId);
 
     private sealed record LocalSeason(string Id, int SeasonNumber)
     {

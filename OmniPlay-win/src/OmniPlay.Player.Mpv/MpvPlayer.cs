@@ -1,4 +1,8 @@
 using System.Globalization;
+using System.Diagnostics;
+using System.ComponentModel;
+using System.Text.Json;
+using System.Text;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models.Entities;
 using OmniPlay.Core.Models.Playback;
@@ -20,6 +24,9 @@ public sealed class MpvPlayer : IMediaPlayer
     private long? cachedSelectedSubtitleTrackId;
     private IReadOnlyList<PlayerTrackInfo> cachedAudioTracks = [];
     private IReadOnlyList<PlayerTrackInfo> cachedSubtitleTracks = [];
+    private MountedIsoImage? mountedIsoImage;
+    private string? temporaryPlaylistPath;
+    private IReadOnlyList<double> activePlaylistSegmentDurations = [];
 
     public bool IsAvailable { get; private set; }
 
@@ -202,6 +209,7 @@ public sealed class MpvPlayer : IMediaPlayer
     private MediaPlayerOpenResult OpenCore(string filePath)
     {
         Initialize();
+        filePath = MediaSourcePathResolver.ResolvePlayableLocation(filePath);
 
         if (!MediaSourcePathResolver.IsPlayableLocation(filePath))
         {
@@ -239,10 +247,25 @@ public sealed class MpvPlayer : IMediaPlayer
             {
                 SetOption("http-header-fields", remoteHeaders);
             }
-            var localIsoPath = ResolveLocalIsoPath(filePath);
-            if (localIsoPath is not null)
+            var bluRayTarget = ResolveBluRayPlaybackTarget(filePath);
+            if (!string.IsNullOrWhiteSpace(bluRayTarget?.DevicePath))
             {
-                SetOption("bluray-device", localIsoPath);
+                SetOption("bluray-device", bluRayTarget.DevicePath);
+            }
+            if (!string.IsNullOrWhiteSpace(bluRayTarget?.DvdDevicePath) &&
+                bluRayTarget.PlaybackPath.StartsWith("dvd://", StringComparison.OrdinalIgnoreCase))
+            {
+                SetOption("dvd-device", bluRayTarget.DvdDevicePath);
+            }
+            if (bluRayTarget is not null)
+            {
+                Trace.WriteLine(
+                    $"[MpvPlayer] BluRay target: PlaybackPath={bluRayTarget.PlaybackPath}, " +
+                    $"UsePlaylist={bluRayTarget.UsePlaylist}, DevicePath={bluRayTarget.DevicePath ?? "<none>"}, " +
+                    $"FallbackPlaybackPath={bluRayTarget.FallbackPlaybackPath ?? "<none>"}, " +
+                    $"FallbackUsesPlaylist={bluRayTarget.FallbackUsesPlaylist}, " +
+                    $"FinalFallbackPlaybackPath={bluRayTarget.FinalFallbackPlaybackPath ?? "<none>"}, " +
+                    $"DvdDevicePath={bluRayTarget.DvdDevicePath ?? "<none>"}");
             }
 
             var initResult = MpvNative.Initialize(playerHandle);
@@ -252,15 +275,55 @@ public sealed class MpvPlayer : IMediaPlayer
                 return MediaPlayerOpenResult.Failure($"libmpv 初始化失败，错误码 {initResult}。");
             }
 
-            var loadResult = localIsoPath is not null
-                ? MpvNative.Command(playerHandle, "loadfile", "bd://")
+            var loadedUsesPlaylist = bluRayTarget?.UsePlaylist == true;
+            var loadedSegmentDurations = loadedUsesPlaylist
+                ? bluRayTarget?.PlaybackSegmentDurations ?? []
+                : [];
+
+            var loadResult = bluRayTarget is not null
+                ? LoadBluRayTarget(playerHandle, bluRayTarget)
                 : MpvNative.Command(playerHandle, "loadfile", filePath);
-            if (loadResult < 0 && localIsoPath is not null)
+            Trace.WriteLine($"[MpvPlayer] Initial load result: {loadResult}");
+            if (loadResult < 0 &&
+                bluRayTarget is not null &&
+                !string.IsNullOrWhiteSpace(bluRayTarget.FallbackPlaybackPath) &&
+                !string.Equals(bluRayTarget.FallbackPlaybackPath, bluRayTarget.PlaybackPath, StringComparison.OrdinalIgnoreCase))
             {
-                MpvNative.SetPropertyString(playerHandle, "dvd-device", localIsoPath);
+                loadResult = LoadBluRayFallbackTarget(playerHandle, bluRayTarget);
+                loadedUsesPlaylist = bluRayTarget.FallbackUsesPlaylist;
+                loadedSegmentDurations = loadedUsesPlaylist ? bluRayTarget.FallbackSegmentDurations : [];
+                Trace.WriteLine($"[MpvPlayer] Fallback load result: {loadResult}");
+            }
+            if (loadResult < 0 && !string.IsNullOrWhiteSpace(bluRayTarget?.DvdDevicePath))
+            {
+                MpvNative.SetPropertyString(playerHandle, "dvd-device", bluRayTarget.DvdDevicePath);
                 loadResult = MpvNative.Command(playerHandle, "loadfile", "dvd://");
+                loadedUsesPlaylist = false;
+                loadedSegmentDurations = [];
+                Trace.WriteLine($"[MpvPlayer] DVD fallback load result: {loadResult}");
+            }
+            if (loadResult < 0 &&
+                bluRayTarget is not null &&
+                !string.Equals(bluRayTarget.PlaybackPath, "bd://", StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(bluRayTarget.DevicePath))
+            {
+                loadResult = MpvNative.Command(playerHandle, "loadfile", "bd://");
+                loadedUsesPlaylist = false;
+                loadedSegmentDurations = [];
+                Trace.WriteLine($"[MpvPlayer] BluRay device fallback load result: {loadResult}");
+            }
+            if (loadResult < 0 &&
+                !string.IsNullOrWhiteSpace(bluRayTarget?.FinalFallbackPlaybackPath) &&
+                !string.Equals(bluRayTarget.FinalFallbackPlaybackPath, bluRayTarget.PlaybackPath, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(bluRayTarget.FinalFallbackPlaybackPath, bluRayTarget.FallbackPlaybackPath, StringComparison.OrdinalIgnoreCase))
+            {
+                loadResult = MpvNative.Command(playerHandle, "loadfile", bluRayTarget.FinalFallbackPlaybackPath);
+                loadedUsesPlaylist = false;
+                loadedSegmentDurations = [];
+                Trace.WriteLine($"[MpvPlayer] Final fallback load result: {loadResult}");
             }
 
+            activePlaylistSegmentDurations = loadResult >= 0 && loadedUsesPlaylist ? loadedSegmentDurations : [];
             if (loadResult < 0)
             {
                 DestroyPlayer();
@@ -281,16 +344,191 @@ public sealed class MpvPlayer : IMediaPlayer
         }
     }
 
-    private static string? ResolveLocalIsoPath(string filePath)
+    private BluRayPlaybackTarget? ResolveBluRayPlaybackTarget(string filePath)
     {
-        if (MediaSourcePathResolver.IsRemoteHttpUrl(filePath) ||
-            !string.Equals(Path.GetExtension(filePath), ".iso", StringComparison.OrdinalIgnoreCase) ||
+        if (MediaSourcePathResolver.IsRemoteHttpUrl(filePath))
+        {
+            return null;
+        }
+
+        var localBluRayRoot = MediaSourcePathResolver.ResolveLocalBluRayRoot(filePath);
+        if (!string.IsNullOrWhiteSpace(localBluRayRoot))
+        {
+            return CreateLocalBluRayPlaybackTarget(
+                localBluRayRoot,
+                isIsoImage: false,
+                fallbackPlaybackPath: File.Exists(filePath) ? Path.GetFullPath(filePath) : null);
+        }
+
+        var localDvdRoot = MediaSourcePathResolver.ResolveLocalDvdRoot(filePath);
+        if (!string.IsNullOrWhiteSpace(localDvdRoot))
+        {
+            return CreateLocalDvdPlaybackTarget(
+                localDvdRoot,
+                isIsoImage: false,
+                fallbackPlaybackPath: File.Exists(filePath) ? Path.GetFullPath(filePath) : null);
+        }
+
+        if (!string.Equals(Path.GetExtension(filePath), ".iso", StringComparison.OrdinalIgnoreCase) ||
             !File.Exists(filePath))
         {
             return null;
         }
 
-        return Path.GetFullPath(filePath);
+        var isoPath = Path.GetFullPath(filePath);
+        var mountedImage = TryMountIsoImage(isoPath);
+        if (mountedImage is not null)
+        {
+            mountedIsoImage = mountedImage;
+            var mountedBluRayRoot = MediaSourcePathResolver.ResolveLocalBluRayRoot(mountedImage.RootPath);
+            if (!string.IsNullOrWhiteSpace(mountedBluRayRoot))
+            {
+                return CreateLocalBluRayPlaybackTarget(
+                    mountedBluRayRoot,
+                    isIsoImage: true,
+                    fallbackPlaybackPath: isoPath);
+            }
+
+            var mountedDvdRoot = MediaSourcePathResolver.ResolveLocalDvdRoot(mountedImage.RootPath);
+            if (!string.IsNullOrWhiteSpace(mountedDvdRoot))
+            {
+                return CreateLocalDvdPlaybackTarget(
+                    mountedDvdRoot,
+                    isIsoImage: true,
+                    fallbackPlaybackPath: isoPath);
+            }
+        }
+
+        return new BluRayPlaybackTarget(
+            DevicePath: isoPath,
+            PlaybackPath: "bd://longest",
+            UsePlaylist: false,
+            IsIsoImage: true,
+            FallbackPlaybackPath: "bd://",
+            FallbackUsesPlaylist: false,
+            FinalFallbackPlaybackPath: isoPath,
+            DvdDevicePath: isoPath,
+            PlaybackSegmentDurations: [],
+            FallbackSegmentDurations: []);
+    }
+
+    private static BluRayPlaybackTarget CreateLocalDvdPlaybackTarget(
+        string devicePath,
+        bool isIsoImage,
+        string? fallbackPlaybackPath)
+    {
+        return new BluRayPlaybackTarget(
+            DevicePath: null,
+            PlaybackPath: "dvd://",
+            UsePlaylist: false,
+            IsIsoImage: isIsoImage,
+            FallbackPlaybackPath: fallbackPlaybackPath,
+            FallbackUsesPlaylist: false,
+            FinalFallbackPlaybackPath: null,
+            DvdDevicePath: devicePath,
+            PlaybackSegmentDurations: [],
+            FallbackSegmentDurations: []);
+    }
+
+    private BluRayPlaybackTarget CreateLocalBluRayPlaybackTarget(
+        string devicePath,
+        bool isIsoImage,
+        string? fallbackPlaybackPath)
+    {
+        var mainFeatureSegments = MediaSourcePathResolver.ResolveLocalBluRayMainFeatureSegments(devicePath);
+        var mainFeaturePaths = mainFeatureSegments.Select(static segment => segment.Path).ToList();
+        var mainFeatureDurations = mainFeatureSegments.Select(static segment => segment.DurationSeconds).ToList();
+        string? streamFallbackPath = null;
+        var streamFallbackUsesPlaylist = false;
+        if (mainFeaturePaths.Count == 1)
+        {
+            streamFallbackPath = mainFeaturePaths[0];
+        }
+        else if (mainFeaturePaths.Count > 1 &&
+            TryCreateTemporaryM3uPlaylist(mainFeaturePaths, out var playlistPath))
+        {
+            streamFallbackPath = playlistPath;
+            streamFallbackUsesPlaylist = true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(streamFallbackPath))
+        {
+            return new BluRayPlaybackTarget(
+                DevicePath: devicePath,
+                PlaybackPath: streamFallbackPath,
+                UsePlaylist: streamFallbackUsesPlaylist,
+                IsIsoImage: isIsoImage,
+                FallbackPlaybackPath: "bd://longest",
+                FallbackUsesPlaylist: false,
+                FinalFallbackPlaybackPath: fallbackPlaybackPath,
+                DvdDevicePath: null,
+                PlaybackSegmentDurations: streamFallbackUsesPlaylist ? mainFeatureDurations : [],
+                FallbackSegmentDurations: []);
+        }
+
+        return new BluRayPlaybackTarget(
+            DevicePath: devicePath,
+            PlaybackPath: "bd://longest",
+            UsePlaylist: false,
+            IsIsoImage: isIsoImage,
+            FallbackPlaybackPath: streamFallbackPath ?? fallbackPlaybackPath,
+            FallbackUsesPlaylist: streamFallbackUsesPlaylist,
+            FinalFallbackPlaybackPath: streamFallbackPath is null ? null : fallbackPlaybackPath,
+            DvdDevicePath: null,
+            PlaybackSegmentDurations: [],
+            FallbackSegmentDurations: streamFallbackUsesPlaylist ? mainFeatureDurations : []);
+    }
+
+    private bool TryCreateTemporaryM3uPlaylist(IReadOnlyList<string> filePaths, out string playlistPath)
+    {
+        playlistPath = string.Empty;
+        if (filePaths.Count == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            ReleaseTemporaryPlaylist();
+
+            playlistPath = Path.Combine(
+                Path.GetTempPath(),
+                $"omniplay-bdmv-{Guid.NewGuid():N}.m3u8");
+            List<string> lines = ["#EXTM3U"];
+            foreach (var path in filePaths)
+            {
+                lines.Add($"#EXTINF:-1,{Path.GetFileName(path)}");
+                lines.Add(path);
+            }
+
+            File.WriteAllLines(playlistPath, lines, Encoding.UTF8);
+            temporaryPlaylistPath = playlistPath;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            playlistPath = string.Empty;
+            return false;
+        }
+    }
+
+    private static int LoadBluRayTarget(IntPtr handle, BluRayPlaybackTarget target)
+    {
+        return target.UsePlaylist
+            ? MpvNative.Command(handle, "loadlist", target.PlaybackPath)
+            : MpvNative.Command(handle, "loadfile", target.PlaybackPath);
+    }
+
+    private static int LoadBluRayFallbackTarget(IntPtr handle, BluRayPlaybackTarget target)
+    {
+        if (string.IsNullOrWhiteSpace(target.FallbackPlaybackPath))
+        {
+            return -1;
+        }
+
+        return target.FallbackUsesPlaylist
+            ? MpvNative.Command(handle, "loadlist", target.FallbackPlaybackPath)
+            : MpvNative.Command(handle, "loadfile", target.FallbackPlaybackPath);
     }
 
     private static bool TryCreateRemoteHttpHeaderFields(string filePath, out string headerFields)
@@ -365,12 +603,13 @@ public sealed class MpvPlayer : IMediaPlayer
             trackListCount,
             selectedAudioTrackId,
             selectedSubtitleTrackId);
+        var (effectivePosition, effectiveDuration) = ResolvePlaylistPositionAndDuration(position, duration);
 
         return new PlayerPlaybackState
         {
-            HasMedia = duration > 0 || position > 0 || audioTracks.Count > 0 || subtitleTracks.Count > 0,
-            DurationSeconds = duration,
-            PositionSeconds = position,
+            HasMedia = effectiveDuration > 0 || effectivePosition > 0 || audioTracks.Count > 0 || subtitleTracks.Count > 0,
+            DurationSeconds = effectiveDuration,
+            PositionSeconds = effectivePosition,
             IsPaused = pause,
             IsPlaybackCompleted = eofReached,
             IsMuted = mute,
@@ -380,6 +619,29 @@ public sealed class MpvPlayer : IMediaPlayer
             SubtitleDelaySeconds = subtitleDelay,
             SubtitleFontSize = subtitleFontSize > 0 ? subtitleFontSize : 16
         };
+    }
+
+    private (double PositionSeconds, double DurationSeconds) ResolvePlaylistPositionAndDuration(
+        double positionSeconds,
+        double durationSeconds)
+    {
+        var segmentDurations = activePlaylistSegmentDurations;
+        if (segmentDurations.Count <= 1 || segmentDurations.Any(static duration => duration <= 0))
+        {
+            return (positionSeconds, durationSeconds);
+        }
+
+        var playlistPosition = ParseInt(MpvNative.GetPropertyString(playerHandle, "playlist-pos"));
+        if (playlistPosition < 0 || playlistPosition >= segmentDurations.Count)
+        {
+            return (positionSeconds, Math.Max(durationSeconds, segmentDurations.Sum()));
+        }
+
+        var priorSegmentsDuration = segmentDurations.Take(playlistPosition).Sum();
+        var currentSegmentDuration = segmentDurations[playlistPosition];
+        var totalDuration = segmentDurations.Sum();
+        var currentSegmentPosition = Math.Clamp(positionSeconds, 0, currentSegmentDuration);
+        return (priorSegmentsDuration + currentSegmentPosition, totalDuration);
     }
 
     private Task RunPlayerActionAsync(Action<IntPtr> action, CancellationToken cancellationToken)
@@ -418,9 +680,12 @@ public sealed class MpvPlayer : IMediaPlayer
 
     private void DestroyPlayer()
     {
+        activePlaylistSegmentDurations = [];
         if (playerHandle == IntPtr.Zero)
         {
             InvalidateTrackCache();
+            ReleaseMountedIsoImage();
+            ReleaseTemporaryPlaylist();
             return;
         }
 
@@ -433,7 +698,265 @@ public sealed class MpvPlayer : IMediaPlayer
         finally
         {
             InvalidateTrackCache();
+            ReleaseMountedIsoImage();
+            ReleaseTemporaryPlaylist();
         }
+    }
+
+    private void ReleaseTemporaryPlaylist()
+    {
+        var playlistPath = temporaryPlaylistPath;
+        temporaryPlaylistPath = null;
+        if (string.IsNullOrWhiteSpace(playlistPath))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(playlistPath))
+            {
+                File.Delete(playlistPath);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 临时播放列表清理失败不影响播放器生命周期。
+        }
+    }
+
+    private MountedIsoImage? TryMountIsoImage(string isoPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        const string script = """
+            $ErrorActionPreference = 'Stop'
+            $path = [System.IO.Path]::GetFullPath($args[0])
+            $disk = Get-DiskImage -ImagePath $path -ErrorAction SilentlyContinue
+            $alreadyAttached = $false
+            if ($null -ne $disk) {
+                $alreadyAttached = [bool]$disk.Attached
+            }
+            if (-not $alreadyAttached) {
+                $disk = Mount-DiskImage -ImagePath $path -StorageType ISO -Access ReadOnly -PassThru
+            } else {
+                $disk = Get-DiskImage -ImagePath $path
+            }
+
+            function Test-BluRayRoot([string]$root) {
+                if ([string]::IsNullOrWhiteSpace($root)) { return $false }
+                return (Test-Path -LiteralPath $root -PathType Container) -and
+                    (Test-Path -LiteralPath (Join-Path $root 'BDMV') -PathType Container)
+            }
+
+            $fallbackRoot = $null
+            for ($attempt = 0; $attempt -lt 40; $attempt++) {
+                if ($attempt -gt 0) {
+                    Start-Sleep -Milliseconds 250
+                }
+                $disk = Get-DiskImage -ImagePath $path -ErrorAction SilentlyContinue
+
+                $volumeRoots = @()
+                if ($null -ne $disk) {
+                    $volumeRoots += @(
+                        $disk |
+                            Get-Volume -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DriveLetter } |
+                            ForEach-Object { [string]$_.DriveLetter + ':\' }
+                    )
+
+                    $volumeRoots += @(
+                        $disk |
+                            Get-Disk -ErrorAction SilentlyContinue |
+                            Get-Partition -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DriveLetter } |
+                        ForEach-Object { [string]$_.DriveLetter + ':\' }
+                    )
+                }
+
+                $volumeRoots = @(
+                    $volumeRoots |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                        Select-Object -Unique
+                )
+
+                foreach ($root in $volumeRoots) {
+                    if ($null -eq $fallbackRoot -and
+                        (Test-Path -LiteralPath $root -PathType Container)) {
+                        $fallbackRoot = $root
+                    }
+
+                    if (Test-BluRayRoot $root) {
+                        [pscustomobject]@{
+                            Root = $root
+                            ShouldDismount = (-not $alreadyAttached)
+                        } | ConvertTo-Json -Compress
+                        exit 0
+                    }
+                }
+            }
+
+            if ($null -ne $fallbackRoot) {
+                [pscustomobject]@{
+                    Root = $fallbackRoot
+                    ShouldDismount = (-not $alreadyAttached)
+                } | ConvertTo-Json -Compress
+                exit 0
+            }
+
+            throw 'mounted ISO has no accessible drive letter'
+            """;
+
+        if (!TryRunPowerShell(script, isoPath, timeoutMilliseconds: 60_000, out var output))
+        {
+            const string legacyScript = """
+                $ErrorActionPreference = 'Stop'
+                $path = [System.IO.Path]::GetFullPath($args[0])
+                $disk = Get-DiskImage -ImagePath $path -ErrorAction SilentlyContinue
+                $alreadyAttached = $false
+                if ($null -ne $disk) {
+                    $alreadyAttached = [bool]$disk.Attached
+                }
+                if (-not $alreadyAttached) {
+                    $disk = Mount-DiskImage -ImagePath $path -PassThru
+                    Start-Sleep -Seconds 1
+                } else {
+                    $disk = Get-DiskImage -ImagePath $path
+                }
+                $volume = $disk | Get-Volume | Where-Object { $_.DriveLetter } | Select-Object -First 1
+                if ($null -eq $volume) {
+                    $volume = Get-DiskImage -ImagePath $path | Get-Volume | Where-Object { $_.DriveLetter } | Select-Object -First 1
+                }
+                if ($null -eq $volume -or -not $volume.DriveLetter) {
+                    throw 'mounted ISO has no drive letter'
+                }
+                [pscustomobject]@{
+                    Root = ([string]$volume.DriveLetter + ':\')
+                    ShouldDismount = (-not $alreadyAttached)
+                } | ConvertTo-Json -Compress
+                """;
+
+            if (!TryRunPowerShell(legacyScript, isoPath, timeoutMilliseconds: 20_000, out output))
+            {
+                return null;
+            }
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement.ValueKind == JsonValueKind.Array
+                ? document.RootElement.EnumerateArray().FirstOrDefault()
+                : document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("Root", out var rootProperty))
+            {
+                return null;
+            }
+
+            var rootPath = rootProperty.GetString();
+            if (string.IsNullOrWhiteSpace(rootPath))
+            {
+                return null;
+            }
+
+            var shouldDismount = root.TryGetProperty("ShouldDismount", out var shouldDismountProperty) &&
+                                  shouldDismountProperty.ValueKind == JsonValueKind.True;
+            return new MountedIsoImage(isoPath, rootPath, shouldDismount);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private void ReleaseMountedIsoImage()
+    {
+        var image = mountedIsoImage;
+        mountedIsoImage = null;
+        if (image is null || !image.ShouldDismount || !OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        const string script = """
+            $ErrorActionPreference = 'SilentlyContinue'
+            for ($attempt = 0; $attempt -lt 6; $attempt++) {
+                Dismount-DiskImage -ImagePath $args[0]
+                Start-Sleep -Milliseconds 300
+                $disk = Get-DiskImage -ImagePath $args[0] -ErrorAction SilentlyContinue
+                if ($null -eq $disk -or -not [bool]$disk.Attached) {
+                    exit 0
+                }
+            }
+            """;
+        _ = TryRunPowerShell(script, image.IsoPath, timeoutMilliseconds: 10_000, out _);
+    }
+
+    private static bool TryRunPowerShell(
+        string script,
+        string pathArgument,
+        int timeoutMilliseconds,
+        out string output)
+    {
+        output = string.Empty;
+        foreach (var executable in new[] { "powershell.exe", "pwsh.exe" })
+        {
+            try
+            {
+                using var process = new Process();
+                process.StartInfo.FileName = executable;
+                process.StartInfo.UseShellExecute = false;
+                process.StartInfo.CreateNoWindow = true;
+                process.StartInfo.RedirectStandardOutput = true;
+                process.StartInfo.RedirectStandardError = true;
+                var encodedCommand = Convert.ToBase64String(
+                    Encoding.Unicode.GetBytes($"$isoPath = @'\n{pathArgument}\n'@\n& {{ {script} }} $isoPath"));
+                process.StartInfo.ArgumentList.Add("-NoProfile");
+                process.StartInfo.ArgumentList.Add("-ExecutionPolicy");
+                process.StartInfo.ArgumentList.Add("Bypass");
+                process.StartInfo.ArgumentList.Add("-EncodedCommand");
+                process.StartInfo.ArgumentList.Add(encodedCommand);
+
+                if (!process.Start())
+                {
+                    continue;
+                }
+
+                var standardOutputTask = process.StandardOutput.ReadToEndAsync();
+                var standardErrorTask = process.StandardError.ReadToEndAsync();
+                if (!process.WaitForExit(timeoutMilliseconds))
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                    }
+
+                    continue;
+                }
+
+                var standardOutput = standardOutputTask.GetAwaiter().GetResult();
+                _ = standardErrorTask.GetAwaiter().GetResult();
+                if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(standardOutput))
+                {
+                    continue;
+                }
+
+                output = standardOutput.Trim();
+                return true;
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or IOException)
+            {
+            }
+        }
+
+        return false;
     }
 
     private (IReadOnlyList<PlayerTrackInfo> AudioTracks, IReadOnlyList<PlayerTrackInfo> SubtitleTracks) ReadCachedTracks(
@@ -506,9 +1029,16 @@ public sealed class MpvPlayer : IMediaPlayer
 
             var title = MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/title");
             var language = MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/lang");
-            var codec = MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/codec");
+            var codec = BuildCodecDisplaySource(
+                MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/codec"),
+                MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/codec-profile"),
+                MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/decoder-desc"),
+                title);
             var audioChannels = string.Equals(trackType, "audio", StringComparison.OrdinalIgnoreCase)
-                ? MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/audio-channels")
+                ? FirstNonWhiteSpace(
+                    MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/demux-channel-count"),
+                    MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/demux-channels"),
+                    MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/audio-channels"))
                 : null;
             var isDefault = ParseFlag(MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/default"));
             var isForced = ParseFlag(MpvNative.GetPropertyString(playerHandle, $"{propertyPrefix}/forced"));
@@ -533,6 +1063,30 @@ public sealed class MpvPlayer : IMediaPlayer
         }
 
         return tracks;
+    }
+
+    private static string? BuildCodecDisplaySource(params string?[] values)
+    {
+        var parts = values
+            .Select(static value => value?.Trim())
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return parts.Length == 0 ? null : string.Join(' ', parts);
+    }
+
+    private static string? FirstNonWhiteSpace(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            var trimmed = value?.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed))
+            {
+                return trimmed;
+            }
+        }
+
+        return null;
     }
 
     private static IReadOnlyList<PlayerTrackInfo> ApplySelectedTrack(
@@ -605,4 +1159,21 @@ public sealed class MpvPlayer : IMediaPlayer
         return string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
             || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
     }
+
+    private sealed record BluRayPlaybackTarget(
+        string? DevicePath,
+        string PlaybackPath,
+        bool UsePlaylist,
+        bool IsIsoImage,
+        string? FallbackPlaybackPath,
+        bool FallbackUsesPlaylist,
+        string? FinalFallbackPlaybackPath,
+        string? DvdDevicePath,
+        IReadOnlyList<double> PlaybackSegmentDurations,
+        IReadOnlyList<double> FallbackSegmentDurations);
+
+    private sealed record MountedIsoImage(
+        string IsoPath,
+        string RootPath,
+        bool ShouldDismount);
 }

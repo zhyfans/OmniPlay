@@ -12,7 +12,9 @@ public sealed record HlsPlaybackProfile(
     string? ExternalSubtitlePath,
     int? EmbeddedSubtitleStreamIndex,
     bool PreferHardwareAcceleration,
-    string? HardwareEncoder)
+    string? HardwareEncoder,
+    string? HardwareDecoder,
+    string? HardwareAcceleration)
 {
     public string CacheKey =>
         string.Join(
@@ -23,7 +25,9 @@ public sealed record HlsPlaybackProfile(
             SubtitleMode,
             ExternalSubtitlePath is null ? "nosub" : Path.GetFileNameWithoutExtension(ExternalSubtitlePath),
             EmbeddedSubtitleStreamIndex?.ToString() ?? "noembsub",
-            HardwareEncoder ?? "sw");
+            HardwareEncoder ?? "sw",
+            HardwareDecoder ?? "nodec",
+            HardwareAcceleration ?? "noaccel");
 
     public static HlsPlaybackProfile Remux { get; } = CreateRemux();
 
@@ -43,6 +47,8 @@ public sealed record HlsPlaybackProfile(
             null,
             null,
             false,
+            null,
+            null,
             null);
     }
 
@@ -52,7 +58,9 @@ public sealed record HlsPlaybackProfile(
         string subtitleMode = "off",
         string? externalSubtitlePath = null,
         int? embeddedSubtitleStreamIndex = null,
-        string? hardwareEncoder = null)
+        string? hardwareEncoder = null,
+        string? hardwareDecoder = null,
+        string? hardwareAcceleration = null)
     {
         var quality = HlsPlaybackQuality.Resolve(qualityId);
         return new(
@@ -67,7 +75,9 @@ public sealed record HlsPlaybackProfile(
             externalSubtitlePath,
             embeddedSubtitleStreamIndex,
             hardwareEncoder is not null,
-            hardwareEncoder);
+            hardwareEncoder,
+            hardwareDecoder,
+            hardwareAcceleration);
     }
 }
 

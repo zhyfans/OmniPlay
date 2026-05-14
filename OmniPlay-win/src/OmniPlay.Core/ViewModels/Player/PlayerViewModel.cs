@@ -148,6 +148,8 @@ public partial class PlayerViewModel : ObservableObject
     public bool ShouldShowNextEpisodeAction =>
         HasNextEpisodeAction && IsPlaying && PlaybackProgressRatio >= PlaybackProgressRules.CompletionRatio;
 
+    public bool ShouldShowOpeningMovieStatus => IsOpeningMovie || !IsPlaying;
+
     public bool HasPlaybackNavigation => PlaybackNavigationItems.Count > 0;
 
     public bool HasPlaybackNavigationSeasons => PlaybackNavigationSeasons.Count > 1;
@@ -178,6 +180,9 @@ public partial class PlayerViewModel : ObservableObject
 
     [ObservableProperty]
     private bool isPlaybackCompleted;
+
+    [ObservableProperty]
+    private bool isOpeningMovie;
 
     [ObservableProperty]
     private bool isMuted;
@@ -328,7 +333,8 @@ public partial class PlayerViewModel : ObservableObject
         hasUserSelectedSubtitleTrack = false;
         ResetTrackSelection();
         RefreshTimeTexts();
-        StatusMessage = "正在打开视频...";
+        IsOpeningMovie = true;
+        StatusMessage = "正在打开电影...";
 
         var result = await mediaPlayer.OpenAsync(request, cancellationToken);
         IsAvailable = mediaPlayer.IsAvailable;
@@ -336,6 +342,10 @@ public partial class PlayerViewModel : ObservableObject
         StatusMessage = result.Message;
         IsPlaying = result.Succeeded;
         IsPaused = false;
+        if (!result.Succeeded)
+        {
+            IsOpeningMovie = false;
+        }
 
         RefreshComputedProperties();
 
@@ -360,6 +370,7 @@ public partial class PlayerViewModel : ObservableObject
         IsPlaying = false;
         IsPaused = false;
         IsPlaybackCompleted = false;
+        IsOpeningMovie = false;
         IsMuted = false;
         VolumePercent = 100;
         CurrentPositionSeconds = 0;
@@ -692,6 +703,11 @@ public partial class PlayerViewModel : ObservableObject
             return;
         }
 
+        if (state.HasMedia)
+        {
+            IsOpeningMovie = false;
+        }
+
         IsPaused = state.IsPaused;
         IsPlaybackCompleted = state.IsPlaybackCompleted;
         IsMuted = state.IsMuted;
@@ -822,7 +838,7 @@ public partial class PlayerViewModel : ObservableObject
 
     private PlayerTrackInfo? ResolvePreferredSubtitleTrack()
     {
-        return SubtitleTracks
+        var preferredTrack = SubtitleTracks
             .Select((track, index) => new
             {
                 Track = track,
@@ -834,6 +850,9 @@ public partial class PlayerViewModel : ObservableObject
             .ThenBy(static item => item.Index)
             .Select(static item => item.Track)
             .FirstOrDefault();
+
+        return preferredTrack
+            ?? SubtitleTracks.LastOrDefault(static track => !track.IsOffOption && track.TrackId is not null);
     }
 
     private void ResetTrackSelection()
@@ -1079,18 +1098,24 @@ public partial class PlayerViewModel : ObservableObject
 
     private static IReadOnlyList<PlayerTrackInfo> BuildSubtitleTrackOptions(IReadOnlyList<PlayerTrackInfo> tracks)
     {
-        if (tracks.Count == 0)
+        var realTracks = tracks
+            .Where(static track => !track.IsOffOption && track.TrackId is not null)
+            .GroupBy(static track => track.TrackId)
+            .Select(static group => group.Last())
+            .ToArray();
+
+        if (realTracks.Length == 0)
         {
             return [];
         }
 
-        var hasSelectedTrack = tracks.Any(track => track.IsSelected);
-        var items = new List<PlayerTrackInfo>(tracks.Count + 1)
+        var hasSelectedTrack = realTracks.Any(track => track.IsSelected);
+        var items = new List<PlayerTrackInfo>(realTracks.Length + 1)
         {
             new("sub", null, "关闭字幕", !hasSelectedTrack, true)
         };
 
-        items.AddRange(tracks);
+        items.AddRange(realTracks);
         return items;
     }
 
@@ -1325,6 +1350,7 @@ public partial class PlayerViewModel : ObservableObject
     {
         OnPropertyChanged(nameof(HasTrackControls));
         OnPropertyChanged(nameof(HasSubtitleStyleControls));
+        OnPropertyChanged(nameof(ShouldShowOpeningMovieStatus));
         NotifyPlaybackNavigationStateChanged();
     }
 
@@ -1356,7 +1382,13 @@ public partial class PlayerViewModel : ObservableObject
         OnPropertyChanged(nameof(HasPreviousEpisodeAction));
         OnPropertyChanged(nameof(HasNextEpisodeAction));
         OnPropertyChanged(nameof(ShouldShowNextEpisodeAction));
+        OnPropertyChanged(nameof(ShouldShowOpeningMovieStatus));
         PlayPreviousEpisodeCommand.NotifyCanExecuteChanged();
         PlayNextEpisodeCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnIsOpeningMovieChanged(bool value)
+    {
+        OnPropertyChanged(nameof(ShouldShowOpeningMovieStatus));
     }
 }

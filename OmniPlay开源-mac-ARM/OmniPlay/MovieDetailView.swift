@@ -260,33 +260,28 @@ struct MovieDetailView: View {
     }
 
     private func episodeBaseDisplayName(season: Int, episode: Int) -> String {
-        season == 0 ? "特别篇 第 \(episode) 集" : "第 \(season) 季 第 \(episode) 集"
-    }
-
-    private func episodeDetailSuffix(from descriptor: MediaNameParser.EpisodeDescriptor) -> String? {
-        let pieces = [descriptor.variantTitle, descriptor.segmentLabel]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !pieces.isEmpty else { return nil }
-        return pieces.joined(separator: " · ")
+        season == 0 ? "特别篇第\(episode)集" : "第\(season)季第\(episode)集"
     }
 
     private func applyingDuplicateEpisodeSuffixes(
         to episodes: [EpisodeItem],
         eligibleEpisodeIDs: Set<String>,
-        explicitSubtitleFileIDs: Set<String>,
-        detailSuffixesByFileID: [String: String]
+        explicitSubtitleFileIDs: Set<String>
     ) -> [EpisodeItem] {
-        let duplicateCounts = Dictionary(
+        let duplicateGroups = Dictionary(
             grouping: episodes.filter { eligibleEpisodeIDs.contains($0.id) },
             by: { "\($0.season)#\($0.episode)" }
-        ).mapValues(\.count)
+        ).filter { $0.value.count > 1 }
+
+        var suffixesByFileID: [String: String] = [:]
+        for group in duplicateGroups.values {
+            let candidates = group.filter { !explicitSubtitleFileIDs.contains($0.id) }
+            let suffixes = episodePrefixDisambiguationSuffixes(for: candidates)
+            suffixesByFileID.merge(suffixes) { current, _ in current }
+        }
 
         return episodes.map { episode in
-            let key = "\(episode.season)#\(episode.episode)"
-            guard duplicateCounts[key, default: 0] > 1,
-                  !explicitSubtitleFileIDs.contains(episode.id),
-                  let suffix = detailSuffixesByFileID[episode.id],
+            guard let suffix = suffixesByFileID[episode.id],
                   !suffix.isEmpty else {
                 return episode
             }
@@ -298,6 +293,129 @@ struct MovieDetailView: View {
                 displayName: "\(episodeBaseDisplayName(season: episode.season, episode: episode.episode)) · \(suffix)"
             )
         }
+    }
+
+    private func episodePrefixDisambiguationSuffixes(for episodes: [EpisodeItem]) -> [String: String] {
+        guard episodes.count > 1 else { return [:] }
+        let tokenSets = episodes.map { episode in
+            (id: episode.id, tokens: episodePrefixTokens(from: episode.file.fileName))
+        }
+        guard tokenSets.contains(where: { !$0.tokens.isEmpty }) else { return [:] }
+
+        let allTokens = tokenSets.map(\.tokens)
+        let prefixCount = commonPrefixTokenCount(allTokens)
+        let suffixCount = commonSuffixTokenCount(allTokens, afterCommonPrefix: prefixCount)
+
+        var result: [String: String] = [:]
+        for item in tokenSets {
+            let end = max(prefixCount, item.tokens.count - suffixCount)
+            guard prefixCount < end else { continue }
+            let differenceTokens = Array(item.tokens[prefixCount..<end])
+            if let title = preferredEpisodeDifferenceTitle(from: differenceTokens) {
+                result[item.id] = title
+            }
+        }
+        return result
+    }
+
+    private func episodePrefixTokens(from fileName: String) -> [String] {
+        let stem = ((fileName as NSString).lastPathComponent as NSString).deletingPathExtension
+        guard let markerRange = episodeMarkerRange(in: stem) else { return [] }
+        let prefix = String(stem[..<markerRange.lowerBound])
+        let normalized = prefix
+            .replacingOccurrences(of: #"[\\[\\]\\(\\)\\{\\}【】（）《》「」『』〔〕〖〗,:：]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"[._\-–—]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+        return normalized
+            .split(separator: " ")
+            .map(String.init)
+            .filter { !isEpisodePrefixNoiseToken($0) }
+    }
+
+    private func episodeMarkerRange(in stem: String) -> Range<String.Index>? {
+        let patterns = [
+            #"[sS]\d{1,2}[eE][pP]?\d{1,3}"#,
+            #"[eE][pP]?\d{1,3}"#,
+            #"第\s*\d{1,3}\s*[集话]"#
+        ]
+        for pattern in patterns {
+            if let range = stem.range(of: pattern, options: .regularExpression) {
+                return range
+            }
+        }
+        return nil
+    }
+
+    private func commonPrefixTokenCount(_ tokenSets: [[String]]) -> Int {
+        guard let first = tokenSets.first, !first.isEmpty else { return 0 }
+        var count = 0
+        while count < first.count {
+            let token = normalizedEpisodeDifferenceToken(first[count])
+            guard tokenSets.allSatisfy({ $0.count > count && normalizedEpisodeDifferenceToken($0[count]) == token }) else {
+                break
+            }
+            count += 1
+        }
+        return count
+    }
+
+    private func commonSuffixTokenCount(_ tokenSets: [[String]], afterCommonPrefix prefixCount: Int) -> Int {
+        var count = 0
+        while true {
+            var candidate: String?
+            for tokens in tokenSets {
+                let index = tokens.count - count - 1
+                guard index >= prefixCount else { return count }
+                let token = normalizedEpisodeDifferenceToken(tokens[index])
+                if let candidate {
+                    guard candidate == token else { return count }
+                } else {
+                    candidate = token
+                }
+            }
+            count += 1
+        }
+    }
+
+    private func preferredEpisodeDifferenceTitle(from tokens: [String]) -> String? {
+        let chineseTokens = tokens.filter { $0.range(of: #"\p{Han}"#, options: .regularExpression) != nil }
+        if !chineseTokens.isEmpty {
+            let title = chineseTokens.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            return title.isEmpty ? nil : title
+        }
+
+        let englishTokens = tokens.filter {
+            $0.range(of: #"[A-Za-z]"#, options: .regularExpression) != nil &&
+            !isEpisodePrefixNoiseToken($0)
+        }
+        let title = englishTokens.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? nil : title
+    }
+
+    private func normalizedEpisodeDifferenceToken(_ token: String) -> String {
+        token.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isEpisodePrefixNoiseToken(_ token: String) -> Bool {
+        let lower = token.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lower.isEmpty { return true }
+        if lower.range(of: #"^(19|20)\d{2}$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^\d+$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^\d+(\.\d+)?$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(\d{3,4}p|[48]k|uhd|fhd|hd|sd)$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(8|10|12)bit$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(x|h)?26[45]$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^h\.?(264|265)$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(aac|ac3|eac3|ddp|dts|truehd|lpcm|flac|mp3|opus)\d*(\.\d+)?$"#, options: .regularExpression) != nil { return true }
+        let releaseTokens: Set<String> = [
+            "blu", "ray", "bluray", "bdrip", "web", "dl", "webdl", "webrip", "hdtv", "uhdtv",
+            "remux", "avc", "hevc", "hdr", "dv", "dovi", "sdr", "hdr10", "hdr10plus",
+            "atmos", "nf", "netflix", "amzn", "amazon", "dsnp", "disney", "hulu", "atvp",
+            "max", "proper", "repack", "internal"
+        ]
+        return releaseTokens.contains(lower)
     }
 
     private func hasUnfinishedPlaybackProgress(_ file: VideoFile) -> Bool {
@@ -356,7 +474,6 @@ struct MovieDetailView: View {
                 var episodes: [EpisodeItem] = []
                 var eligibleEpisodeIDs = Set<String>()
                 var explicitSubtitleFileIDs = Set<String>()
-                var detailSuffixesByFileID: [String: String] = [:]
                 var isShow = false
                 
                 for (index, file) in sortedFiles.enumerated() {
@@ -378,8 +495,6 @@ struct MovieDetailView: View {
                         if let subtitle = override?.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !subtitle.isEmpty {
                             dName += " · \(subtitle)"
                             explicitSubtitleFileIDs.insert(file.id)
-                        } else if let suffix = episodeDetailSuffix(from: parsed) {
-                            detailSuffixesByFileID[file.id] = suffix
                         }
                     } else if displayMovieTitle.contains("季") || displayMovieTitle.contains("集") {
                         isShow = true
@@ -396,8 +511,7 @@ struct MovieDetailView: View {
                 let sortedEpisodes = applyingDuplicateEpisodeSuffixes(
                     to: episodes,
                     eligibleEpisodeIDs: eligibleEpisodeIDs,
-                    explicitSubtitleFileIDs: explicitSubtitleFileIDs,
-                    detailSuffixesByFileID: detailSuffixesByFileID
+                    explicitSubtitleFileIDs: explicitSubtitleFileIDs
                 )
                 let resumeEp = mostRecentUnfinishedEpisode(in: sortedEpisodes)
                 let nextUnwatchedEp = sortedEpisodes.first { isNotFullyWatched($0.file) }

@@ -13,6 +13,9 @@ namespace OmniPlay.Desktop.Windows;
 
 public partial class StandalonePlayerWindow : Window
 {
+    private const int VirtualKeyEnter = 0x0D;
+    private const int VirtualKeyEscape = 0x1B;
+
     private readonly DispatcherTimer controlsHideTimer;
     private readonly DispatcherTimer windowControlsHideTimer;
     private PlayerSurfaceHost? playerSurfaceHost;
@@ -38,6 +41,7 @@ public partial class StandalonePlayerWindow : Window
 
         PositionSlider.AddHandler(PointerPressedEvent, PositionSlider_OnPointerPressed, RoutingStrategies.Tunnel, true);
         PositionSlider.AddHandler(PointerReleasedEvent, PositionSlider_OnPointerReleased, RoutingStrategies.Tunnel, true);
+        PropertyChanged += Window_OnPropertyChanged;
     }
 
     public bool ReturnToShellOnClose { get; set; }
@@ -83,6 +87,7 @@ public partial class StandalonePlayerWindow : Window
         playerSurfaceHost = new PlayerSurfaceHost();
         playerSurfaceHost.NativePointerActivity += PlayerSurfaceHost_OnNativePointerActivity;
         playerSurfaceHost.NativePrimaryButtonPressed += PlayerSurfaceHost_OnNativePrimaryButtonPressed;
+        playerSurfaceHost.NativeKeyDown += PlayerSurfaceHost_OnNativeKeyDown;
         PlayerSurfaceHostContainer.Content = playerSurfaceHost;
         return playerSurfaceHost;
     }
@@ -92,9 +97,26 @@ public partial class StandalonePlayerWindow : Window
         Dispatcher.UIThread.Post(ShowControlsTemporarily);
     }
 
-    private void PlayerSurfaceHost_OnNativePrimaryButtonPressed(object? sender, EventArgs e)
+    private void PlayerSurfaceHost_OnNativePrimaryButtonPressed(object? sender, NativePrimaryButtonPressedEventArgs e)
     {
         Dispatcher.UIThread.Post(ToggleControlsVisibility);
+    }
+
+    private void PlayerSurfaceHost_OnNativeKeyDown(object? sender, NativeKeyActivityEventArgs e)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            switch (e.VirtualKey)
+            {
+                case VirtualKeyEnter:
+                    ToggleFullscreen();
+                    ShowControlsTemporarily();
+                    break;
+                case VirtualKeyEscape:
+                    ExitFullscreen();
+                    break;
+            }
+        });
     }
 
     private void WindowControlsHideTimer_OnTick(object? sender, EventArgs e)
@@ -160,19 +182,22 @@ public partial class StandalonePlayerWindow : Window
 
     private void MaximizeButton_OnClick(object? sender, RoutedEventArgs e)
     {
-        WindowState = WindowState switch
-        {
-            WindowState.FullScreen => WindowState.Normal,
-            WindowState.Maximized => WindowState.Normal,
-            _ => WindowState.Maximized
-        };
-
+        ToggleFullscreenFromMaximizeButton();
         ShowWindowControlsTemporarily();
     }
 
     private void Window_OnOpened(object? sender, EventArgs e)
     {
         ShowControlsTemporarily();
+    }
+
+    private void Window_OnPropertyChanged(object? sender, AvaloniaPropertyChangedEventArgs e)
+    {
+        if (e.Property == WindowStateProperty &&
+            WindowState is not WindowState.Minimized)
+        {
+            ShowWindowControlsAfterWindowStateChange();
+        }
     }
 
     private void Window_OnPointerMoved(object? sender, PointerEventArgs e)
@@ -317,13 +342,13 @@ public partial class StandalonePlayerWindow : Window
                 ShowControlsTemporarily();
                 e.Handled = true;
                 break;
+            case Key.Enter:
+                ToggleFullscreen();
+                ShowControlsTemporarily();
+                e.Handled = true;
+                break;
             case Key.Escape:
-                if (WindowState == WindowState.FullScreen)
-                {
-                    WindowState = WindowState.Normal;
-                    ShowControlsTemporarily();
-                    e.Handled = true;
-                }
+                e.Handled = ExitFullscreen();
                 break;
         }
     }
@@ -331,6 +356,39 @@ public partial class StandalonePlayerWindow : Window
     private void ToggleFullscreen()
     {
         WindowState = WindowState == WindowState.FullScreen ? WindowState.Normal : WindowState.FullScreen;
+        ShowWindowControlsAfterWindowStateChange();
+    }
+
+    private void ToggleFullscreenFromMaximizeButton()
+    {
+        if (WindowState == WindowState.FullScreen)
+        {
+            WindowState = WindowState.Normal;
+            ShowWindowControlsAfterWindowStateChange();
+            return;
+        }
+
+        WindowState = WindowState.FullScreen;
+        ShowWindowControlsAfterWindowStateChange();
+    }
+
+    private bool ExitFullscreen()
+    {
+        if (WindowState != WindowState.FullScreen)
+        {
+            return false;
+        }
+
+        WindowState = WindowState.Normal;
+        ShowWindowControlsAfterWindowStateChange();
+        ShowControlsTemporarily();
+        return true;
+    }
+
+    private void ShowWindowControlsAfterWindowStateChange()
+    {
+        ShowWindowControlsTemporarily();
+        Dispatcher.UIThread.Post(ShowWindowControlsTemporarily, DispatcherPriority.Background);
     }
 
     protected override void OnClosed(EventArgs e)
@@ -340,6 +398,7 @@ public partial class StandalonePlayerWindow : Window
             $"ReturnInProgress={returnToShellInProgress}, IsVisible={IsVisible}, WindowState={WindowState}");
         controlsHideTimer.Stop();
         windowControlsHideTimer.Stop();
+        PropertyChanged -= Window_OnPropertyChanged;
         StopSeekRepeat();
         base.OnClosed(e);
     }

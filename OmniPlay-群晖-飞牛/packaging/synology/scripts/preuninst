@@ -1,2 +1,13 @@
 #!/bin/sh
+
+PACKAGE="OmniPlay"
+SERVICE_SCRIPT="/var/packages/${PACKAGE}/scripts/start-stop-status"
+TARGET_SERVICE_SCRIPT="/var/packages/${PACKAGE}/target/scripts/start-stop-status"
+
+if [ -x "${SERVICE_SCRIPT}" ]; then
+  "${SERVICE_SCRIPT}" stop || true
+elif [ -x "${TARGET_SERVICE_SCRIPT}" ]; then
+  "${TARGET_SERVICE_SCRIPT}" stop || true
+fi
+
 exit 0

@@ -119,6 +119,60 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task ScanAllSkipsProbeWhenNewItemsAreHiddenUntilScraped()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(mediaRoot, "Movies", "Inception (2010)", "Inception.2010.2160p.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        await new MediaSourceRepository(database).AddLocalAsync("测试媒体", mediaRoot);
+        var probeService = new CountingMediaProbeService();
+        var scanner = new LibraryScanner(database, probeService);
+
+        var summary = await scanner.ScanAllAsync(progress: null, hideNewItemsUntilScraped: true);
+        using var connection = database.OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*), COALESCE(MAX(duration_seconds), 0) FROM video_files WHERE missing_at IS NULL;";
+        using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        Assert.Equal(1, summary.NewVideoFileCount);
+        Assert.Equal(0, probeService.ProbeCount);
+        Assert.Equal(1, reader.GetInt32(0));
+        Assert.Equal(0, reader.GetDouble(1));
+    }
+
+    [Fact]
+    public async Task ScanAllMergesDifferentSeasonsOfSameTvShowIntoOneItem()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(mediaRoot, "南家三姐妹", "A.S04E01.2013.mkv"));
+        Touch(Path.Combine(mediaRoot, "南家三姐妹", "Z.S01E01.2009.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        await new MediaSourceRepository(database).AddLocalAsync("测试媒体", mediaRoot);
+        var scanner = new LibraryScanner(database);
+
+        await scanner.ScanAllAsync();
+
+        var repository = new LibraryRepository(database);
+        var item = Assert.Single(await repository.GetItemsAsync());
+        var detail = await repository.GetItemDetailAsync(item.Id);
+
+        Assert.NotNull(detail);
+        Assert.Equal("南家三姐妹", item.Title);
+        Assert.Equal("tv", item.ItemKind);
+        Assert.Equal(2, item.VideoFileCount);
+        Assert.Equal("2009-01-01", item.ReleaseDate);
+        Assert.Contains(detail.Seasons, season => season.SeasonNumber == 1);
+        Assert.Contains(detail.Seasons, season => season.SeasonNumber == 4);
+    }
+
+    [Fact]
     public async Task ScanSourceIndexesOnlyRequestedSourceAndStoresLastScannedAt()
     {
         var mediaRootA = Path.Combine(root, "media-a");
@@ -144,6 +198,66 @@ public sealed class LibraryScannerTests : IDisposable
         Assert.Contains(items, item => item.Title == "Movie A");
         Assert.NotNull(sources.Single(source => source.Id == sourceA.Id).LastScannedAt);
         Assert.Null(sources.Single(source => source.Id == sourceB.Id).LastScannedAt);
+    }
+
+    [Fact]
+    public async Task RemovedSourceImmediatelyDisappearsFromLibrary()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(mediaRoot, "Movie.A.2020.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        var mediaSources = new MediaSourceRepository(database);
+        var source = await mediaSources.AddLocalAsync("源 A", mediaRoot);
+        var scanner = new LibraryScanner(database);
+        await scanner.ScanAllAsync();
+
+        var repository = new LibraryRepository(database);
+        Assert.Single(await repository.GetItemsAsync());
+
+        Assert.True(await mediaSources.RemoveAsync(source.Id));
+
+        Assert.Empty(await mediaSources.GetAllAsync());
+        Assert.Empty(await repository.GetItemsAsync());
+    }
+
+    [Fact]
+    public async Task DisabledSourceDisappearsFromLibraryWithoutDeletingIndexedMetadata()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(mediaRoot, "Movie.A.2020.mkv"));
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        var mediaSources = new MediaSourceRepository(database);
+        var source = await mediaSources.AddLocalAsync("源 A", mediaRoot);
+        var scanner = new LibraryScanner(database);
+        await scanner.ScanAllAsync();
+
+        var repository = new LibraryRepository(database);
+        var item = Assert.Single(await repository.GetItemsAsync());
+        Assert.True(await repository.ApplyMetadataMatchAsync(new LibraryItemMetadataApplyRequest(
+            item.Id,
+            TmdbId: 100,
+            MediaType: "movie",
+            Title: "保留的元数据",
+            Overview: "停用媒体源不应删除元数据。",
+            ReleaseDate: "2020-01-01",
+            PosterPath: null,
+            VoteAverage: 8.1,
+            PosterLocalPath: null,
+            LockMetadata: true)));
+
+        Assert.NotNull(await mediaSources.UpdateAsync(source.Id, new UpdateMediaSourceRequest(IsEnabled: false)));
+        Assert.Empty(await repository.GetItemsAsync());
+
+        Assert.NotNull(await mediaSources.UpdateAsync(source.Id, new UpdateMediaSourceRequest(IsEnabled: true)));
+        var restored = Assert.Single(await repository.GetItemsAsync());
+        Assert.Equal("保留的元数据", restored.Title);
+        Assert.Equal(8.1, restored.VoteAverage);
     }
 
     [Fact]

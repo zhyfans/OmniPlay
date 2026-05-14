@@ -34,6 +34,8 @@ public sealed class JsonSettingsServiceTests : IDisposable
         Assert.Equal(string.Empty, defaults.Tmdb.CustomApiKey);
         Assert.Equal(string.Empty, defaults.Tmdb.CustomAccessToken);
         Assert.Equal(string.Empty, defaults.Tmdb.Language);
+        Assert.Equal(LibraryViewSettings.SortOptionTitle, defaults.LibraryView.SortOption);
+        Assert.False(defaults.LibraryView.SortDescending);
         Assert.Equal(PlaybackPreferenceSettings.DefaultAudioSmart, defaults.Playback.DefaultAudioTrack);
         Assert.Equal(PlaybackPreferenceSettings.DefaultSubtitleChinese, defaults.Playback.DefaultSubtitleTrack);
 
@@ -41,6 +43,11 @@ public sealed class JsonSettingsServiceTests : IDisposable
         {
             AutoScanOnStartup = false,
             ShowMediaSourceRealPath = false,
+            LibraryView = new LibraryViewSettings
+            {
+                SortOption = LibraryViewSettings.SortOptionRating,
+                SortDescending = true
+            },
             Tmdb = new TmdbSettings
             {
                 EnableMetadataEnrichment = false,
@@ -68,6 +75,8 @@ public sealed class JsonSettingsServiceTests : IDisposable
         Assert.Equal("custom-key", reloaded.Tmdb.CustomApiKey);
         Assert.Equal("custom-token", reloaded.Tmdb.CustomAccessToken);
         Assert.Equal("en-US", reloaded.Tmdb.Language);
+        Assert.Equal(LibraryViewSettings.SortOptionRating, reloaded.LibraryView.SortOption);
+        Assert.True(reloaded.LibraryView.SortDescending);
         Assert.Equal(PlaybackPreferenceSettings.AudioJapanese, reloaded.Playback.DefaultAudioTrack);
         Assert.Equal(PlaybackPreferenceSettings.SubtitleEnglish, reloaded.Playback.DefaultSubtitleTrack);
     }

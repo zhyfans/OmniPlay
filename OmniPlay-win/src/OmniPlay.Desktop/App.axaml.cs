@@ -4,6 +4,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using Avalonia.Markup.Xaml;
 using Microsoft.Extensions.DependencyInjection;
+using OmniPlay.Core.Models.Entities;
 using OmniPlay.Core.ViewModels;
 using OmniPlay.Core.ViewModels.Player;
 using OmniPlay.Desktop.Bootstrap;
@@ -140,7 +141,7 @@ public partial class App : Application
     private StandalonePlayerWindow CreatePlaybackDiagnosticWindow(CommandLineOptions launchOptions)
     {
         var playbackFilePath = launchOptions.PlayFilePath!;
-        if (!File.Exists(playbackFilePath))
+        if (!MediaSourcePathResolver.IsPlayableLocation(playbackFilePath))
         {
             throw new FileNotFoundException($"命令行播放诊断文件不存在: {playbackFilePath}", playbackFilePath);
         }
@@ -181,7 +182,7 @@ public partial class App : Application
     private MainWindow CreateOverlayPlaybackDiagnosticWindow(CommandLineOptions launchOptions)
     {
         var playbackFilePath = launchOptions.OverlayPlayFilePath!;
-        if (!File.Exists(playbackFilePath))
+        if (!MediaSourcePathResolver.IsPlayableLocation(playbackFilePath))
         {
             throw new FileNotFoundException($"命令行覆盖层诊断文件不存在: {playbackFilePath}", playbackFilePath);
         }

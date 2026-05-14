@@ -12,7 +12,7 @@ internal static class LibraryTmdbMatchGuard
         int tolerance = 1)
     {
         var isTv = string.Equals(preferredMediaType, "tv", StringComparison.OrdinalIgnoreCase);
-        if (isTv && preferredSeason is > 1)
+        if (isTv)
         {
             return true;
         }

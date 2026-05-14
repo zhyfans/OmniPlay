@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace OmniPlay.Core.Models.Playback;
 
 public static class PlayerTrackDisplayNameFormatter
@@ -23,9 +25,22 @@ public static class PlayerTrackDisplayNameFormatter
             displayParts.Add(languageLabel);
         }
 
+        var codecSearchText = string.Join(
+            ' ',
+            new[] { codec, rawTitle }
+                .Select(static value => value?.Trim())
+                .Where(static value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+        var formattedCodec = FormatCodec(codecSearchText);
+        var formattedChannels = FormatAudioChannels(audioChannels);
+        if (string.IsNullOrWhiteSpace(formattedChannels))
+        {
+            formattedChannels = ExtractAudioChannels(rawTitle);
+        }
+
         if (!string.IsNullOrWhiteSpace(rawTitle) &&
             !IsDuplicateTrackTitle(rawTitle, rawLanguage, languageLabel) &&
-            !string.Equals(rawTitle, "Surround 5.1", StringComparison.OrdinalIgnoreCase))
+            !IsAudioMetadataOnlyTitle(rawTitle, formattedCodec, formattedChannels))
         {
             displayParts.Add(rawTitle);
         }
@@ -35,8 +50,6 @@ public static class PlayerTrackDisplayNameFormatter
             : string.Join(" - ", displayParts);
 
         var metadataParts = new List<string>();
-        var formattedCodec = FormatCodec(codec);
-        var formattedChannels = FormatAudioChannels(audioChannels);
 
         if (!string.IsNullOrWhiteSpace(formattedCodec) && !string.IsNullOrWhiteSpace(formattedChannels))
         {
@@ -69,6 +82,66 @@ public static class PlayerTrackDisplayNameFormatter
         return metadataParts.Count == 0
             ? baseName
             : $"{baseName} ({string.Join(" / ", metadataParts)})";
+    }
+
+    private static bool IsAudioMetadataOnlyTitle(
+        string title,
+        string formattedCodec,
+        string formattedChannels)
+    {
+        var normalized = NormalizeAudioMetadataTitle(title);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return true;
+        }
+
+        if (string.Equals(normalized, "surround51", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var codecNormalized = NormalizeAudioMetadataTitle(formattedCodec);
+        var channelNormalized = NormalizeAudioMetadataTitle(formattedChannels);
+        var hasCodec = !string.IsNullOrWhiteSpace(codecNormalized) &&
+                       normalized.Contains(codecNormalized, StringComparison.OrdinalIgnoreCase);
+        var hasChannel = !string.IsNullOrWhiteSpace(channelNormalized) &&
+                         normalized.Contains(channelNormalized, StringComparison.OrdinalIgnoreCase);
+        if (hasCodec && (hasChannel || LooksLikeAudioCodecOnlyTitle(normalized)))
+        {
+            return true;
+        }
+
+        if (!RegexContainsAudioChannel(title))
+        {
+            return false;
+        }
+
+        var withoutChannel = Regex.Replace(
+            normalized,
+            @"(?:mono|stereo|channels?|ch|10|20|21|40|41|50|51|61|70|71|1|2|3|4|5|6|7|8)$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+        return LooksLikeAudioCodecOnlyTitle(withoutChannel);
+    }
+
+    private static bool LooksLikeAudioCodecOnlyTitle(string normalizedTitle)
+    {
+        return normalizedTitle is "dts" or "dtshd" or "dtshdma" or "dtshdmasteraudio"
+            or "truehd" or "truehdatmos" or "atmos" or "ac3" or "eac3" or "ddp"
+            or "dolbydigital" or "dolbydigitalplus" or "aac" or "flac" or "lpcm" or "pcm";
+    }
+
+    private static string NormalizeAudioMetadataTitle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return new string(value
+            .Where(static character => char.IsLetterOrDigit(character))
+            .Select(static character => char.ToLowerInvariant(character))
+            .ToArray());
     }
 
     private static bool IsDuplicateTrackTitle(string title, string language, string languageLabel)
@@ -227,15 +300,26 @@ public static class PlayerTrackDisplayNameFormatter
             return string.Empty;
         }
 
-        if (normalized.Contains("truehd", StringComparison.OrdinalIgnoreCase))
+        normalized = normalized
+            .Replace('_', '-')
+            .Replace('.', '-');
+
+        if (normalized.Contains("truehd", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("true-hd", StringComparison.OrdinalIgnoreCase))
         {
-            return "TrueHD Atmos";
+            return normalized.Contains("atmos", StringComparison.OrdinalIgnoreCase)
+                ? "TrueHD Atmos"
+                : "TrueHD";
         }
 
         if (normalized.Contains("dts-hd", StringComparison.OrdinalIgnoreCase) ||
-            normalized.Contains("dtshd", StringComparison.OrdinalIgnoreCase))
+            normalized.Contains("dtshd", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("dts hd", StringComparison.OrdinalIgnoreCase))
         {
-            return "DTS-HD MA";
+            return normalized.Contains("hra", StringComparison.OrdinalIgnoreCase) ||
+                   normalized.Contains("high resolution", StringComparison.OrdinalIgnoreCase)
+                ? "DTS-HD HRA"
+                : "DTS-HD MA";
         }
 
         if (normalized.Contains("dts", StringComparison.OrdinalIgnoreCase))
@@ -243,14 +327,19 @@ public static class PlayerTrackDisplayNameFormatter
             return "DTS";
         }
 
-        if (normalized.Contains("eac3", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("eac3", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("e-ac-3", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("ddp", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("dolby digital plus", StringComparison.OrdinalIgnoreCase))
         {
-            return "E-AC3";
+            return "Dolby Digital Plus (E-AC3)";
         }
 
-        if (normalized.Contains("ac3", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("ac3", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("ac-3", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("dolby digital", StringComparison.OrdinalIgnoreCase))
         {
-            return "Dolby AC3";
+            return "Dolby Digital (AC3)";
         }
 
         if (normalized.Contains("aac", StringComparison.OrdinalIgnoreCase))
@@ -261,6 +350,12 @@ public static class PlayerTrackDisplayNameFormatter
         if (normalized.Contains("flac", StringComparison.OrdinalIgnoreCase))
         {
             return "FLAC";
+        }
+
+        if (normalized.Contains("lpcm", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("pcm", StringComparison.OrdinalIgnoreCase))
+        {
+            return "LPCM";
         }
 
         if (normalized.Contains("pgs", StringComparison.OrdinalIgnoreCase))
@@ -290,11 +385,50 @@ public static class PlayerTrackDisplayNameFormatter
             return string.Empty;
         }
 
-        return normalized.ToLowerInvariant() switch
+        var lower = normalized.ToLowerInvariant();
+        lower = Regex.Replace(lower, @"\s*channels?\s*$", string.Empty, RegexOptions.IgnoreCase);
+        lower = Regex.Replace(lower, @"\s*ch\s*$", string.Empty, RegexOptions.IgnoreCase);
+        lower = Regex.Replace(lower, @"\s*\([^)]*\)\s*$", string.Empty, RegexOptions.IgnoreCase);
+        lower = lower.Trim();
+
+        return lower switch
         {
+            "1" => "1.0",
+            "2" => "2.0",
+            "3" => "2.1",
+            "4" => "4.0",
+            "5" => "5.0",
+            "6" => "5.1",
+            "7" => "6.1",
+            "8" => "7.1",
             "stereo" => "2.0",
             "mono" => "1.0",
-            _ => normalized
+            _ => Regex.IsMatch(lower, @"^\d(?:\.\d)?$", RegexOptions.IgnoreCase)
+                ? lower
+                : normalized
         };
+    }
+
+    private static string ExtractAudioChannels(string? value)
+    {
+        var text = value?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var match = Regex.Match(
+            text,
+            @"(?<!\d)(?<channels>[1-8](?:\.[01])?)(?:\s*(?:ch|channels?))?(?!\d)",
+            RegexOptions.IgnoreCase);
+        return match.Success ? FormatAudioChannels(match.Groups["channels"].Value) : string.Empty;
+    }
+
+    private static bool RegexContainsAudioChannel(string value)
+    {
+        return Regex.IsMatch(
+            value,
+            @"(?<!\d)[1-8](?:\.[01])?(?:\s*(?:ch|channels?))?(?!\d)|\b(?:mono|stereo)\b",
+            RegexOptions.IgnoreCase);
     }
 }

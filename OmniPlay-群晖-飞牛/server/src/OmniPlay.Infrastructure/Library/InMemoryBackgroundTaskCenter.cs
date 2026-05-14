@@ -135,7 +135,7 @@ public sealed class InMemoryBackgroundTaskCenter : IBackgroundTaskCenter
         }
         catch (Exception ex)
         {
-            MarkFailed(task.Status.Id, ex.Message);
+            MarkFailed(task.Status.Id, UserFacingErrorMessages.FromException(ex));
         }
         finally
         {

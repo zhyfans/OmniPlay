@@ -27,6 +27,7 @@ class MPVPlayerManager: ObservableObject {
     @Published var remainingTime: String = "00:00"
     @Published var currentSubtitleSize: Int = 16
     @Published var currentFilename: String = ""
+    @Published var currentPlaylistIndex: Int = 0
     @Published var audioTrackNames: [String] = ["默认音轨"]
     @Published var subtitleNames: [String] = ["默认字幕"]
     @Published var drawableBindVersion: Int = 0
@@ -324,6 +325,18 @@ class MPVPlayerManager: ObservableObject {
         mpv_set_option_string(mpv, "osc", "no")
         mpv_set_option_string(mpv, "osd-bar", "no")
         mpv_set_option_string(mpv, "osd-on-seek", "no")
+        // Intel macOS can kill LuaJIT executable pages from mpv's built-in Lua scripts with
+        // CODESIGNING Invalid Page. OmniPlay owns its playback UI, so disable those scripts.
+        mpv_set_option_string(mpv, "load-scripts", "no")
+        mpv_set_option_string(mpv, "load-stats-overlay", "no")
+        mpv_set_option_string(mpv, "load-osd-console", "no")
+        mpv_set_option_string(mpv, "load-console", "no")
+        mpv_set_option_string(mpv, "load-commands", "no")
+        mpv_set_option_string(mpv, "load-auto-profiles", "no")
+        mpv_set_option_string(mpv, "load-positioning", "no")
+        mpv_set_option_string(mpv, "load-select", "no")
+        mpv_set_option_string(mpv, "load-context-menu", "no")
+        mpv_set_option_string(mpv, "ytdl", "no")
         
         // 🌟 核心升级：接管默认轨道优先级逻辑
         let defaultAudio = UserDefaults.standard.string(forKey: "defaultAudio") ?? "auto"
@@ -439,6 +452,7 @@ class MPVPlayerManager: ObservableObject {
             DispatchQueue.main.async {
                 self.isPlaying = true
                 self.lastTrackCount = 0
+                self.currentPlaylistIndex = 0
             }
         }
     }
@@ -485,6 +499,21 @@ class MPVPlayerManager: ObservableObject {
             mpv_set_property(self.mpv, "pause", MPV_FORMAT_FLAG, &newPause)
             DispatchQueue.main.async {
                 self.isPlaying = (newPause == 0)
+            }
+        }
+    }
+
+    func setPaused(_ paused: Bool) {
+        guard !isStopping else { return }
+        DispatchQueue.main.async {
+            self.isPlaying = !paused
+        }
+        runOnControlQueue { [weak self] in
+            guard let self else { return }
+            var pause: Int32 = paused ? 1 : 0
+            mpv_set_property(self.mpv, "pause", MPV_FORMAT_FLAG, &pause)
+            DispatchQueue.main.async {
+                self.isPlaying = !paused
             }
         }
     }
@@ -649,6 +678,10 @@ class MPVPlayerManager: ObservableObject {
                 }
                 if let name = filename, name != self.currentFilename {
                     self.currentFilename = name
+                }
+                let resolvedPlaylistIndex = max(0, Int(playlistPos))
+                if resolvedPlaylistIndex != self.currentPlaylistIndex {
+                    self.currentPlaylistIndex = resolvedPlaylistIndex
                 }
                 if currentTrackCount > 0 && currentTrackCount != self.lastTrackCount {
                     self.lastTrackCount = currentTrackCount

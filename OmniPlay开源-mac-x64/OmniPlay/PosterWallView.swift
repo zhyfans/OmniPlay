@@ -327,88 +327,181 @@ struct PosterWallView: View {
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n----------------\n\n")
     }
+    private var topStatusMessage: String? {
+        if isProcessing {
+            return processingMessage.isEmpty ? "正在扫描媒体源..." : processingMessage
+        }
+        if !thumbManager.progressMessage.isEmpty {
+            return thumbManager.progressMessage
+        }
+        return nil
+    }
+
+    private var homeControlBar: some View {
+        HStack(spacing: 12) {
+            Group {
+                if let statusMessage = topStatusMessage {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(topToolbarStatusTextColor)
+                        Text(statusMessage)
+                            .font(.caption)
+                            .foregroundColor(topToolbarStatusTextColor)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: 280, alignment: .leading)
+                } else if !unifiedDiagnosticsText.isEmpty {
+                    Button(action: { copyLastDiagnosticsToPasteboard() }) {
+                        Label("扫描刮削日志", systemImage: "doc.text.magnifyingglass")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(topToolbarInactiveIconColor)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("toolbar.copyDiagnostics")
+                    .conditionalHelp("复制最近一次扫描失败或 WebDAV 预检失败的诊断信息", show: enableFastTooltip)
+                } else {
+                    Color.clear.frame(width: 1, height: 32)
+                }
+            }
+
+            Spacer()
+
+            HStack(spacing: 14) {
+                Button(action: { isShowingManageSources.toggle() }) {
+                    Image(systemName: "externaldrive.badge.plus")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(topToolbarInactiveIconColor)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("toolbar.addSource")
+                .conditionalHelp("管理已挂载目录、添加本地文件夹或 WebDAV 媒体源", show: enableFastTooltip)
+                .popover(isPresented: $isShowingManageSources, arrowEdge: .top) { folderMenuPanel }
+
+                Button(action: { triggerScanAndScrape() }) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(isProcessing ? topToolbarDisabledIconColor : topToolbarInactiveIconColor)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("toolbar.sync")
+                .disabled(isProcessing)
+                .conditionalHelp("重新扫描目录并刷新刮削结果", show: enableFastTooltip)
+
+                Button(action: { withAnimation { isHomeCacheModeActive.toggle() } }) {
+                    Image(systemName: isHomeCacheModeActive ? "icloud.fill" : "icloud")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(isHomeCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
+
+                Button(action: {
+                    settingsFocusTMDBApi = false
+                    showSettings = true
+                }) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(topToolbarInactiveIconColor)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("toolbar.settings")
+                .conditionalHelp("打开偏好设置", show: enableFastTooltip)
+            }
+        }
+        .padding(.top, 18)
+        .padding(.horizontal, 25)
+        .padding(.bottom, 8)
+    }
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .topTrailing) {
                 theme.background.ignoresSafeArea()
                 
-                ScrollView {
-                    if movies.isEmpty && continueWatchingMovies.isEmpty {
-                        VStack(spacing: 20) {
-                            Image(systemName: "film").font(.system(size: 60)).foregroundColor(.secondary)
-                            Text("媒体库空空如也，快去添加文件夹吧！").font(.title2).foregroundColor(.secondary)
-                        }.padding(.top, 150).frame(maxWidth: .infinity)
-                    } else {
-                        VStack(alignment: .leading, spacing: 30) {
-                            if !continueWatchingMovies.isEmpty {
-                                Text("继续播放")
-                                    .font(.title2).fontWeight(.bold)
-                                    .foregroundColor(theme.textPrimary)
-                                    .padding(.horizontal, 25).padding(.top, 20)
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 20) {
-                                        ForEach(continueWatchingMovies, id: \.id) { movie in
-                                            if isHomeCacheModeActive {
-                                                MovieCardView(
-                                                    movie: movie,
-                                                    isContinueWatchingContext: true,
-                                                    isHomeCacheModeActive: isHomeCacheModeActive
-                                                )
-                                                .frame(width: 160)
-                                            } else {
-                                                NavigationLink(destination: MovieDetailView(movie: movie)) {
-                                                    MovieCardView(movie: movie, isContinueWatchingContext: true).frame(width: 160)
+                VStack(spacing: 0) {
+                    homeControlBar
+                    ScrollView {
+                        if movies.isEmpty && continueWatchingMovies.isEmpty {
+                            VStack(spacing: 20) {
+                                Image(systemName: "film").font(.system(size: 60)).foregroundColor(.secondary)
+                                Text("媒体库空空如也，快去添加文件夹吧！").font(.title2).foregroundColor(.secondary)
+                            }.padding(.top, 150).frame(maxWidth: .infinity)
+                        } else {
+                            VStack(alignment: .leading, spacing: 30) {
+                                if !continueWatchingMovies.isEmpty {
+                                    Text("继续播放")
+                                        .font(.title2).fontWeight(.bold)
+                                        .foregroundColor(theme.textPrimary)
+                                        .padding(.horizontal, 25).padding(.top, 20)
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 20) {
+                                            ForEach(continueWatchingMovies, id: \.id) { movie in
+                                                if isHomeCacheModeActive {
+                                                    MovieCardView(
+                                                        movie: movie,
+                                                        isContinueWatchingContext: true,
+                                                        isHomeCacheModeActive: isHomeCacheModeActive
+                                                    )
+                                                    .frame(width: 160)
+                                                } else {
+                                                    NavigationLink(destination: MovieDetailView(movie: movie)) {
+                                                        MovieCardView(movie: movie, isContinueWatchingContext: true).frame(width: 160)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .focusable(false)
                                                 }
-                                                .buttonStyle(.plain)
-                                                .focusable(false)
                                             }
-                                        }
-                                    }.padding(.horizontal, 25)
-                                }
-                                Divider().background(theme.textSecondary.opacity(0.3)).padding(.vertical, 10)
-                            }
-                            HStack(spacing: 12) {
-                                Text("所有影视")
-                                    .font(.title2).fontWeight(.bold)
-                                    .foregroundColor(theme.textPrimary)
-                                Spacer().frame(width: 15)
-                                if isSearchActive {
-                                    TextField("搜索...", text: $searchText)
-                                        .textFieldStyle(.roundedBorder).frame(width: 160).transition(.opacity.combined(with: .move(edge: .trailing)))
-                                }
-                                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isSearchActive.toggle(); if !isSearchActive { searchText = "" } } }) {
-                                    Image(systemName: "magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(isSearchActive ? theme.accent : .secondary)
-                                }.buttonStyle(.plain)
-                                Menu {
-                                    Picker("", selection: $selectedSortOption) {
-                                        ForEach(MovieSortOption.allCases, id: \.self) { option in Text(option.rawValue).tag(option) }
-                                    }.labelsHidden().pickerStyle(.inline)
-                                } label: {
-                                    Image(systemName: "line.3.horizontal.decrease.circle").font(.system(size: 16, weight: .semibold)).foregroundColor(.secondary)
-                                }.menuStyle(.borderlessButton).fixedSize()
-                                Button(action: { withAnimation { isAscending.toggle() } }) {
-                                    Image(systemName: isAscending ? "arrow.up" : "arrow.down").font(.system(size: 14, weight: .bold)).foregroundColor(.secondary)
-                                }.buttonStyle(.plain)
-                                Spacer()
-                            }.padding(.horizontal, 25).padding(.top, 15)
-                            
-                            LazyVGrid(columns: columns, spacing: 30) {
-                                ForEach(displayedMovies, id: \.id) { movie in
-                                    if isHomeCacheModeActive {
-                                        MovieCardView(movie: movie, isHomeCacheModeActive: isHomeCacheModeActive)
-                                    } else {
-                                        NavigationLink(destination: MovieDetailView(movie: movie)) {
-                                            MovieCardView(movie: movie)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .focusable(false)
+                                        }.padding(.horizontal, 25)
                                     }
+                                    Divider().background(theme.textSecondary.opacity(0.3)).padding(.vertical, 10)
                                 }
-                            }.padding(.horizontal, 25).padding(.bottom, 25).animation(.easeInOut, value: displayedMovies.count)
+                                HStack(spacing: 12) {
+                                    Text("所有影视")
+                                        .font(.title2).fontWeight(.bold)
+                                        .foregroundColor(theme.textPrimary)
+                                    Spacer().frame(width: 15)
+                                    if isSearchActive {
+                                        TextField("搜索...", text: $searchText)
+                                            .textFieldStyle(.roundedBorder).frame(width: 160).transition(.opacity.combined(with: .move(edge: .trailing)))
+                                    }
+                                    Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isSearchActive.toggle(); if !isSearchActive { searchText = "" } } }) {
+                                        Image(systemName: "magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(isSearchActive ? theme.accent : .secondary)
+                                    }.buttonStyle(.plain)
+                                    Menu {
+                                        Picker("", selection: $selectedSortOption) {
+                                            ForEach(MovieSortOption.allCases, id: \.self) { option in Text(option.rawValue).tag(option) }
+                                        }.labelsHidden().pickerStyle(.inline)
+                                    } label: {
+                                        Image(systemName: "line.3.horizontal.decrease.circle").font(.system(size: 16, weight: .semibold)).foregroundColor(.secondary)
+                                    }.menuStyle(.borderlessButton).fixedSize()
+                                    Button(action: { withAnimation { isAscending.toggle() } }) {
+                                        Image(systemName: isAscending ? "arrow.up" : "arrow.down").font(.system(size: 14, weight: .bold)).foregroundColor(.secondary)
+                                    }.buttonStyle(.plain)
+                                    Spacer()
+                                }.padding(.horizontal, 25).padding(.top, 15)
+                                
+                                LazyVGrid(columns: columns, spacing: 30) {
+                                    ForEach(displayedMovies, id: \.id) { movie in
+                                        if isHomeCacheModeActive {
+                                            MovieCardView(movie: movie, isHomeCacheModeActive: isHomeCacheModeActive)
+                                        } else {
+                                            NavigationLink(destination: MovieDetailView(movie: movie)) {
+                                                MovieCardView(movie: movie)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .focusable(false)
+                                        }
+                                    }
+                                }.padding(.horizontal, 25).padding(.bottom, 25).animation(.easeInOut, value: displayedMovies.count)
+                            }
                         }
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
                 
                 if let cacheMessage = cacheManager.cacheStatusMessage {
                     Text(cacheMessage)
@@ -419,69 +512,12 @@ struct PosterWallView: View {
                         .background(.ultraThinMaterial)
                         .clipShape(Capsule())
                         .shadow(radius: 8)
-                        .padding(.top, 18)
+                        .padding(.top, 76)
                         .padding(.trailing, 18)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity).navigationTitle("我的觅影库")
-            .toolbar {
-                ToolbarItemGroup(placement: .navigation) {
-                    if isProcessing || !thumbManager.progressMessage.isEmpty {
-                        let statusMessage = isProcessing
-                            ? (processingMessage.isEmpty ? "正在扫描媒体源..." : processingMessage)
-                            : thumbManager.progressMessage
-                        HStack {
-                            ProgressView().controlSize(.small)
-                                .tint(topToolbarStatusTextColor)
-                            Text(statusMessage)
-                                .font(.caption)
-                                .foregroundColor(topToolbarStatusTextColor)
-                                .lineLimit(1)
-                                .frame(maxWidth: 200, alignment: .leading)
-                        }
-                    }
-                }
-                ToolbarItemGroup(placement: .primaryAction) {
-                    if !unifiedDiagnosticsText.isEmpty {
-                        Button(action: { copyLastDiagnosticsToPasteboard() }) {
-                            Label("复制诊断", systemImage: "doc.on.doc")
-                                .foregroundColor(topToolbarInactiveIconColor)
-                        }
-                        .accessibilityIdentifier("toolbar.copyDiagnostics")
-                        .conditionalHelp("复制最近一次扫描失败或 WebDAV 预检失败的诊断信息", show: enableFastTooltip)
-                    }
-                    
-                    Button(action: { isShowingManageSources.toggle() }) {
-                        Label("媒体源管理", systemImage: "externaldrive.badge.plus")
-                            .foregroundColor(topToolbarInactiveIconColor)
-                    }
-                        .accessibilityIdentifier("toolbar.addSource")
-                        .conditionalHelp("管理已挂载目录、添加本地文件夹或 WebDAV 媒体源", show: enableFastTooltip)
-                        .popover(isPresented: $isShowingManageSources, arrowEdge: .top) { folderMenuPanel }
-                    Button(action: { triggerScanAndScrape() }) {
-                        Label("同步", systemImage: "arrow.triangle.2.circlepath")
-                            .foregroundColor(isProcessing ? topToolbarDisabledIconColor : topToolbarInactiveIconColor)
-                    }
-                        .accessibilityIdentifier("toolbar.sync")
-                        .disabled(isProcessing)
-                        .conditionalHelp("重新扫描目录并刷新刮削结果", show: enableFastTooltip)
-                    Button(action: { withAnimation { isHomeCacheModeActive.toggle() } }) {
-                        Label("缓存模式", systemImage: isHomeCacheModeActive ? "icloud.fill" : "icloud")
-                            .foregroundColor(isHomeCacheModeActive ? theme.accent : topToolbarInactiveIconColor)
-                    }
-                    .conditionalHelp("切换离线缓存编辑模式", show: enableFastTooltip)
-                    Button(action: {
-                        settingsFocusTMDBApi = false
-                        showSettings = true
-                    }) {
-                        Label("设置", systemImage: "gearshape")
-                            .foregroundColor(topToolbarInactiveIconColor)
-                    }
-                        .accessibilityIdentifier("toolbar.settings")
-                        .conditionalHelp("打开偏好设置", show: enableFastTooltip)
-                }
-            }
             .alert("同步提示", isPresented: $isShowingScanSummaryAlert) {
                 Button("复制诊断信息") { copyLastDiagnosticsToPasteboard() }
                 Button("我知道了", role: .cancel) {}
@@ -530,6 +566,7 @@ struct PosterWallView: View {
         }
         .onAppear {
             loadData()
+            MacAppUpdateChecker.checkAtStartupIfNeeded()
             if ProcessInfo.processInfo.environment["UITEST_OPEN_WEBDAV_SHEET"] == "1" {
                 resetWebDAVDraft(useRecentHistory: false)
                 isShowingAddWebDAVSheet = true

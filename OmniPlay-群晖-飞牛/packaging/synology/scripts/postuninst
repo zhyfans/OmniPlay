@@ -1,2 +1,8 @@
 #!/bin/sh
+
+PACKAGE="OmniPlay"
+APP_ROOT="/var/packages/${PACKAGE}/home"
+
+rm -f "${APP_ROOT}/omniplay.pid"
+
 exit 0

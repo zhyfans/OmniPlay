@@ -9,6 +9,7 @@ public sealed record LibraryItemDetail(
     string? PosterAssetId,
     double? VoteAverage,
     bool IsLocked,
+    bool IsWatched,
     int VideoFileCount,
     double MaxProgressSeconds,
     double MaxDurationSeconds,

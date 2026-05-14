@@ -61,6 +61,24 @@ public sealed class BackgroundTaskCenterTests
         Assert.Equal("canceled", snapshot.Tasks[0].State);
     }
 
+    [Fact]
+    public async Task TryStartExclusiveLocalizesUnexpectedEofFailures()
+    {
+        var center = new InMemoryBackgroundTaskCenter();
+
+        Assert.True(center.TryStartExclusive(
+            "scan",
+            "扫描媒体库",
+            (_, _, _) => throw new IOException("Received an unexpected EOF or 0 bytes from the transport stream."),
+            onAccepted: null,
+            out _));
+
+        var snapshot = await WaitForSnapshotAsync(center, static next => next.ActiveTask is null);
+
+        Assert.Equal("failed", snapshot.Tasks[0].State);
+        Assert.Contains("网络连接提前断开", snapshot.Tasks[0].ErrorMessage);
+    }
+
     private static async Task<BackgroundTaskSnapshot> WaitForSnapshotAsync(
         InMemoryBackgroundTaskCenter center,
         Func<BackgroundTaskSnapshot, bool> predicate)

@@ -20,6 +20,48 @@ public sealed class PlayerTrackDisplayNameFormatterTests
     }
 
     [Fact]
+    public void Format_NormalizesNumericAudioChannels()
+    {
+        var displayName = PlayerTrackDisplayNameFormatter.Format(
+            "音轨",
+            3,
+            title: null,
+            language: "eng",
+            codec: "dts",
+            audioChannels: "6");
+
+        Assert.Equal("🇺🇸 英语 (DTS 5.1)", displayName);
+    }
+
+    [Fact]
+    public void Format_UsesAudioMetadataTitleAsCodecHintWithoutDuplicatingIt()
+    {
+        var displayName = PlayerTrackDisplayNameFormatter.Format(
+            "音轨",
+            4,
+            "DTS 6",
+            language: null,
+            codec: null,
+            audioChannels: null);
+
+        Assert.Equal("音轨 4 (DTS 5.1)", displayName);
+    }
+
+    [Fact]
+    public void Format_PrefersDetailedCodecFromTrackTitle()
+    {
+        var displayName = PlayerTrackDisplayNameFormatter.Format(
+            "音轨",
+            5,
+            "DTS-HD Master Audio 7.1",
+            "jpn",
+            "dts",
+            "8");
+
+        Assert.Equal("🇯🇵 日语 (DTS-HD MA 7.1)", displayName);
+    }
+
+    [Fact]
     public void Format_BuildsMacStyleSubtitleTrackName()
     {
         var displayName = PlayerTrackDisplayNameFormatter.Format(

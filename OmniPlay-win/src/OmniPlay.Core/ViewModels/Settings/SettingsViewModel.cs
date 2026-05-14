@@ -19,6 +19,7 @@ public partial class SettingsViewModel : ObservableObject
     private const string GitHubRepositoryUrl = "https://github.com/nandieling/OmniPlay";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/nandieling/OmniPlay/releases/latest";
     private const string GitHubLatestReleaseUrl = "https://github.com/nandieling/OmniPlay/releases/latest";
+    private static readonly TimeSpan AutomaticUpdateCheckInterval = TimeSpan.FromHours(24);
 
     private static readonly IReadOnlyList<AppCreditLinkItem> BuiltInCreditLinks =
     [
@@ -65,6 +66,7 @@ public partial class SettingsViewModel : ObservableObject
     private readonly string thirdPartyNoticesPath;
     private bool loaded;
     private bool suppressOptionSelectionChange;
+    private DateTimeOffset? lastUpdateCheckAt;
 
     public SettingsViewModel(
         ISettingsService settingsService,
@@ -147,7 +149,16 @@ public partial class SettingsViewModel : ObservableObject
     private bool autoScanOnStartup = true;
 
     [ObservableProperty]
+    private bool autoCheckUpdatesOnStartup = true;
+
+    [ObservableProperty]
     private bool showMediaSourceRealPath = true;
+
+    [ObservableProperty]
+    private string librarySortOption = LibraryViewSettings.SortOptionTitle;
+
+    [ObservableProperty]
+    private bool librarySortDescending;
 
     [ObservableProperty]
     private string offlineCacheDirectory = string.Empty;
@@ -229,7 +240,14 @@ public partial class SettingsViewModel : ObservableObject
         return new AppSettings
         {
             AutoScanOnStartup = AutoScanOnStartup,
+            AutoCheckUpdatesOnStartup = AutoCheckUpdatesOnStartup,
+            LastUpdateCheckAt = lastUpdateCheckAt,
             ShowMediaSourceRealPath = ShowMediaSourceRealPath,
+            LibraryView = new LibraryViewSettings
+            {
+                SortOption = NormalizeLibrarySortOption(LibrarySortOption),
+                SortDescending = LibrarySortDescending
+            },
             OfflineCacheDirectory = OfflineCacheDirectory.Trim(),
             Tmdb = BuildTmdbSettings(),
             LocalMetadata = BuildLocalMetadataSettings(),
@@ -305,6 +323,17 @@ public partial class SettingsViewModel : ObservableObject
         }
     }
 
+    public async Task SaveLibraryViewPreferencesAsync(
+        string sortOption,
+        bool sortDescending,
+        CancellationToken cancellationToken = default)
+    {
+        LibrarySortOption = NormalizeLibrarySortOption(sortOption);
+        LibrarySortDescending = sortDescending;
+        await settingsService.SaveAsync(BuildAppSettings(), cancellationToken);
+        loaded = true;
+    }
+
     private async Task TestTmdbConnectionAsync()
     {
         IsBusy = true;
@@ -331,6 +360,43 @@ public partial class SettingsViewModel : ObservableObject
     private async Task InstallLatestUpdateAsync()
     {
         await CheckForUpdatesCoreAsync(install: true);
+    }
+
+    public async Task CheckForUpdatesOnStartupIfNeededAsync(CancellationToken cancellationToken = default)
+    {
+        if (!AutoCheckUpdatesOnStartup)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (lastUpdateCheckAt.HasValue &&
+            now >= lastUpdateCheckAt.Value &&
+            now - lastUpdateCheckAt.Value < AutomaticUpdateCheckInterval)
+        {
+            return;
+        }
+
+        try
+        {
+            lastUpdateCheckAt = now;
+            await settingsService.SaveAsync(BuildAppSettings(), cancellationToken);
+
+            var release = await FetchLatestGitHubReleaseAsync(cancellationToken);
+            if (release is null)
+            {
+                return;
+            }
+
+            var isNewer = IsVersionNewer(release.TagName, AppVersionText);
+            UpdateStatusMessage = isNewer
+                ? $"后台自动检查发现新版本 {release.TagName}，可点击“直接更新”。"
+                : $"最近自动检查：当前已是最新版本（{AppVersionText}）。";
+        }
+        catch
+        {
+            // 启动时检查只做静默提示，网络失败不打扰用户。
+        }
     }
 
     private async Task CheckForUpdatesCoreAsync(bool install)
@@ -453,8 +519,13 @@ public partial class SettingsViewModel : ObservableObject
 
     private void Apply(AppSettings settings)
     {
+        var libraryView = settings.LibraryView ?? new LibraryViewSettings();
         AutoScanOnStartup = settings.AutoScanOnStartup;
+        AutoCheckUpdatesOnStartup = settings.AutoCheckUpdatesOnStartup;
+        lastUpdateCheckAt = settings.LastUpdateCheckAt;
         ShowMediaSourceRealPath = settings.ShowMediaSourceRealPath;
+        LibrarySortOption = NormalizeLibrarySortOption(libraryView.SortOption);
+        LibrarySortDescending = libraryView.SortDescending;
         OfflineCacheDirectory = settings.OfflineCacheDirectory ?? string.Empty;
         EnableLocalMetadataImport = settings.LocalMetadata.EnableLocalMetadataImport;
         EnableLocalMetadataExport = settings.LocalMetadata.EnableLocalMetadataExport;
@@ -518,6 +589,22 @@ public partial class SettingsViewModel : ObservableObject
             "en" or "en-us" => "en-US",
             "zh" or "zh-cn" or "zh-hans" or "zh-hans-cn" => "zh-CN",
             _ => DefaultTmdbLanguage
+        };
+    }
+
+    private static string NormalizeLibrarySortOption(string? value)
+    {
+        var normalized = value?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return LibraryViewSettings.SortOptionTitle;
+        }
+
+        return normalized.ToLowerInvariant() switch
+        {
+            "year" or "年份" => LibraryViewSettings.SortOptionYear,
+            "rating" or "score" or "评分" => LibraryViewSettings.SortOptionRating,
+            _ => LibraryViewSettings.SortOptionTitle
         };
     }
 
@@ -594,19 +681,19 @@ public partial class SettingsViewModel : ObservableObject
         InstallLatestUpdateCommand.NotifyCanExecuteChanged();
     }
 
-    private static async Task<GitHubRelease?> FetchLatestGitHubReleaseAsync()
+    private static async Task<GitHubRelease?> FetchLatestGitHubReleaseAsync(CancellationToken cancellationToken = default)
     {
         using var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd("OmniPlay-Windows");
-        using var response = await client.GetAsync(GitHubLatestReleaseApiUrl);
+        using var response = await client.GetAsync(GitHubLatestReleaseApiUrl, cancellationToken);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
             return null;
         }
 
         response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync();
-        using var document = await JsonDocument.ParseAsync(stream);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
         var root = document.RootElement;
         var assets = new List<GitHubAsset>();
         if (root.TryGetProperty("assets", out var assetsElement) &&

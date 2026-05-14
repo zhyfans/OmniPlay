@@ -1439,13 +1439,16 @@ struct PlayerScreen: View {
             }
         }
         .onChange(of: showControls) { _, isVisible in setCursorHidden(!isVisible) }
-        .onChange(of: playerManager.currentFilename) { _, newName in
-             guard let oldId = currentVideoFileId else { return }
-             guard let newIndex = allPlaylistFiles.firstIndex(where: { playbackFilename(newName, matches: $0) }) else { return }
-             let newFile = allPlaylistFiles[newIndex]
-             guard oldId != newFile.id else { return }
-             persistFinishedPlaylistFiles(finishedPlaylistFileIds(before: newIndex, previousFileId: oldId))
-             currentVideoFileId = newFile.id
+        .onChange(of: playerManager.currentPlaylistIndex) { _, newIndex in
+            guard allPlaylistFiles.indices.contains(newIndex) else { return }
+            guard let oldId = currentVideoFileId else {
+                currentVideoFileId = allPlaylistFiles[newIndex].id
+                return
+            }
+            let newFile = allPlaylistFiles[newIndex]
+            guard oldId != newFile.id else { return }
+            persistFinishedPlaylistFiles(finishedPlaylistFileIds(before: newIndex, previousFileId: oldId))
+            currentVideoFileId = newFile.id
         }
     }
     
@@ -1608,7 +1611,7 @@ struct PlayerScreen: View {
             do {
                 print("[PlayerScreen] prepare DB snapshot start")
                 let snapshot: (files: [VideoFile], sourceBasePath: String, sourceProtocolType: String, sourceAuthConfig: String?, startIndex: Int)? = try await dbQueue.read { db in
-                    let fetchedFiles = try movieValue.request(for: Movie.videoFiles).fetchAll(db)
+                    let fetchedFiles = try VideoFile.fetchVisibleFiles(movieId: movieValue.id, in: db)
                     let files = fetchedFiles.enumerated().sorted {
                         MediaNameParser.episodeSortKey(for: $0.element.fileName, fallbackIndex: $0.offset) <
                         MediaNameParser.episodeSortKey(for: $1.element.fileName, fallbackIndex: $1.offset)
@@ -1732,12 +1735,12 @@ struct PlayerScreen: View {
     }
 
     private func resolvedPlaybackFileIndex(from snapshot: MPVPlayerManager.PlaybackEngineSnapshot) -> Int? {
+        if allPlaylistFiles.indices.contains(snapshot.playlistIndex) {
+            return snapshot.playlistIndex
+        }
         if let filename = snapshot.filename,
            let filenameIndex = allPlaylistFiles.firstIndex(where: { playbackFilename(filename, matches: $0) }) {
             return filenameIndex
-        }
-        if allPlaylistFiles.indices.contains(snapshot.playlistIndex) {
-            return snapshot.playlistIndex
         }
         if let currentVideoFileId {
             return allPlaylistFiles.firstIndex(where: { $0.id == currentVideoFileId })

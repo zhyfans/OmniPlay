@@ -308,6 +308,29 @@ public sealed class PlayerViewModelTests
     }
 
     [Fact]
+    public async Task DefaultSubtitleTrack_FallsBackToLastSubtitleWhenLanguageUnknown()
+    {
+        var mediaPlayer = new RecordingMediaPlayer
+        {
+            SubtitleTracks =
+            [
+                new PlayerTrackInfo("sub", 3, "Track 1", false, false, ""),
+                new PlayerTrackInfo("sub", 4, "Track 2", false, false, "")
+            ]
+        };
+        var viewModel = new PlayerViewModel(mediaPlayer);
+        viewModel.ConfigureDefaultTracks("auto", "chi");
+
+        await viewModel.OpenAsync("sample.mkv");
+        await Task.Delay(50);
+
+        Assert.Equal(4, viewModel.SelectedSubtitleTrack?.TrackId);
+        Assert.Equal(4, mediaPlayer.LastSelectedSubtitleTrackId);
+
+        await viewModel.StopAsync();
+    }
+
+    [Fact]
     public async Task LoadExternalSubtitleCommand_LoadsSubtitleAndRefreshesTracks()
     {
         var subtitlePath = Path.Combine(Path.GetTempPath(), $"omniplay-sub-{Guid.NewGuid():N}.srt");

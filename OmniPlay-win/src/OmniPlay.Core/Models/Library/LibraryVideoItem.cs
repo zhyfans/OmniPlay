@@ -74,8 +74,8 @@ public sealed class LibraryVideoItem
 
             var seasonText = SeasonNumber == 0
                 ? "\u7279\u522B\u7BC7"
-                : $"\u7B2C {SeasonNumber} \u5B63";
-            return $"{seasonText} \u7B2C {EpisodeNumber} \u96C6";
+                : $"\u7B2C{SeasonNumber}\u5B63";
+            return $"{seasonText}\u7B2C{EpisodeNumber}\u96C6";
         }
     }
 

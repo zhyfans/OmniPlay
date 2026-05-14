@@ -340,7 +340,7 @@ OmniPlay.spk
 飞牛端默认端口建议避开系统 HTTP/HTTPS 端口：
 
 ```text
-OmniPlay Web/API: 8096 或 45721
+OmniPlay Web/API: 45721
 ```
 
 实际端口最终由安装向导或配置文件决定。
@@ -2310,7 +2310,7 @@ web/dist/assets/index-DDlV7SOH.js
 - 已新增可执行打包入口 `scripts/package-synology.sh`，内部调用 `scripts/package-synology.mjs` 组装 SPK。
 - 打包器支持 `x64` 和 `arm64` 参数，分别映射到 .NET RID `linux-x64` / `linux-arm64` 与 DSM 架构 `x86_64` / `aarch64`。
 - 打包流程会先构建 Web UI，再从 Release 自包含发布目录复制服务端 payload，并用最新 `web/dist` 覆盖 payload 内的 `wwwroot`，最后生成 DSM 需要的 `INFO`、`package.tgz`、`scripts`、`conf` 和套件图标。
-- SPK 安装后的服务默认监听 `http://0.0.0.0:8096`，运行数据目录为 `/var/packages/OmniPlay/home`。
+- SPK 安装后的服务默认监听 `http://0.0.0.0:45721`，运行数据目录为 `/var/packages/OmniPlay/home`。
 - DSM 启停脚本已补齐 `start`、`stop`、`restart`、`status`、`log`，启动时会创建 `data`、`cache`、`logs`、`settings` 目录，并写入 PID 文件。
 - 打包输出已加入 `dist/synology/`，构建中间产物已加入 `build/` 忽略规则。
 - 已生成 x64 测试包 `dist/synology/OmniPlay-0.1.0-0001-x86_64.spk` 和 `dist/synology/OmniPlay-0.1.0-0001-x86_64.spk.sha256`。
@@ -2371,7 +2371,7 @@ wwwroot/assets/index-DDlV7SOH.js
 - SPK 尚未在 DSM 7 实机安装验证，`INFO` 架构字段和 DSM 权限模型仍需实机校正。
 - 尚未加入 DSM 安装向导、端口冲突提示、反向代理向导和套件签名。
 - 当前只生成了 x64 包；arm64 需要先执行对应 RID 的直接发布，再运行 `./scripts/package-synology.sh arm64`。
-- 当前包默认监听 8096，尚未接入 DSM 套件中心里的端口配置页面。
+- 当前包默认监听 45721，尚未接入 DSM 套件中心里的端口配置页面。
 
 ## 60. DSM 7.2.2 SPK 格式修复当前状态
 
@@ -2481,3 +2481,114 @@ cat /etc.defaults/VERSION
 tail -n 200 /var/log/messages | grep -i synopkg
 tail -n 200 /var/log/synopkg.log
 ```
+
+## 62. 阶段 6 Docker / fnOS 验证链路当前状态
+
+更新时间：2026-05-11
+
+已完成 Docker / fnOS 验证链路第一阶段：
+
+- 已新增 `scripts/package-docker.sh`，支持 `x64` 和 `arm64`，分别发布 `linux-x64` / `linux-arm64` 服务端 payload。
+- Docker 打包脚本会先构建 Web UI，再执行 `dotnet publish`，并将 `web/dist` 写入发布目录 `wwwroot`。
+- `packaging/docker/Dockerfile` 已补齐运行期 `ffmpeg`、`ffprobe`、CA 证书和时区数据，镜像内默认使用 `/usr/bin/ffmpeg` 和 `/usr/bin/ffprobe`。
+- `packaging/docker/compose.yml` 已加入 `restart: unless-stopped`、`TZ` 和项目级数据目录挂载，默认将数据保存到 `OmniPlay-群晖-飞牛/data`。
+- 已新增 `docs/PACKAGE_GUIDE_DOCKER.md`，记录 Docker 构建、运行、Compose 和 fnOS Docker 验证方式。
+- `scripts/package-fnos.sh` 现在先构建 `omniplay-fnos:dev` Docker 验证镜像，原生 `.fpk` 仍保持薄封装策略，等待官方 manifest / 签名规范确认。
+
+当前构建方式：
+
+```text
+./scripts/package-docker.sh x64
+IMAGE=omniplay-nas:arm64 ./scripts/package-docker.sh arm64
+IMAGE=omniplay-fnos:dev ./scripts/package-fnos.sh x64
+```
+
+当前限制：
+
+- Docker 镜像构建依赖基础镜像和 apt 软件源网络可用。
+- 目前镜像使用框架依赖发布，需要运行时基础镜像版本与 `net10.0` 匹配。
+- fnOS 原生 `.fpk` 尚未实现，仍需以官方开放平台当前规范校正 manifest、权限、端口和签名流程。
+
+## 63. 阶段 5 Synology 端口入口和升级链路当前状态
+
+更新时间：2026-05-11
+
+针对 DSM 套件可安装但“看不到端口、没有一键打开网页”的问题，已补齐 Synology 套件元数据和升级生命周期脚本：
+
+- `INFO` 已新增 `adminprotocol="http"`、`adminport="45721"` 和 `adminurl="/"`，用于 DSM 套件中心显示打开入口。
+- 已新增 `conf/resource`，声明 `port-config` 资源文件。
+- 已新增 `port_conf/OmniPlay.sc`，声明 `45721/tcp` 为 OmniPlay Web/API 端口，供 DSM 防火墙/端口资源识别。
+- 打包器会把 `conf/resource` 放入外层 SPK，并把 `port_conf/OmniPlay.sc` 放入内层 `package.tgz`。
+- `start-stop-status` 已支持 `SYNOPKG_PKGPORT` / `OMNIPLAY_PORT`，默认仍使用 `45721`。
+- `postinst` 会创建 `home/data`、`home/cache`、`home/logs`、`home/settings`，并记录安装版本。
+- `preupgrade` 会停止旧服务，`postupgrade` 会复建运行目录、清理旧 PID 并记录升级后版本。
+- `preuninst` 会停止服务，`postuninst` 会清理 PID 文件；不主动删除 `home` 下数据库、设置和缓存，避免升级链路误删数据。
+
+需要重新打包并在 DSM 实机验证：
+
+```text
+./scripts/package-synology.sh x64
+```
+
+DSM 实机验证重点：
+
+1. 套件中心是否显示 OmniPlay 的网页打开按钮。
+2. 套件详情或防火墙端口资源是否能看到 `45721/tcp`。
+3. 点击打开后是否进入 `http://NAS_IP:45721/`。
+4. 覆盖安装新 SPK 后，数据库、设置、海报缓存是否仍保留。
+5. 升级后服务是否能正常启动、停止、重启。
+
+当前限制：
+
+- `adminport` 仍是固定 `45721`，尚未做 DSM 安装向导中的自定义端口输入。
+- 一键打开按钮和端口展示依赖 DSM 对 `INFO` 与 `port-config` 的实际解析，仍需 DSM 7 实机回归确认。
+
+## 64. 阶段 5 DSM IPv6 打开入口修复当前状态
+
+更新时间：2026-05-11
+
+用户反馈套件中心能看到端口，但“一键打开网页”在 IPv6 环境下被 DSM 拼成错误地址：
+
+```text
+http://[240e:45721/
+```
+
+已做修复：
+
+- `INFO` 已新增 `dsmuidir="ui"` 和 `dsmappname="com.omniplay.nas"`，让 DSM 优先使用套件 UI 入口。
+- 已新增 `packaging/synology/ui/config`，定义 DSM 桌面 / 套件 UI URL 应用入口。
+- 已新增 `packaging/synology/ui/redirect.html`，由浏览器端读取 `window.location.hostname` 并在 IPv6 主机名外补齐方括号，再跳转到 `http://<host>:45721/`。
+- 打包器会把 `ui/config`、`ui/redirect.html` 和多尺寸 `ui/images/omniplay_*.png` 写入内层 `package.tgz`。
+- 继续保留 `adminport="45721"` 和 `port_conf/OmniPlay.sc`，用于 DSM 展示端口和防火墙端口资源；打开动作改由 DSM UI 跳转页兜底。
+
+需要重新安装或覆盖升级后验证：
+
+1. 套件中心点击打开时不再出现 `http://[240e:45721/`。
+2. IPv6 访问 DSM 时，跳转目标应类似 `http://[240e:...]:45721/`。
+3. IPv4 / 主机名访问 DSM 时，跳转目标应类似 `http://NAS_IP:45721/` 或 `http://hostname:45721/`。
+
+当前限制：
+
+- 跳转页端口仍固定为 `45721`，后续如果加入 DSM 安装向导自定义端口，需要同步生成 `redirect.html` 或让服务端提供 DSM 入口跳转配置。
+
+## 65. 阶段 5 Synology 默认端口调整当前状态
+
+更新时间：2026-05-11
+
+用户反馈 `8096` 容易和 Jellyfin / Emby 等媒体服务重复。Synology 套件默认端口已统一改为 `45721`：
+
+- `INFO` 的 `adminport` 已改为 `45721`。
+- `port_conf/OmniPlay.sc` 已改为声明 `45721/tcp`。
+- `start-stop-status` 默认监听端口已改为 `45721`，仍支持 `SYNOPKG_PKGPORT` / `OMNIPLAY_PORT` 覆盖。
+- DSM UI 跳转页已改为跳转 `http://<host>:45721/`，IPv6 场景继续自动补方括号。
+- SPK payload 说明中的默认监听地址已同步为 `http://0.0.0.0:45721`。
+
+升级验证重点：
+
+1. 覆盖升级后旧的 `8096` 进程应停止，新服务监听 `45721`。
+2. DSM 套件中心端口展示应为 `45721/tcp`。
+3. 一键打开入口应跳转到 `http://NAS_IP:45721/` 或 `http://[IPv6]:45721/`。
+
+当前限制：
+
+- 端口仍是固定默认值，不是安装向导可配置项。

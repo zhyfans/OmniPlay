@@ -9,6 +9,7 @@ struct SettingsView: View {
     // 绑定全局持久化设置
     @AppStorage("keepLocalPosters") var keepLocalPosters = true
     @AppStorage("autoScanOnStartup") var autoScanOnStartup = true
+    @AppStorage("autoCheckUpdatesOnStartup") var autoCheckUpdatesOnStartup = true
     @AppStorage("enableFastTooltip") var enableFastTooltip = true
     @AppStorage("showMediaSourceRealPath") var showMediaSourceRealPath = true
     @AppStorage("removeWebDAVCredentialsOnDelete") var removeWebDAVCredentialsOnDelete = false
@@ -56,6 +57,45 @@ struct SettingsView: View {
             Divider()
             
             Form {
+                Section(header: Text("软件更新").font(.headline)) {
+                    HStack(spacing: 8) {
+                        Text("当前版本")
+                        Text(currentAppVersion)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer(minLength: 0)
+                    }
+
+                    Toggle("启动时自动检查更新", isOn: $autoCheckUpdatesOnStartup)
+
+                    HStack(spacing: 10) {
+                        Button(action: { checkForUpdates(install: false) }) {
+                            if isCheckingForUpdate {
+                                ProgressView().controlSize(.small).frame(width: 52)
+                            } else {
+                                Text("检查更新")
+                            }
+                        }
+                        .disabled(isCheckingForUpdate)
+
+                        Button("直接更新") {
+                            checkForUpdates(install: true)
+                        }
+                        .disabled(isCheckingForUpdate)
+
+                        Button("打开 GitHub 仓库") {
+                            openExternalURL(githubRepositoryURL)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(theme.accent)
+
+                    if !updateStatusMessage.isEmpty {
+                        Text(updateStatusMessage)
+                            .font(.caption)
+                            .foregroundColor(updateStatusColor)
+                    }
+                }
+
                 Section(header: Text("基础设置").font(.headline)) {
                     Toggle("启动时自动扫描并同步库", isOn: $autoScanOnStartup)
                     Toggle("删除文件夹时保留本地缓存海报", isOn: $keepLocalPosters)
@@ -98,43 +138,6 @@ struct SettingsView: View {
                         .font(.caption).foregroundColor(theme.textSecondary)
                 }
 
-                Section(header: Text("软件更新").font(.headline).padding(.top, 10)) {
-                    HStack(spacing: 8) {
-                        Text("当前版本")
-                        Text(currentAppVersion)
-                            .foregroundColor(theme.textSecondary)
-                        Spacer(minLength: 0)
-                    }
-
-                    HStack(spacing: 10) {
-                        Button(action: { checkForUpdates(install: false) }) {
-                            if isCheckingForUpdate {
-                                ProgressView().controlSize(.small).frame(width: 52)
-                            } else {
-                                Text("检查更新")
-                            }
-                        }
-                        .disabled(isCheckingForUpdate)
-
-                        Button("直接更新") {
-                            checkForUpdates(install: true)
-                        }
-                        .disabled(isCheckingForUpdate)
-
-                        Button("打开 GitHub 仓库") {
-                            openExternalURL(githubRepositoryURL)
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(theme.accent)
-
-                    if !updateStatusMessage.isEmpty {
-                        Text(updateStatusMessage)
-                            .font(.caption)
-                            .foregroundColor(updateStatusColor)
-                    }
-                }
-                
                 Section(header: Text("外观与主题").font(.headline).padding(.top, 10)) {
                     Picker("应用主题配色", selection: $appTheme) {
                         ForEach(ThemeType.allCases) { themeItem in
@@ -252,6 +255,7 @@ struct SettingsView: View {
             OpenSourceInfoSheet(theme: theme)
         }
         .onAppear {
+            restoreAutomaticUpdateStatusIfAvailable()
             guard focusTMDBApi else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 isTMDBApiFocused = true
@@ -272,6 +276,15 @@ struct SettingsView: View {
         return (info?["CFBundleShortVersionString"] as? String)
             ?? (info?["CFBundleVersion"] as? String)
             ?? "dev"
+    }
+
+    private func restoreAutomaticUpdateStatusIfAvailable() {
+        guard updateStatusMessage.isEmpty,
+              let message = MacAppUpdateChecker.cachedAutomaticUpdateMessage(currentVersion: currentAppVersion) else {
+            return
+        }
+        updateStatusMessage = message
+        updateStatusColor = .orange
     }
     
     private func validateTMDBApi() {
@@ -437,5 +450,97 @@ struct SettingsView: View {
     private func openExternalURL(_ value: String) {
         guard let url = URL(string: value) else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+enum MacAppUpdateChecker {
+    private static let autoCheckKey = "autoCheckUpdatesOnStartup"
+    private static let lastCheckKey = "lastAutomaticUpdateCheckAt"
+    private static let detectedVersionKey = "lastDetectedUpdateVersion"
+    private static let detectedReleaseURLKey = "lastDetectedUpdateReleaseURL"
+    private static let automaticCheckInterval: TimeInterval = 24 * 60 * 60
+
+    static func checkAtStartupIfNeeded() {
+        let defaults = UserDefaults.standard
+        let isEnabled = defaults.object(forKey: autoCheckKey) as? Bool ?? true
+        guard isEnabled else { return }
+        guard ProcessInfo.processInfo.environment["UITEST_MODE"] != "1" else { return }
+
+        let now = Date().timeIntervalSince1970
+        let lastCheck = defaults.double(forKey: lastCheckKey)
+        guard lastCheck <= 0 || now - lastCheck >= automaticCheckInterval else { return }
+
+        defaults.set(now, forKey: lastCheckKey)
+        Task.detached(priority: .background) {
+            do {
+                let release = try await fetchLatestRelease()
+                let currentVersion = currentAppVersion()
+                await MainActor.run {
+                    let defaults = UserDefaults.standard
+                    if isVersion(release.tagName, newerThan: currentVersion) {
+                        defaults.set(release.tagName, forKey: detectedVersionKey)
+                        defaults.set(release.htmlURL, forKey: detectedReleaseURLKey)
+                    } else {
+                        defaults.removeObject(forKey: detectedVersionKey)
+                        defaults.removeObject(forKey: detectedReleaseURLKey)
+                    }
+                }
+            } catch {
+                // 启动时检查只做静默提示，网络失败不打扰用户。
+            }
+        }
+    }
+
+    static func cachedAutomaticUpdateMessage(currentVersion: String) -> String? {
+        let defaults = UserDefaults.standard
+        guard let version = defaults.string(forKey: detectedVersionKey),
+              isVersion(version, newerThan: currentVersion) else {
+            return nil
+        }
+        return "后台自动检查发现新版本 \(version)，可点击“直接更新”。"
+    }
+
+    nonisolated private static func fetchLatestRelease() async throws -> (tagName: String, htmlURL: String) {
+        guard let url = URL(string: "https://api.github.com/repos/nandieling/OmniPlay/releases/latest") else { return ("", "") }
+        var request = URLRequest(url: url)
+        request.setValue("OmniPlay", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+            return ("", "https://github.com/nandieling/OmniPlay")
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ("", "")
+        }
+        return (
+            (object["tag_name"] as? String) ?? "",
+            (object["html_url"] as? String) ?? "https://github.com/nandieling/OmniPlay/releases/latest"
+        )
+    }
+
+    nonisolated private static func currentAppVersion() -> String {
+        let info = Bundle.main.infoDictionary
+        return (info?["CFBundleShortVersionString"] as? String)
+            ?? (info?["CFBundleVersion"] as? String)
+            ?? "dev"
+    }
+
+    nonisolated private static func isVersion(_ candidate: String, newerThan current: String) -> Bool {
+        let lhs = versionParts(candidate)
+        let rhs = versionParts(current)
+        guard !lhs.isEmpty else { return false }
+        let count = max(lhs.count, rhs.count)
+        for index in 0..<count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left > right }
+        }
+        return false
+    }
+
+    nonisolated private static func versionParts(_ value: String) -> [Int] {
+        value.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "v "))
+            .split { !$0.isNumber }
+            .compactMap { Int($0) }
     }
 }

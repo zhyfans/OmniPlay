@@ -5,8 +5,165 @@ APP_DIR="/var/packages/${PACKAGE}/target"
 APP_ROOT="/var/packages/${PACKAGE}/home"
 PID_FILE="${APP_ROOT}/omniplay.pid"
 LOG_FILE="${APP_ROOT}/logs/server.log"
-URLS="${OMNIPLAY_URLS:-http://0.0.0.0:8096}"
+PORT="${SYNOPKG_PKGPORT:-${OMNIPLAY_PORT:-45721}}"
+URLS="${OMNIPLAY_URLS:-http://0.0.0.0:${PORT}}"
 EXECUTABLE="${APP_DIR}/OmniPlay.Api"
+MEDIA_TOOLS_ENV="${APP_ROOT}/settings/media-tools.env"
+
+find_media_tool() {
+  TOOL_NAME="$1"
+  for CANDIDATE in \
+    "${APP_DIR}/bin/${TOOL_NAME}" \
+    "${APP_DIR}/tools/ffmpeg/bin/${TOOL_NAME}" \
+    "/var/packages/ffmpeg7/target/bin/${TOOL_NAME}" \
+    "/var/packages/ffmpeg6/target/bin/${TOOL_NAME}" \
+    "/var/packages/ffmpeg5/target/bin/${TOOL_NAME}" \
+    "/var/packages/ffmpeg4/target/bin/${TOOL_NAME}" \
+    "/var/packages/ffmpeg/target/bin/${TOOL_NAME}" \
+    "/var/packages/jellyfin-ffmpeg/target/bin/${TOOL_NAME}" \
+    "/var/packages/Jellyfin/target/bin/${TOOL_NAME}" \
+    "/var/packages/CodecPack/target/bin/${TOOL_NAME}" \
+    "/var/packages/VideoStation/target/bin/${TOOL_NAME}" \
+    "/var/packages/MediaServer/target/bin/${TOOL_NAME}" \
+    "/var/packages/AdvancedMediaExtensions/target/bin/${TOOL_NAME}" \
+    "/var/packages/CodecPack/target/bin/${TOOL_NAME}41" \
+    "/var/packages/VideoStation/target/bin/${TOOL_NAME}41" \
+    "/usr/local/bin/${TOOL_NAME}" \
+    "/usr/syno/bin/${TOOL_NAME}" \
+    "/usr/bin/${TOOL_NAME}" \
+    "/bin/${TOOL_NAME}"
+  do
+    if [ -x "${CANDIDATE}" ]; then
+      printf '%s\n' "${CANDIDATE}"
+      return 0
+    fi
+  done
+
+  if [ "${TOOL_NAME}" = "ffmpeg" ] && [ -x "/usr/syno/bin/synoffmpeg" ]; then
+    printf '%s\n' "/usr/syno/bin/synoffmpeg"
+    return 0
+  fi
+
+  printf '%s\n' "${TOOL_NAME}"
+}
+
+find_vaapi_device() {
+  if [ -n "${OMNIPLAY_VAAPI_DEVICE:-}" ]; then
+    printf '%s\n' "${OMNIPLAY_VAAPI_DEVICE}"
+    return 0
+  fi
+
+  for CANDIDATE in /dev/dri/renderD*; do
+    if [ -e "${CANDIDATE}" ]; then
+      printf '%s\n' "${CANDIDATE}"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "/dev/dri/renderD128"
+}
+
+prepend_library_path_for_tool() {
+  TOOL_PATH="$1"
+  case "${TOOL_PATH}" in
+    /*/bin/*)
+      TOOL_ROOT="$(cd "$(dirname "${TOOL_PATH}")/.." 2>/dev/null && pwd)"
+      if [ -n "${TOOL_ROOT}" ]; then
+        for LIB_DIR in "${TOOL_ROOT}/lib" "${TOOL_ROOT}/lib64"; do
+          if [ -d "${LIB_DIR}" ]; then
+            prepend_library_path "${LIB_DIR}"
+            prepend_onevpl_search_path "${LIB_DIR}"
+            prepend_libva_driver_path "${LIB_DIR}/dri"
+            prepend_library_path "${LIB_DIR}/mfx"
+            prepend_onevpl_search_path "${LIB_DIR}/mfx"
+          fi
+        done
+      fi
+      ;;
+  esac
+}
+
+prepend_library_path() {
+  LIB_DIR="$1"
+  if [ ! -d "${LIB_DIR}" ]; then
+    return 0
+  fi
+
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":${LIB_DIR}:"*) ;;
+    *) LD_LIBRARY_PATH="${LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+  esac
+}
+
+prepend_libva_driver_path() {
+  DRIVER_DIR="$1"
+  if [ ! -d "${DRIVER_DIR}" ]; then
+    return 0
+  fi
+
+  case ":${LIBVA_DRIVERS_PATH:-}:" in
+    *":${DRIVER_DIR}:"*) ;;
+    *) LIBVA_DRIVERS_PATH="${DRIVER_DIR}${LIBVA_DRIVERS_PATH:+:${LIBVA_DRIVERS_PATH}}" ;;
+  esac
+}
+
+prepend_onevpl_search_path() {
+  SEARCH_DIR="$1"
+  if [ ! -d "${SEARCH_DIR}" ]; then
+    return 0
+  fi
+
+  case ":${ONEVPL_SEARCH_PATH:-}:" in
+    *":${SEARCH_DIR}:"*) ;;
+    *) ONEVPL_SEARCH_PATH="${SEARCH_DIR}${ONEVPL_SEARCH_PATH:+:${ONEVPL_SEARCH_PATH}}" ;;
+  esac
+}
+
+append_libva_driver_path_once() {
+  DRIVER_DIR="$1"
+  if [ ! -d "${DRIVER_DIR}" ]; then
+    return 0
+  fi
+
+  case ":${LIBVA_DRIVERS_PATH:-}:" in
+    *":${DRIVER_DIR}:"*) ;;
+    *) LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:+${LIBVA_DRIVERS_PATH}:}${DRIVER_DIR}" ;;
+  esac
+}
+
+append_libva_driver_path() {
+  for DRIVER_DIR in \
+    "/var/packages/jellyfin-ffmpeg/target/lib/dri" \
+    "/var/packages/Jellyfin/target/lib/jellyfin-ffmpeg/lib/dri" \
+    "/usr/lib/jellyfin-ffmpeg/lib/dri" \
+    "/usr/lib/x86_64-linux-gnu/dri" \
+    "/usr/lib/dri" \
+    "/usr/lib64/dri" \
+    "/usr/local/lib/dri" \
+    "/lib/dri" \
+    "/var/packages/CodecPack/target/lib/dri" \
+    "/var/packages/AdvancedMediaExtensions/target/lib/dri" \
+    "/var/packages/VideoStation/target/lib/dri"
+  do
+    append_libva_driver_path_once "${DRIVER_DIR}"
+  done
+}
+
+find_libva_driver_name() {
+  OLD_IFS="${IFS}"
+  IFS=":"
+  for DRIVER_DIR in ${LIBVA_DRIVERS_PATH:-}; do
+    for DRIVER_NAME in iHD i965 radeonsi nouveau; do
+      if [ -f "${DRIVER_DIR}/${DRIVER_NAME}_drv_video.so" ]; then
+        IFS="${OLD_IFS}"
+        printf '%s\n' "${DRIVER_NAME}"
+        return 0
+      fi
+    done
+  done
+  IFS="${OLD_IFS}"
+  return 1
+}
 
 start() {
   mkdir -p "${APP_ROOT}/data" "${APP_ROOT}/cache" "${APP_ROOT}/logs" "${APP_ROOT}/settings"
@@ -20,7 +177,41 @@ start() {
     exit 1
   fi
 
-  OMNIPLAY_APP_ROOT="${APP_ROOT}" OMNIPLAY_URLS="${URLS}" nohup "${EXECUTABLE}" >> "${LOG_FILE}" 2>&1 &
+  if [ -f "${MEDIA_TOOLS_ENV}" ]; then
+    # shellcheck disable=SC1090
+    . "${MEDIA_TOOLS_ENV}"
+  fi
+
+  OMNIPLAY_FFMPEG_PATH="${OMNIPLAY_FFMPEG_PATH:-$(find_media_tool ffmpeg)}"
+  OMNIPLAY_FFPROBE_PATH="${OMNIPLAY_FFPROBE_PATH:-$(find_media_tool ffprobe)}"
+  OMNIPLAY_VAAPI_DEVICE="${OMNIPLAY_VAAPI_DEVICE:-$(find_vaapi_device)}"
+  prepend_library_path_for_tool "${OMNIPLAY_FFMPEG_PATH}"
+  prepend_library_path_for_tool "${OMNIPLAY_FFPROBE_PATH}"
+  append_libva_driver_path
+  if [ -z "${LIBVA_DRIVER_NAME:-}" ]; then
+    LIBVA_DRIVER_NAME="$(find_libva_driver_name || true)"
+  fi
+
+  {
+    echo "Using FFmpeg: ${OMNIPLAY_FFMPEG_PATH}"
+    echo "Using FFprobe: ${OMNIPLAY_FFPROBE_PATH}"
+    echo "Using VAAPI device: ${OMNIPLAY_VAAPI_DEVICE}"
+    [ -n "${LIBVA_DRIVERS_PATH:-}" ] && echo "Using LIBVA drivers: ${LIBVA_DRIVERS_PATH}"
+    [ -n "${LIBVA_DRIVER_NAME:-}" ] && echo "Using LIBVA driver: ${LIBVA_DRIVER_NAME}"
+    [ -n "${ONEVPL_SEARCH_PATH:-}" ] && echo "Using oneVPL search path: ${ONEVPL_SEARCH_PATH}"
+  } >> "${LOG_FILE}"
+
+  export OMNIPLAY_APP_ROOT="${APP_ROOT}"
+  export OMNIPLAY_PORT="${PORT}"
+  export OMNIPLAY_URLS="${URLS}"
+  export OMNIPLAY_FFMPEG_PATH="${OMNIPLAY_FFMPEG_PATH}"
+  export OMNIPLAY_FFPROBE_PATH="${OMNIPLAY_FFPROBE_PATH}"
+  export OMNIPLAY_VAAPI_DEVICE="${OMNIPLAY_VAAPI_DEVICE}"
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+  [ -n "${ONEVPL_SEARCH_PATH:-}" ] && export ONEVPL_SEARCH_PATH
+  [ -n "${LIBVA_DRIVERS_PATH:-}" ] && export LIBVA_DRIVERS_PATH
+  [ -n "${LIBVA_DRIVER_NAME:-}" ] && export LIBVA_DRIVER_NAME
+  nohup "${EXECUTABLE}" >> "${LOG_FILE}" 2>&1 &
   echo $! > "${PID_FILE}"
   sleep 1
   if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then

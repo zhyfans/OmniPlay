@@ -57,6 +57,24 @@ public sealed class AppSettingsRepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateAlwaysKeepsTmdbScrapingAndPostersEnabled()
+    {
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "tmdb-defaults")));
+        database.EnsureInitialized();
+        var repository = new AppSettingsRepository(database);
+
+        var updated = await repository.UpdateAsync(new AppSettingsUpdateRequest(
+            Tmdb: new TmdbSettings(
+                EnableMetadataEnrichment: false,
+                EnablePosterDownloads: false,
+                CustomApiKey: "api-key")));
+
+        Assert.True(updated.Tmdb.EnableMetadataEnrichment);
+        Assert.True(updated.Tmdb.EnablePosterDownloads);
+        Assert.Equal("api-key", updated.Tmdb.CustomApiKey);
+    }
+
+    [Fact]
     public async Task UpdateNormalizesEmptyPlaybackPolicyToDefault()
     {
         var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "playback-default")));
@@ -98,6 +116,31 @@ public sealed class AppSettingsRepositoryTests : IDisposable
         Assert.False(updated.Playback.Transcode);
         Assert.Equal(48, updated.Cache.WebDavRetentionHours);
         Assert.Equal(64, updated.Cache.WebDavMaxGb);
+    }
+
+    [Fact]
+    public async Task UpdatePersistsAndNormalizesProxySettings()
+    {
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "proxy")));
+        database.EnsureInitialized();
+        var repository = new AppSettingsRepository(database);
+
+        var updated = await repository.UpdateAsync(new AppSettingsUpdateRequest(
+            Proxy: new ProxySettings(
+                IsEnabled: true,
+                Url: "192.168.1.10:7890",
+                Username: " user ",
+                Password: " pass ",
+                BypassList: " localhost ; 192.168.*\n.local ")));
+        var snapshot = await repository.GetAsync();
+
+        Assert.True(updated.Proxy.IsEnabled);
+        Assert.Equal("http://192.168.1.10:7890", updated.Proxy.Url);
+        Assert.Equal("user", updated.Proxy.Username);
+        Assert.Equal("pass", updated.Proxy.Password);
+        Assert.Equal("localhost,192.168.*,.local", updated.Proxy.BypassList);
+        Assert.Equal("http://192.168.1.10:7890", snapshot.Proxy.Url);
+        Assert.Equal("localhost,192.168.*,.local", snapshot.Proxy.BypassList);
     }
 
     public void Dispose()

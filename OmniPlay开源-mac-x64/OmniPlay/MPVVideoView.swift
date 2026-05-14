@@ -3,37 +3,76 @@ import AppKit
 import QuartzCore
 import Libmpv
 
+private final class MPVMetalLayer: CAMetalLayer {
+    override var drawableSize: CGSize {
+        get { super.drawableSize }
+        set {
+            // MoltenVK can briefly force 1x1 during resize; ignoring that keeps mpv's
+            // render target from getting stuck at a stale tiny size.
+            guard newValue.width > 1, newValue.height > 1 else { return }
+            super.drawableSize = newValue
+        }
+    }
+}
+
 private final class MPVContainerView: NSView {
     weak var playerManager: MPVPlayerManager?
     private var lastLayoutSize: CGSize = .zero
     private var windowObservationTokens: [NSObjectProtocol] = []
+    private var isLiveResizing = false
+    private var autoPausedForLiveResize = false
+    private var resumeAfterLiveResizeWorkItem: DispatchWorkItem?
 
     deinit {
+        resumeAfterLiveResizeWorkItem?.cancel()
         removeWindowObservers()
     }
 
     override func layout() {
         super.layout()
-        refreshDrawableSize()
+        handleGeometryChange(rebuildLayer: false)
+    }
 
-        let size = bounds.size
-        if size.width > 0, size.height > 0, size != lastLayoutSize {
-            lastLayoutSize = size
-            playerManager?.setDrawable(self, force: true)
-            scheduleDrawableRefresh(rebuildLayer: false)
-        }
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        handleGeometryChange(rebuildLayer: false)
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(newSize)
+        handleGeometryChange(rebuildLayer: false)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        scheduleDrawableRefresh(delays: [0.0, 0.05], rebind: true)
+    }
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        beginLiveResize()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        endLiveResize()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         installWindowObservers()
-        scheduleDrawableRefresh(rebuildLayer: false)
+        scheduleDrawableRefresh(delays: [0.0, 0.12], rebind: true)
     }
 
-    func installFreshMetalLayer(rebind: Bool) {
-        let metalLayer = CAMetalLayer()
+    func ensureMetalLayer(rebind: Bool) {
+        let metalLayer: CAMetalLayer
+        if let existingLayer = layer as? CAMetalLayer {
+            metalLayer = existingLayer
+        } else {
+            metalLayer = MPVMetalLayer()
+            layer = metalLayer
+        }
         configure(metalLayer)
-        layer = metalLayer
         lastLayoutSize = bounds.size
         if rebind {
             playerManager?.setDrawable(self, force: true)
@@ -44,17 +83,26 @@ private final class MPVContainerView: NSView {
         removeWindowObservers()
         guard let window else { return }
         let center = NotificationCenter.default
-        let events: [(Notification.Name, Bool)] = [
-            (NSWindow.didResizeNotification, false),
-            (NSWindow.didEndLiveResizeNotification, false),
-            (NSWindow.didEnterFullScreenNotification, false),
-            (NSWindow.didExitFullScreenNotification, true)
+        let events: [(Notification.Name, [TimeInterval], Bool)] = [
+            (NSWindow.didResizeNotification, [0.0, 0.016, 0.05], false),
+            (NSWindow.didEnterFullScreenNotification, [0.0, 0.08, 0.22, 0.45], true),
+            (NSWindow.didExitFullScreenNotification, [0.0, 0.08, 0.22, 0.45, 0.8], true)
         ]
-        windowObservationTokens = events.map { eventName, shouldRebuild in
+        windowObservationTokens = events.map { eventName, delays, shouldRebind in
             center.addObserver(forName: eventName, object: window, queue: .main) { [weak self] _ in
-                self?.scheduleDrawableRefresh(rebuildLayer: shouldRebuild)
+                guard let self else { return }
+                self.scheduleDrawableRefresh(delays: delays, rebind: shouldRebind || self.autoPausedForLiveResize)
             }
         }
+        let liveResizeTokens: [NSObjectProtocol] = [
+            center.addObserver(forName: NSWindow.willStartLiveResizeNotification, object: window, queue: .main) { [weak self] _ in
+                self?.beginLiveResize()
+            },
+            center.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: window, queue: .main) { [weak self] _ in
+                self?.endLiveResize()
+            }
+        ]
+        windowObservationTokens.append(contentsOf: liveResizeTokens)
     }
 
     private func removeWindowObservers() {
@@ -67,33 +115,102 @@ private final class MPVContainerView: NSView {
 
     private func configure(_ metalLayer: CAMetalLayer) {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let pointSize = bounds.size
+        let drawableSize = NSSize(
+            width: pointSize.width * scale,
+            height: pointSize.height * scale
+        )
+        metalLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "frame": NSNull(),
+            "contentsScale": NSNull(),
+            "drawableSize": NSNull()
+        ]
         metalLayer.backgroundColor = NSColor.black.cgColor
-        metalLayer.frame = bounds
+        metalLayer.frame = CGRect(origin: .zero, size: pointSize)
         metalLayer.contentsScale = scale
-        metalLayer.drawableSize = NSSize(width: bounds.width * scale, height: bounds.height * scale)
+        if drawableSize.width > 1, drawableSize.height > 1 {
+            metalLayer.drawableSize = drawableSize
+        }
+        metalLayer.presentsWithTransaction = false
+        metalLayer.allowsNextDrawableTimeout = false
+        metalLayer.framebufferOnly = true
+        metalLayer.isOpaque = true
+        metalLayer.masksToBounds = true
+        metalLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        metalLayer.contentsGravity = .resize
         metalLayer.needsDisplayOnBoundsChange = true
         metalLayer.setNeedsDisplay()
     }
 
-    private func refreshDrawableSize() {
-        layer?.frame = bounds
-        if let metalLayer = layer as? CAMetalLayer {
-            configure(metalLayer)
+    private func handleGeometryChange(rebuildLayer: Bool) {
+        refreshDrawableSize()
+
+        let size = bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+        if rebuildLayer || size != lastLayoutSize {
+            lastLayoutSize = size
+            let delays: [TimeInterval] = isLiveResizing ? [0.0, 0.016] : [0.0, 0.05]
+            scheduleDrawableRefresh(
+                delays: rebuildLayer ? [0.0, 0.08, 0.22, 0.45] : delays,
+                rebind: rebuildLayer || autoPausedForLiveResize
+            )
         }
     }
 
-    private func scheduleDrawableRefresh(rebuildLayer: Bool) {
-        let delays: [TimeInterval] = rebuildLayer ? [0.0, 0.08, 0.22, 0.45] : [0.0, 0.12]
-        for (index, delay) in delays.enumerated() {
+    private func beginLiveResize() {
+        resumeAfterLiveResizeWorkItem?.cancel()
+        resumeAfterLiveResizeWorkItem = nil
+        isLiveResizing = true
+        if !autoPausedForLiveResize, playerManager?.isPlaying == true {
+            autoPausedForLiveResize = true
+            playerManager?.setPaused(true)
+        }
+        scheduleDrawableRefresh(delays: [0.0, 0.016, 0.033], rebind: autoPausedForLiveResize)
+    }
+
+    private func endLiveResize() {
+        isLiveResizing = false
+        scheduleDrawableRefresh(delays: [0.0, 0.08, 0.22, 0.45], rebind: true)
+        resumeAfterLiveResizeIfNeeded()
+    }
+
+    private func resumeAfterLiveResizeIfNeeded() {
+        guard autoPausedForLiveResize else { return }
+        resumeAfterLiveResizeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.window != nil, self.autoPausedForLiveResize else { return }
+            self.refreshDrawable(rebind: true)
+            self.playerManager?.setPaused(false)
+            self.autoPausedForLiveResize = false
+            self.resumeAfterLiveResizeWorkItem = nil
+        }
+        resumeAfterLiveResizeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+    }
+
+    func refreshDrawable(rebind: Bool) {
+        refreshDrawableSize()
+        if rebind {
+            playerManager?.setDrawable(self, force: true)
+        }
+    }
+
+    private func refreshDrawableSize() {
+        if let metalLayer = layer as? CAMetalLayer {
+            configure(metalLayer)
+        } else {
+            ensureMetalLayer(rebind: false)
+        }
+    }
+
+    private func scheduleDrawableRefresh(delays: [TimeInterval], rebind: Bool) {
+        for delay in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.window != nil else { return }
                 self.layoutSubtreeIfNeeded()
-                if rebuildLayer && index == 1 {
-                    self.installFreshMetalLayer(rebind: true)
-                } else {
-                    self.refreshDrawableSize()
-                    self.playerManager?.setDrawable(self, force: true)
-                }
+                self.refreshDrawable(rebind: rebind)
             }
         }
     }
@@ -115,8 +232,9 @@ struct MPVVideoView: NSViewRepresentable {
         view.playerManager = playerManager
         view.wantsLayer = true
         view.autoresizingMask = [.width, .height]
+        view.layerContentsRedrawPolicy = .duringViewResize
 
-        view.installFreshMetalLayer(rebind: false)
+        view.ensureMetalLayer(rebind: false)
         context.coordinator.lastSize = view.bounds.size
 
         print("[MPVVideoView] makeNSView created")
@@ -130,8 +248,9 @@ struct MPVVideoView: NSViewRepresentable {
         let newSize = nsView.bounds.size
         if newSize != context.coordinator.lastSize {
             context.coordinator.lastSize = newSize
-            // Rebind on fullscreen/resize to avoid stale drawable region (black area on right/bottom).
-            playerManager.setDrawable(nsView, force: true)
+            if let videoView = nsView as? MPVContainerView {
+                videoView.refreshDrawable(rebind: false)
+            }
         }
     }
 }

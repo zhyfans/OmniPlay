@@ -185,6 +185,39 @@ public sealed class PosterWallViewModelTests
     }
 
     [Fact]
+    public async Task LoadAsync_RestoresAndPersistsLibrarySortPreference()
+    {
+        var settingsService = new FakeSettingsService(new AppSettings
+        {
+            LibraryView = new LibraryViewSettings
+            {
+                SortOption = LibraryViewSettings.SortOptionRating,
+                SortDescending = true
+            }
+        });
+        var viewModel = CreateViewModel(
+            new FakeVideoFileRepository(),
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(settingsService, new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()));
+
+        await viewModel.LoadAsync();
+
+        Assert.Equal(LibrarySortOption.Rating, viewModel.SelectedSortOption);
+        Assert.True(viewModel.IsSortDescending);
+        Assert.True(viewModel.SortOptions.Single(option => option.Value == LibrarySortOption.Rating).IsSelected);
+
+        viewModel.SelectSortOptionCommand.Execute(
+            viewModel.SortOptions.Single(option => option.Value == LibrarySortOption.Year));
+
+        await Task.Delay(50);
+
+        Assert.Equal(LibraryViewSettings.SortOptionYear, settingsService.Settings.LibraryView.SortOption);
+        Assert.True(settingsService.Settings.LibraryView.SortDescending);
+        Assert.True(viewModel.SortOptions.Single(option => option.Value == LibrarySortOption.Year).IsSelected);
+    }
+
+    [Fact]
     public async Task OpenStandalonePrimaryCommand_PersistsPlaybackStateWhenWindowCloses()
     {
         var filePath = CreateMediaFile();
@@ -874,6 +907,54 @@ public sealed class PosterWallViewModelTests
         Assert.Equal(expectedYear, viewModel.PosterScrapeYear);
     }
 
+    [Theory]
+    [InlineData(
+        "乘风破浪的姐姐.Sisters.Who.Make.Waves.S07.2026.2160p.WEB-DL.H265.AAC-ADWeb",
+        "乘风破浪的姐姐.Sisters.Who.Make.Waves.S07.2026.2160p.WEB-DL.H265.AAC-ADWeb",
+        "乘风破浪的姐姐",
+        "2026")]
+    [InlineData(
+        "00001.m2ts",
+        @"[后天].The.Day.After.Tomorrow.2004.Blu-ray.1080p.AVC.DTS-HD.MA.5.1-CMCT\DAT-CMCT\BDMV\STREAM\00001.m2ts",
+        "后天",
+        "2004")]
+    public async Task OpenPosterScrapeCommand_UsesChineseSourceTitleForDefaultQuery(
+        string fileName,
+        string relativePath,
+        string expectedQuery,
+        string expectedYear)
+    {
+        var videoRepository = new FakeVideoFileRepository();
+        videoRepository.MovieFilesById[9] =
+        [
+            new LibraryVideoItem
+            {
+                Id = "movie-with-chinese-source-title",
+                FileName = fileName,
+                RelativePath = relativePath,
+                AbsolutePath = relativePath,
+                PlaybackPath = relativePath
+            }
+        ];
+        var viewModel = CreateViewModel(
+            videoRepository,
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()));
+        var poster = new LibraryPosterItem
+        {
+            Id = "movie-9",
+            Title = "乘风破浪的姐姐 Sisters Who Make Waves",
+            MediaKind = "电影",
+            MovieId = 9
+        };
+
+        await viewModel.OpenPosterScrapeCommand.ExecuteAsync(poster);
+
+        Assert.Equal(expectedQuery, viewModel.PosterScrapeQuery);
+        Assert.Equal(expectedYear, viewModel.PosterScrapeYear);
+    }
+
     [Fact]
     public void OpenEpisodeEditCommand_ShowsDecodedSourceRelativePath()
     {
@@ -928,7 +1009,7 @@ public sealed class PosterWallViewModelTests
     }
 
     [Fact]
-    public async Task OpenDetailCommand_OnlyUsesParsedEpisodeSubtitleForDuplicateEpisodes()
+    public async Task OpenDetailCommand_OnlyUsesPrefixDifferenceForDuplicateEpisodes()
     {
         var videoRepository = new FakeVideoFileRepository();
         videoRepository.TvShowFilesById[7] =
@@ -936,35 +1017,57 @@ public sealed class PosterWallViewModelTests
             new LibraryVideoItem
             {
                 Id = "ep-1",
-                FileName = "Show.S01E01.Topic.mkv",
+                FileName = "My.Mister.S01E01.2018.1080p.Blu-ray.REMUX.AVC.LPCM.2.0-WhaX.mkv",
                 AbsolutePath = CreateMediaFile(),
                 PlaybackPath = CreateMediaFile(),
                 IsTvEpisode = true,
                 SeasonNumber = 1,
                 EpisodeNumber = 1,
-                EpisodeSubtitle = "Topic"
+                EpisodeSubtitle = "2 0 WhaX"
             },
             new LibraryVideoItem
             {
-                Id = "ep-2-talk",
-                FileName = "Show.S01E02.Talk.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                Id = "ep-2-gold",
+                FileName = "1.金牌得主.S01E02.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
                 AbsolutePath = CreateMediaFile(),
                 PlaybackPath = CreateMediaFile(),
                 IsTvEpisode = true,
                 SeasonNumber = 1,
                 EpisodeNumber = 2,
-                EpisodeSubtitle = "Talk"
+                EpisodeSubtitle = "Ignored Tail"
             },
             new LibraryVideoItem
             {
-                Id = "ep-2-team",
-                FileName = "Show.S01E02.Team.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                Id = "ep-2-phoenix",
+                FileName = "2.凤凰台上.S01E02.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
                 AbsolutePath = CreateMediaFile(),
                 PlaybackPath = CreateMediaFile(),
                 IsTvEpisode = true,
                 SeasonNumber = 1,
                 EpisodeNumber = 2,
-                EpisodeSubtitle = "Team"
+                EpisodeSubtitle = "Ignored Tail"
+            },
+            new LibraryVideoItem
+            {
+                Id = "ep-3-gold",
+                FileName = "Show.Gold.Medalist.S01E03.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                AbsolutePath = CreateMediaFile(),
+                PlaybackPath = CreateMediaFile(),
+                IsTvEpisode = true,
+                SeasonNumber = 1,
+                EpisodeNumber = 3,
+                EpisodeSubtitle = "Ignored Tail"
+            },
+            new LibraryVideoItem
+            {
+                Id = "ep-3-phoenix",
+                FileName = "Show.Phoenix.Stage.S01E03.2026.2160p.WEB-DL.H265.AAC-ADWeb.mkv",
+                AbsolutePath = CreateMediaFile(),
+                PlaybackPath = CreateMediaFile(),
+                IsTvEpisode = true,
+                SeasonNumber = 1,
+                EpisodeNumber = 3,
+                EpisodeSubtitle = "Ignored Tail"
             }
         ];
         var tvShowRepository = new FakeTvShowRepository();
@@ -984,13 +1087,19 @@ public sealed class PosterWallViewModelTests
         await viewModel.OpenDetailCommand.ExecuteAsync(Assert.Single(viewModel.LibraryItems));
 
         var single = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-1");
+        Assert.Equal("第1季第1集", single.SeasonEpisodeText);
         Assert.Equal(single.SeasonEpisodeText, single.EpisodeDisplayTitle);
         Assert.Equal(string.Empty, single.EpisodeDisplaySubtitle);
 
-        var talk = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-talk");
-        var team = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-team");
-        Assert.Equal(string.Concat(talk.SeasonEpisodeText, " \u00B7 Talk"), talk.EpisodeDisplayTitle);
-        Assert.Equal(string.Concat(team.SeasonEpisodeText, " \u00B7 Team"), team.EpisodeDisplayTitle);
+        var gold = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-gold");
+        var phoenix = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-2-phoenix");
+        Assert.Equal(string.Concat(gold.SeasonEpisodeText, " \u00B7 金牌得主"), gold.EpisodeDisplayTitle);
+        Assert.Equal(string.Concat(phoenix.SeasonEpisodeText, " \u00B7 凤凰台上"), phoenix.EpisodeDisplayTitle);
+
+        var goldEnglish = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-3-gold");
+        var phoenixEnglish = Assert.Single(viewModel.DetailFiles, static file => file.Id == "ep-3-phoenix");
+        Assert.Equal(string.Concat(goldEnglish.SeasonEpisodeText, " \u00B7 Gold Medalist"), goldEnglish.EpisodeDisplayTitle);
+        Assert.Equal(string.Concat(phoenixEnglish.SeasonEpisodeText, " \u00B7 Phoenix Stage"), phoenixEnglish.EpisodeDisplayTitle);
     }
 
     [Fact]
@@ -2396,15 +2505,23 @@ public sealed class PosterWallViewModelTests
 
     private sealed class FakeSettingsService : ISettingsService
     {
+        public FakeSettingsService(AppSettings? settings = null)
+        {
+            Settings = settings ?? new AppSettings();
+        }
+
         public string SettingsDirectory => Path.GetTempPath();
+
+        public AppSettings Settings { get; private set; }
 
         public Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(new AppSettings());
+            return Task.FromResult(Settings);
         }
 
         public Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default)
         {
+            Settings = settings;
             return Task.CompletedTask;
         }
     }

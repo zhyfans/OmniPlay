@@ -489,6 +489,7 @@ struct PosterWallView: View {
         }
         .onAppear {
             loadData()
+            MacAppUpdateChecker.checkAtStartupIfNeeded()
             if ProcessInfo.processInfo.environment["UITEST_OPEN_WEBDAV_SHEET"] == "1" {
                 prepareManualWebDAVBrowserLogin()
                 isShowingWebDAVPreScanLoginSheet = true

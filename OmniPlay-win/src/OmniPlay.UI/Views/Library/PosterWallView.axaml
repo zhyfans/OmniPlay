@@ -4,6 +4,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:brand="using:OmniPlay.UI.Controls.Brand"
     xmlns:converters="using:OmniPlay.UI.Converters"
+    xmlns:layout="using:OmniPlay.UI.Controls.Layout"
     xmlns:player="using:OmniPlay.UI.Controls.Player">
   <UserControl.Resources>
     <converters:ImagePathToBitmapConverter x:Key="ImagePathToBitmapConverter" />
@@ -143,6 +144,7 @@
     <Style Selector="Button.offlineCacheAction:pointerover"><Setter Property="Background" Value="#CC000000" /><Setter Property="BorderBrush" Value="#FFFFFFFF" /></Style>
     <Style Selector="TextBlock.offlineCacheGlyph"><Setter Property="Foreground" Value="#FFFFFF" /><Setter Property="FontSize" Value="30" /><Setter Property="FontWeight" Value="Bold" /><Setter Property="HorizontalAlignment" Value="Center" /><Setter Property="VerticalAlignment" Value="Center" /></Style>
     <Style Selector="ProgressBar.offlineCacheProgress"><Setter Property="Height" Value="5" /><Setter Property="Minimum" Value="0" /><Setter Property="Maximum" Value="1" /></Style>
+    <Style Selector="ProgressBar.continueWatchingProgress"><Setter Property="Height" Value="4" /><Setter Property="Minimum" Value="0" /><Setter Property="Maximum" Value="1" /><Setter Property="Foreground" Value="#0078D4" /><Setter Property="Background" Value="#D8DDE3" /></Style>
     
     <Style Selector="Button.cardButton">
       <Setter Property="Background" Value="#00000000" /><Setter Property="BorderBrush" Value="#00000000" /><Setter Property="BorderThickness" Value="0" /><Setter Property="Padding" Value="0" /><Setter Property="HorizontalContentAlignment" Value="Left" /><Setter Property="VerticalContentAlignment" Value="Top" />
@@ -218,6 +220,15 @@
     <Style Selector="Button.WinCloseBtnOverlay:pointerover /template/ ContentPresenter">
       <Setter Property="Background" Value="#E81123"/>
     </Style>
+    <Style Selector="Border.overlayResizeGrip">
+      <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="Border.overlayResizeGrip:pointerover">
+      <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="Border.overlayResizeGrip:pressed">
+      <Setter Property="Background" Value="Transparent"/>
+    </Style>
 
     <!-- 进度条 -->
     <Style Selector="Border.progressTrack"><Setter Property="Background" Value="#E5E5E5" /><Setter Property="CornerRadius" Value="3" /><Setter Property="Height" Value="6" /></Style>
@@ -271,7 +282,10 @@
                   <ItemsControl.ItemTemplate>
                     <DataTemplate>
                       <Button Classes="sortOption" Command="{Binding $parent[UserControl].DataContext.SelectSortOptionCommand}" CommandParameter="{Binding}">
-                        <TextBlock FontSize="15" Foreground="#323130" Text="{Binding Label}" />
+                        <Grid ColumnDefinitions="20,*">
+                          <TextBlock Grid.Column="0" FontSize="15" FontWeight="Bold" Foreground="#1A1A1A" Text="✓" IsVisible="{Binding IsSelected}" />
+                          <TextBlock Grid.Column="1" FontSize="15" Foreground="#323130" Text="{Binding Label}" />
+                        </Grid>
                       </Button>
                     </DataTemplate>
                   </ItemsControl.ItemTemplate>
@@ -359,6 +373,23 @@
                   </Grid>
 
                   <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
+                    <StackPanel Spacing="12">
+                      <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="软件更新" />
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Foreground="#323130" Text="当前版本" />
+                        <TextBlock Opacity="0.72" Foreground="#605E5C" Text="{Binding Settings.AppVersionText}" TextTrimming="CharacterEllipsis" />
+                      </StackPanel>
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoCheckUpdatesOnStartup}" Content="启动时自动检查更新" />
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Classes="sourceAction" Command="{Binding Settings.CheckForUpdatesCommand}" Content="检查更新" />
+                        <Button Classes="sourceAction" Command="{Binding Settings.InstallLatestUpdateCommand}" Content="直接更新" />
+                        <Button Classes="sourceAction" Command="{Binding Settings.OpenGitHubRepositoryCommand}" Content="GitHub 仓库" />
+                      </StackPanel>
+                      <TextBlock Opacity="0.72" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding Settings.UpdateStatusMessage}" />
+                    </StackPanel>
+                  </Border>
+
+                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
                     <StackPanel Spacing="14">
                       <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="&#x57FA;&#x7840;&#x8BBE;&#x7F6E;" />
                       <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoScanOnStartup}" Content="&#x542F;&#x52A8;&#x65F6;&#x81EA;&#x52A8;&#x626B;&#x63CF;&#x5E76;&#x540C;&#x6B65;&#x5E93;" />
@@ -401,22 +432,6 @@
                           <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
                         </ComboBox>
                       </StackPanel>
-                    </StackPanel>
-                  </Border>
-
-                  <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
-                    <StackPanel Spacing="12">
-                      <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="软件更新" />
-                      <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBlock Foreground="#323130" Text="当前版本" />
-                        <TextBlock Opacity="0.72" Foreground="#605E5C" Text="{Binding Settings.AppVersionText}" TextTrimming="CharacterEllipsis" />
-                      </StackPanel>
-                      <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Classes="sourceAction" Command="{Binding Settings.CheckForUpdatesCommand}" Content="检查更新" />
-                        <Button Classes="sourceAction" Command="{Binding Settings.InstallLatestUpdateCommand}" Content="直接更新" />
-                        <Button Classes="sourceAction" Command="{Binding Settings.OpenGitHubRepositoryCommand}" Content="GitHub 仓库" />
-                      </StackPanel>
-                      <TextBlock Opacity="0.72" Foreground="#605E5C" TextWrapping="Wrap" Text="{Binding Settings.UpdateStatusMessage}" />
                     </StackPanel>
                   </Border>
 
@@ -551,16 +566,16 @@
 
           <StackPanel Margin="0,-18,0,0" Spacing="14" IsVisible="{Binding HasContinueWatching}">
             <TextBlock FontSize="32" FontWeight="Bold" Foreground="#1A1A1A" Text="&#x7EE7;&#x7EED;&#x64AD;&#x653E;" />
-            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ScrollViewer x:Name="ContinueWatchingScrollViewer" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
               <ItemsControl ItemsSource="{Binding ContinueWatchingItems}">
                 <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
                   <DataTemplate>
-                    <Grid Width="204" Margin="0,0,20,0">
-                      <StackPanel Width="204" Spacing="0">
-                        <Grid Classes="posterInteractive" Width="204" Height="306" ClipToBounds="True">
+                    <Grid Width="{Binding $parent[UserControl].LibraryPosterItemWidth}">
+                      <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Spacing="0">
+                        <Grid Classes="posterInteractive" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}" ClipToBounds="True">
                           <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                            <Grid Width="204" Height="306">
+                            <Grid Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}">
                               <Border Classes="posterShell" />
                               <Rectangle RadiusX="6" RadiusY="6">
                                 <Rectangle.Fill><ImageBrush Source="{Binding PosterPath, Converter={StaticResource ImagePathToBitmapConverter}}" Stretch="UniformToFill" /></Rectangle.Fill>
@@ -588,13 +603,14 @@
                             </Grid>
                           </Button>
                         </Grid>
-                        <StackPanel Width="204" Spacing="0">
+                        <ProgressBar Classes="continueWatchingProgress" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Margin="0,8,0,0" Value="{Binding ContinueWatchingProgress}" />
+                        <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Spacing="0">
                           <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                            <TextBlock Margin="0,10,0,0" Width="204" MinHeight="34" FontSize="16" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
+                            <TextBlock Margin="0,10,0,0" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" MinHeight="34" FontSize="{Binding $parent[UserControl].LibraryPosterTitleFontSize}" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
                           </Button>
                           <Grid Margin="0,2,0,0" ColumnDefinitions="*,Auto" VerticalAlignment="Center">
                             <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                              <TextBlock Width="166" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
+                              <TextBlock Width="{Binding $parent[UserControl].LibraryPosterSubtitleWidth}" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
                             </Button>
                             <Button Grid.Column="1" Classes="watchStateButton" Margin="8,0,0,0" Command="{Binding $parent[UserControl].DataContext.OpenPosterWatchStateConfirmationCommand}" CommandParameter="{Binding}" ToolTip.Tip="{Binding WatchStateText}">
                               <Grid Width="18" Height="18" HorizontalAlignment="Center" VerticalAlignment="Center">
@@ -636,15 +652,15 @@
 
               <ItemsControl x:Name="LibraryItemsControl" ItemsSource="{Binding LibraryItems}">
                 <ItemsControl.ItemsPanel>
-                  <ItemsPanelTemplate><WrapPanel Orientation="Horizontal" ItemWidth="224" ItemHeight="420" /></ItemsPanelTemplate>
+                  <ItemsPanelTemplate><WrapPanel Orientation="Horizontal" ItemWidth="{Binding $parent[UserControl].LibraryPosterItemWidth}" ItemHeight="{Binding $parent[UserControl].LibraryPosterItemHeight}" /></ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
                   <DataTemplate>
-                    <Grid Width="204">
-                      <StackPanel Width="204" Margin="0,0,0,22" Spacing="0">
-                        <Grid Classes="posterInteractive" Width="204" Height="306" ClipToBounds="True">
+                    <Grid Width="{Binding $parent[UserControl].LibraryPosterCardWidth}">
+                      <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Margin="0,0,0,22" Spacing="0">
+                        <Grid Classes="posterInteractive" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}" ClipToBounds="True">
                           <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                            <Grid Width="204" Height="306">
+                            <Grid Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}">
                               <Border Classes="posterShell" />
                               <Rectangle RadiusX="6" RadiusY="6">
                                 <Rectangle.Fill><ImageBrush Source="{Binding PosterPath, Converter={StaticResource ImagePathToBitmapConverter}}" Stretch="UniformToFill" /></Rectangle.Fill>
@@ -672,13 +688,13 @@
                             </Grid>
                           </Button>
                         </Grid>
-                        <StackPanel Width="204" Spacing="0">
+                        <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Spacing="0">
                           <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                            <TextBlock Margin="0,10,0,0" Width="204" MinHeight="34" FontSize="16" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
+                            <TextBlock Margin="0,10,0,0" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" MinHeight="34" FontSize="{Binding $parent[UserControl].LibraryPosterTitleFontSize}" FontWeight="SemiBold" LineHeight="21" Foreground="#1A1A1A" Text="{Binding Title}" MaxLines="2" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
                           </Button>
                           <Grid Margin="0,2,0,0" ColumnDefinitions="*,Auto" VerticalAlignment="Center">
                             <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
-                              <TextBlock Width="166" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
+                              <TextBlock Width="{Binding $parent[UserControl].LibraryPosterSubtitleWidth}" FontSize="13" Foreground="#605E5C" VerticalAlignment="Center" Text="{Binding Subtitle}" TextTrimming="CharacterEllipsis" />
                             </Button>
                             <Button Grid.Column="1" Classes="watchStateButton" Margin="8,0,0,0" Command="{Binding $parent[UserControl].DataContext.OpenPosterWatchStateConfirmationCommand}" CommandParameter="{Binding}" ToolTip.Tip="{Binding WatchStateText}">
                               <Grid Width="18" Height="18" HorizontalAlignment="Center" VerticalAlignment="Center">
@@ -702,7 +718,7 @@
     <!-- 详情页 -->
     <Border Grid.Row="0" Classes="detailSurface" IsVisible="{Binding IsDetailOpen}">
       <ScrollViewer HorizontalScrollBarVisibility="Disabled">
-        <StackPanel Margin="58,44,58,48" Spacing="42">
+        <StackPanel x:Name="DetailContentStack" Margin="58,44,58,48" Spacing="42">
           
           <!-- ====== 重绘详情页精美返回按钮 ====== -->
           <Grid ColumnDefinitions="Auto,*,Auto">
@@ -785,15 +801,26 @@
               <ProgressBar Classes="libraryProgress" Width="160" Height="5" Minimum="0" Maximum="1" Value="{Binding SelectedSeasonOfflineCacheProgress}" IsVisible="{Binding ShowSelectedSeasonOfflineCacheProgress}" />
             </StackPanel>
 
-            <ItemsControl ItemsSource="{Binding DetailFiles}">
-              <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel Orientation="Horizontal" ItemWidth="430" ItemHeight="340" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+            <ItemsControl x:Name="EpisodeItemsControl" HorizontalAlignment="Stretch" ItemsSource="{Binding DetailFiles}">
+              <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate>
+                  <layout:JustifiedWrapPanel
+                      HorizontalAlignment="Stretch"
+                      ItemWidth="{Binding $parent[UserControl].EpisodeThumbnailCardWidth}"
+                      ItemHeight="{Binding $parent[UserControl].EpisodeThumbnailItemHeight}"
+                      HorizontalSpacing="{Binding $parent[UserControl].EpisodeThumbnailSpacing}"
+                      VerticalSpacing="20"
+                      ItemsPerRow="{Binding $parent[UserControl].EpisodeThumbnailItemsPerRow}"
+                      MinimumJustifiedItems="4" />
+                </ItemsPanelTemplate>
+              </ItemsControl.ItemsPanel>
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
-                  <StackPanel Width="398" Margin="0,0,26,20" Spacing="12">
+                  <StackPanel Width="{Binding $parent[UserControl].EpisodeThumbnailCardWidth}" Margin="0,0,0,20" HorizontalAlignment="Center" Spacing="12">
                     <StackPanel Spacing="10">
-                      <Grid Classes="posterInteractive" Width="398" Height="224" ClipToBounds="True">
+                      <Grid Classes="posterInteractive" Width="{Binding $parent[UserControl].EpisodeThumbnailCardWidth}" Height="{Binding $parent[UserControl].EpisodeThumbnailCardHeight}" ClipToBounds="True">
                         <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.SelectDetailFileCommand}" CommandParameter="{Binding}">
-                          <Grid Width="398" Height="224">
+                          <Grid Width="{Binding $parent[UserControl].EpisodeThumbnailCardWidth}" Height="{Binding $parent[UserControl].EpisodeThumbnailCardHeight}">
                           <Border Classes="posterShell" CornerRadius="8" />
                           <Rectangle RadiusX="8" RadiusY="8">
                             <Rectangle.Fill><ImageBrush Source="{Binding PreviewImagePath, Converter={StaticResource ImagePathToBitmapConverter}}" Stretch="UniformToFill" /></Rectangle.Fill>
@@ -819,7 +846,7 @@
                       <StackPanel Spacing="6" MinHeight="58">
                         <TextBlock FontSize="18" FontWeight="SemiBold" MinHeight="26" HorizontalAlignment="Center" TextAlignment="Center" Foreground="#1A1A1A" Text="{Binding EpisodeDisplayTitle}" TextWrapping="NoWrap" />
                         <TextBlock FontSize="14" Foreground="#605E5C" MinHeight="20" HorizontalAlignment="Center" TextAlignment="Center" Text="{Binding EpisodeDisplaySubtitle}" TextWrapping="Wrap" MaxLines="2" IsVisible="{Binding HasEpisodeDisplaySubtitle}" />
-                        <ProgressBar Classes="libraryProgress" Width="398" Height="4" Minimum="0" Maximum="1" Value="{Binding ProgressRatio}" IsVisible="{Binding ShouldShowEpisodeProgress}" />
+                        <ProgressBar Classes="libraryProgress" Width="{Binding $parent[UserControl].EpisodeThumbnailCardWidth}" Height="4" Minimum="0" Maximum="1" Value="{Binding ProgressRatio}" IsVisible="{Binding ShouldShowEpisodeProgress}" />
                       </StackPanel>
                     </StackPanel>
                   </StackPanel>
@@ -1137,19 +1164,45 @@
       <Grid Background="#000000">
         <ContentControl x:Name="OverlayPlayerSurfaceHostContainer" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
         <Border x:Name="OverlayTapSurface" Background="#01000000" PointerPressed="OverlayTapSurface_OnPointerPressed" />
+
+        <Border x:Name="OverlayWindowBorder" BorderBrush="#FF000000" BorderThickness="1" IsHitTestVisible="False" IsVisible="False" ZIndex="60" />
+
+        <Grid x:Name="OverlayResizeLayer" IsVisible="False" ZIndex="40">
+          <Border x:Name="OverlayNorthResizeGrip" Classes="overlayResizeGrip" Height="6" VerticalAlignment="Top" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="North" />
+          <Border x:Name="OverlaySouthResizeGrip" Classes="overlayResizeGrip" Height="6" VerticalAlignment="Bottom" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="South" />
+          <Border x:Name="OverlayWestResizeGrip" Classes="overlayResizeGrip" Width="6" HorizontalAlignment="Left" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="West" />
+          <Border x:Name="OverlayEastResizeGrip" Classes="overlayResizeGrip" Width="6" HorizontalAlignment="Right" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="East" />
+          <Border x:Name="OverlayNorthWestResizeGrip" Classes="overlayResizeGrip" Width="14" Height="14" HorizontalAlignment="Left" VerticalAlignment="Top" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="NorthWest" />
+          <Border x:Name="OverlayNorthEastResizeGrip" Classes="overlayResizeGrip" Width="14" Height="14" HorizontalAlignment="Right" VerticalAlignment="Top" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="NorthEast" />
+          <Border x:Name="OverlaySouthWestResizeGrip" Classes="overlayResizeGrip" Width="14" Height="14" HorizontalAlignment="Left" VerticalAlignment="Bottom" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="SouthWest" />
+          <Border x:Name="OverlaySouthEastResizeGrip" Classes="overlayResizeGrip" Width="14" Height="14" HorizontalAlignment="Right" VerticalAlignment="Bottom" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="SouthEast" />
+        </Grid>
         
-        <!-- 锚点放置在右上角，用于弹出 Win11 窗口按钮 -->
-        <Border x:Name="OverlayWindowControlsAnchor" Width="1" Height="1" HorizontalAlignment="Right" VerticalAlignment="Top" IsHitTestVisible="False" Opacity="0" />
+        <!-- 锚点放置在左上角，弹窗使用整窗宽度并在内部右对齐窗口按钮 -->
+        <Border x:Name="OverlayWindowControlsAnchor" Width="1" Height="1" HorizontalAlignment="Left" VerticalAlignment="Top" IsHitTestVisible="False" Opacity="0" />
         <Border x:Name="OverlayBottomPopupAnchor" Height="1" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" IsHitTestVisible="False" Opacity="0" />
+
+        <Popup x:Name="OverlayResizePopup" IsLightDismissEnabled="False" Placement="Center" PlacementTarget="{Binding #OverlayPlaybackRoot}" Topmost="True">
+          <Grid x:Name="OverlayResizePopupLayer" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="{Binding #OverlayPlaybackRoot.Bounds.Height}">
+            <Border x:Name="OverlayPopupWestResizeGrip" Classes="overlayResizeGrip" Width="14" HorizontalAlignment="Left" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="West" />
+            <Border x:Name="OverlayPopupEastResizeGrip" Classes="overlayResizeGrip" Width="14" HorizontalAlignment="Right" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="East" />
+            <Border x:Name="OverlayPopupNorthResizeGrip" Classes="overlayResizeGrip" Height="10" VerticalAlignment="Top" IsHitTestVisible="False" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="North" />
+            <Border x:Name="OverlayPopupSouthResizeGrip" Classes="overlayResizeGrip" Height="10" VerticalAlignment="Bottom" IsHitTestVisible="False" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="South" />
+            <Border x:Name="OverlayPopupNorthWestResizeGrip" Classes="overlayResizeGrip" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="NorthWest" />
+            <Border x:Name="OverlayPopupNorthEastResizeGrip" Classes="overlayResizeGrip" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="NorthEast" />
+            <Border x:Name="OverlayPopupSouthWestResizeGrip" Classes="overlayResizeGrip" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="SouthWest" />
+            <Border x:Name="OverlayPopupSouthEastResizeGrip" Classes="overlayResizeGrip" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" PointerPressed="OverlayResizeBorder_OnPointerPressed" Tag="SouthEast" />
+          </Grid>
+        </Popup>
 
         <!-- 统一的 Windows 11 播放页右上角控制器 -->
         <Popup x:Name="OverlayWindowControlsPopup" IsLightDismissEnabled="False" Placement="BottomEdgeAlignedLeft" PlacementTarget="{Binding #OverlayWindowControlsAnchor}" Topmost="True">
-          <Border x:Name="OverlayWindowControlsPanel" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="40" Background="Transparent" PointerEntered="OverlayWindowControlsPanel_OnPointerEntered" PointerExited="OverlayWindowControlsPanel_OnPointerExited" PointerMoved="OverlayWindowControlsPanel_OnPointerMoved" IsVisible="False">
+          <Border x:Name="OverlayWindowControlsPanel" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="40" Background="Transparent" PointerEntered="OverlayWindowControlsPanel_OnPointerEntered" PointerExited="OverlayWindowControlsPanel_OnPointerExited" PointerMoved="OverlayWindowControlsPanel_OnPointerMoved" PointerPressed="OverlayWindowControlsPanel_OnPointerPressed" IsVisible="False">
             <StackPanel Margin="0,4,4,0" HorizontalAlignment="Right" VerticalAlignment="Top" Orientation="Horizontal">
               <Button Classes="WinCaptionBtnOverlay" Click="OverlayMinimizeButton_OnClick" ToolTip.Tip="最小化">
                 <Path Data="M 0,5 H 10 V 6 H 0 Z" Fill="#FFFFFF" Width="10" Height="10" Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
               </Button>
-              <Button Classes="WinCaptionBtnOverlay" Click="OverlayMaximizeButton_OnClick" ToolTip.Tip="最大化或还原">
+              <Button Classes="WinCaptionBtnOverlay" Click="OverlayMaximizeButton_OnClick" ToolTip.Tip="全屏或退出全屏">
                 <Path Data="M 1,1 H 9 V 9 H 1 Z M 0,0 V 10 H 10 V 0 Z" Fill="#FFFFFF" Width="10" Height="10" Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
               </Button>
               <Button Classes="WinCaptionBtnOverlay WinCloseBtnOverlay" Click="OverlayCloseButton_OnClick" ToolTip.Tip="关闭播放页">
@@ -1160,17 +1213,20 @@
         </Popup>
 
         <Popup x:Name="OverlayWindowControlsHotZonePopup" IsLightDismissEnabled="False" Placement="BottomEdgeAlignedLeft" PlacementTarget="{Binding #OverlayWindowControlsAnchor}" Topmost="True">
-          <Border Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="48" Background="#01000000" PointerEntered="OverlayWindowControlsHotZone_OnPointerActivity" PointerMoved="OverlayWindowControlsHotZone_OnPointerActivity" />
+          <Border x:Name="OverlayWindowControlsHotZone" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="48" Background="Transparent" PointerEntered="OverlayWindowControlsHotZone_OnPointerActivity" PointerMoved="OverlayWindowControlsHotZone_OnPointerActivity" PointerPressed="OverlayWindowControlsHotZone_OnPointerPressed" />
         </Popup>
 
         <Popup x:Name="OverlayStatusPopup" IsLightDismissEnabled="False" Placement="Center" PlacementTarget="{Binding #OverlayPlaybackRoot}" Topmost="True">
           <Border MaxWidth="520" Padding="16,11" CornerRadius="8" Background="#CC000000" BorderBrush="#33FFFFFF" BorderThickness="1">
-            <TextBlock Foreground="#FFFFFF" Text="{Binding Player.StatusMessage}" TextAlignment="Center" TextWrapping="Wrap" />
+            <StackPanel Spacing="10">
+              <ProgressBar Width="220" Height="4" IsIndeterminate="True" IsVisible="{Binding Player.IsOpeningMovie}" />
+              <TextBlock Foreground="#FFFFFF" Text="{Binding Player.StatusMessage}" TextAlignment="Center" TextWrapping="Wrap" IsVisible="{Binding !Player.IsPlaying}" />
+            </StackPanel>
           </Border>
         </Popup>
 
         <Popup x:Name="OverlayControlsPopup" IsLightDismissEnabled="False" Placement="TopEdgeAlignedLeft" PlacementTarget="{Binding #OverlayBottomPopupAnchor}" Topmost="True">
-          <Border Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" PointerMoved="OverlayControlsArea_OnPointerMoved">
+          <Border x:Name="OverlayControlsArea" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" PointerMoved="OverlayControlsArea_OnPointerMoved" PointerPressed="OverlayControlsArea_OnPointerPressed">
             <Border.Background>
               <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
                 <GradientStop Color="#00000000" Offset="0" />
@@ -1294,7 +1350,7 @@
         </Popup>
 
         <Popup x:Name="OverlayBottomHotZonePopup" IsLightDismissEnabled="False" Placement="TopEdgeAlignedLeft" PlacementTarget="{Binding #OverlayBottomPopupAnchor}" Topmost="True">
-          <Border Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="180" Background="#01000000" PointerEntered="OverlayBottomHotZone_OnPointerActivity" PointerMoved="OverlayBottomHotZone_OnPointerActivity" PointerPressed="OverlayBottomHotZone_OnPointerPressed" />
+          <Border x:Name="OverlayBottomHotZone" Width="{Binding #OverlayPlaybackRoot.Bounds.Width}" Height="180" Background="#01000000" PointerEntered="OverlayBottomHotZone_OnPointerActivity" PointerMoved="OverlayBottomHotZone_OnPointerActivity" PointerPressed="OverlayBottomHotZone_OnPointerPressed" />
         </Popup>
       </Grid>
     </Border>

@@ -25,9 +25,11 @@ public sealed class LibraryDetailTests : IDisposable
 
         var repository = new LibraryRepository(database);
         var item = (await repository.GetItemsAsync()).Single();
+        Assert.False(item.IsWatched);
         var detail = await repository.GetItemDetailAsync(item.Id);
 
         Assert.NotNull(detail);
+        Assert.False(detail.IsWatched);
         Assert.Equal("tv", detail.ItemKind);
         Assert.Equal("绝命毒师", detail.Title);
         Assert.Equal(2, detail.VideoFiles.Count);
@@ -101,6 +103,19 @@ public sealed class LibraryDetailTests : IDisposable
         var unwatchedDetail = await repository.GetItemDetailAsync(item.Id);
         Assert.NotNull(unwatchedDetail);
         Assert.False(unwatchedDetail.VideoFiles.First(file => file.Id == firstFile.Id).IsWatched);
+
+        Assert.True(await repository.SetLibraryItemWatchedAsync(new LibraryItemWatchedStatusUpdateRequest(item.Id, IsWatched: true)));
+        var watchedDetail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(watchedDetail);
+        Assert.True(watchedDetail.IsWatched);
+        Assert.All(watchedDetail.VideoFiles, file => Assert.True(file.IsWatched));
+        Assert.True((await repository.GetItemsAsync()).Single().IsWatched);
+
+        Assert.True(await repository.SetLibraryItemWatchedAsync(new LibraryItemWatchedStatusUpdateRequest(item.Id, IsWatched: false)));
+        var wholeItemUnwatchedDetail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(wholeItemUnwatchedDetail);
+        Assert.False(wholeItemUnwatchedDetail.IsWatched);
+        Assert.All(wholeItemUnwatchedDetail.VideoFiles, file => Assert.False(file.IsWatched));
     }
 
     [Fact]
@@ -138,6 +153,27 @@ public sealed class LibraryDetailTests : IDisposable
         Assert.Equal(7.8, lockedDetail.VoteAverage);
         Assert.True(lockedDetail.IsLocked);
         Assert.Equal(123, lockedDetail.TmdbId);
+
+        var customPosterPath = Path.Combine(root, "custom-poster.jpg");
+        File.WriteAllBytes(customPosterPath, [1, 2, 3, 4]);
+        Assert.True(await repository.UpdateCustomMetadataAsync(new LibraryItemCustomMetadataUpdateRequest(
+            item.Id,
+            Title: "手动编辑影片",
+            ReleaseDate: "",
+            Overview: "",
+            VoteAverage: null,
+            PosterLocalPath: customPosterPath,
+            PosterRemotePath: "custom-upload",
+            LockMetadata: true)));
+
+        var customDetail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(customDetail);
+        Assert.Equal("手动编辑影片", customDetail.Title);
+        Assert.Null(customDetail.ReleaseDate);
+        Assert.Null(customDetail.Overview);
+        Assert.Null(customDetail.VoteAverage);
+        Assert.NotNull(customDetail.PosterAssetId);
+        Assert.True(customDetail.IsLocked);
 
         Assert.True(await repository.SetLibraryItemLockedAsync(new LibraryItemLockUpdateRequest(item.Id, IsLocked: false)));
         var unlockedDetail = await repository.GetItemDetailAsync(item.Id);

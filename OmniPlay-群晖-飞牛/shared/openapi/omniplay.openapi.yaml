@@ -246,6 +246,7 @@ paths:
           required: false
           schema:
             type: string
+            enum: [movie, tv, all]
         - name: year
           in: query
           required: false
@@ -418,7 +419,7 @@ paths:
           description: Video file not found or not playable
   /api/playback/capabilities:
     get:
-      summary: Detect FFmpeg availability and hardware H.264 encoders
+      summary: Detect FFmpeg availability, hardware decoders, hardware encoders, and accelerators
       responses:
         "200":
           description: FFmpeg transcode capabilities

@@ -646,10 +646,12 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
             return currentYear;
         }
 
-        var fileNameYear = NormalizeYear(MediaNameParser.ExtractSearchMetadata(candidate.FileName ?? string.Empty).Year);
-        if (!string.IsNullOrWhiteSpace(fileNameYear))
+        var combinedYear = NormalizeYear(MediaNameParser.CombinedSearchMetadata(
+            candidate.RelativePath ?? string.Empty,
+            candidate.FileName ?? string.Empty).Year);
+        if (!string.IsNullOrWhiteSpace(combinedYear))
         {
-            return fileNameYear;
+            return combinedYear;
         }
 
         if (string.IsNullOrWhiteSpace(candidate.BaseUrl) ||
@@ -673,13 +675,12 @@ public sealed class LibraryMetadataEnricher : ILibraryMetadataEnricher
             return currentYear;
         }
 
-        if (!MediaNameParser.IsLikelyTvEpisodePath(candidate.FileName ?? string.Empty))
+        var combinedYear = NormalizeYear(MediaNameParser.CombinedSearchMetadata(
+            candidate.RelativePath ?? string.Empty,
+            candidate.FileName ?? string.Empty).Year);
+        if (!string.IsNullOrWhiteSpace(combinedYear))
         {
-            var fileNameYear = NormalizeYear(MediaNameParser.ExtractSearchMetadata(candidate.FileName ?? string.Empty).Year);
-            if (!string.IsNullOrWhiteSpace(fileNameYear))
-            {
-                return fileNameYear;
-            }
+            return combinedYear;
         }
 
         if (string.IsNullOrWhiteSpace(candidate.BaseUrl) ||

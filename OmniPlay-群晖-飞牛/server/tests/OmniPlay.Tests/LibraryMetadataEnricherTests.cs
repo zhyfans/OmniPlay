@@ -186,6 +186,47 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(detail.Seasons[0].Episodes[1].StillAssetId));
     }
 
+    [Fact]
+    public async Task EnrichMissingUsesSourceForeignTitleAsSecondaryQuery()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        Touch(Path.Combine(
+            mediaRoot,
+            "Shows",
+            "足球教练.Ted.Lasso.2020.S01.2160p.ATVP.WEB-DL.H265",
+            "Ted.Lasso.2020.S01E01.2160p.ATVP.WEB-DL.H265.mkv"));
+
+        var paths = new StoragePaths(Path.Combine(root, "app"));
+        var database = new SqliteDatabase(paths);
+        database.EnsureInitialized();
+
+        await new MediaSourceRepository(database).AddLocalAsync("测试媒体", mediaRoot);
+        await new LibraryScanner(database).ScanAllAsync();
+
+        var fakeTmdb = new FakeTmdbMetadataClient(paths)
+        {
+            SearchMatch = new TmdbMetadataMatch(
+                97546,
+                "tv",
+                "足球教练",
+                "美式足球教练执教英超球队。",
+                "2020-08-14",
+                "/ted-lasso.jpg",
+                8.4,
+                80)
+        };
+        var enricher = new LibraryMetadataEnricher(
+            database,
+            new AppSettingsRepository(database),
+            fakeTmdb);
+
+        await enricher.EnrichMissingAsync();
+
+        Assert.Equal("足球教练", fakeTmdb.LastSearchTitle);
+        Assert.Equal("Ted Lasso", fakeTmdb.LastSearchSecondaryQuery);
+        Assert.Equal("2020", fakeTmdb.LastSearchYear);
+    }
+
     private static void Touch(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -217,6 +258,12 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
 
         public int? LastDetailTmdbId { get; private set; }
 
+        public string? LastSearchTitle { get; private set; }
+
+        public string? LastSearchYear { get; private set; }
+
+        public string? LastSearchSecondaryQuery { get; private set; }
+
         public List<int> LastSeasonNumbers { get; } = [];
 
         public TmdbMetadataMatch SearchMatch { get; set; } = new(
@@ -239,7 +286,17 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
             DetailRequestCount = 0;
             SeasonRequestCount = 0;
             LastDetailTmdbId = null;
+            LastSearchTitle = null;
+            LastSearchYear = null;
+            LastSearchSecondaryQuery = null;
             LastSeasonNumbers.Clear();
+        }
+
+        public Task<TmdbConnectionTestResult> TestConnectionAsync(
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new TmdbConnectionTestResult(true, "fake", 200, "ok"));
         }
 
         public Task<TmdbMetadataMatch?> SearchAsync(
@@ -247,9 +304,13 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
             string title,
             string? year,
             TmdbSettings settings,
+            string? secondaryQuery = null,
             CancellationToken cancellationToken = default)
         {
             SearchRequestCount++;
+            LastSearchTitle = title;
+            LastSearchYear = year;
+            LastSearchSecondaryQuery = secondaryQuery;
             return Task.FromResult<TmdbMetadataMatch?>(SearchMatch with { MediaType = mediaType });
         }
 
@@ -258,9 +319,13 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
             string title,
             string? year,
             TmdbSettings settings,
+            string? secondaryQuery = null,
             int limit = 8,
             CancellationToken cancellationToken = default)
         {
+            LastSearchTitle = title;
+            LastSearchYear = year;
+            LastSearchSecondaryQuery = secondaryQuery;
             IReadOnlyList<TmdbMetadataMatch> matches =
             [
                 SearchMatch with { MediaType = mediaType }

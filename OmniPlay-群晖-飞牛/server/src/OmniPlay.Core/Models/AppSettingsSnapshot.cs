@@ -5,9 +5,11 @@ public sealed record AppSettingsSnapshot(
     string Phase,
     TmdbSettings Tmdb,
     CacheSettings Cache,
-    PlaybackSettings Playback);
+    PlaybackSettings Playback,
+    ProxySettings Proxy);
 
 public sealed record PlaybackSettings(
     bool DirectStream = true,
     bool HlsRemux = true,
-    bool Transcode = true);
+    bool Transcode = true,
+    bool ShowEpisodeDetails = true);

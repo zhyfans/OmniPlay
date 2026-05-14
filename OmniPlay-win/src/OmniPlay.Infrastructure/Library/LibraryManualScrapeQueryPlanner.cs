@@ -20,7 +20,7 @@ internal static class LibraryManualScrapeQueryPlanner
             : manualQuery.Trim();
         var seedMetadata = MediaNameParser.ExtractSearchMetadata(seedQuery);
 
-        SearchMetadataSnapshot? pathMetadata = null;
+        SearchMetadataSnapshot? pathMetadata = BuildCombinedSearchMetadataSnapshot(relativePath, fileName);
         var resolvedMetadataPath = ResolveSearchMetadataPath(
             sourceProtocolType,
             baseUrl,
@@ -30,11 +30,13 @@ internal static class LibraryManualScrapeQueryPlanner
         if (!string.IsNullOrWhiteSpace(resolvedMetadataPath))
         {
             var extracted = MediaNameParser.ExtractSearchMetadata(resolvedMetadataPath);
-            pathMetadata = new SearchMetadataSnapshot(
-                extracted.ChineseTitle,
-                extracted.ForeignTitle,
-                extracted.FullCleanTitle,
-                MediaNameParser.ExtractParentFolderChineseTitle(resolvedMetadataPath));
+            pathMetadata = MergeSearchMetadata(
+                pathMetadata,
+                new SearchMetadataSnapshot(
+                    extracted.ChineseTitle,
+                    extracted.ForeignTitle,
+                    extracted.FullCleanTitle,
+                    MediaNameParser.ExtractParentFolderChineseTitle(resolvedMetadataPath)));
         }
 
         var primaryQuery = seedMetadata.ChineseTitle
@@ -94,6 +96,42 @@ internal static class LibraryManualScrapeQueryPlanner
 
             attempts.Add(new LibraryScrapeQueryAttempt(trimmed, label, secondaryQuery));
         }
+    }
+
+    private static SearchMetadataSnapshot? BuildCombinedSearchMetadataSnapshot(string? relativePath, string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) && string.IsNullOrWhiteSpace(fileName))
+        {
+            return null;
+        }
+
+        var metadata = MediaNameParser.CombinedSearchMetadata(relativePath ?? string.Empty, fileName ?? string.Empty);
+        return new SearchMetadataSnapshot(
+            metadata.ChineseTitle,
+            metadata.ForeignTitle,
+            metadata.FullCleanTitle,
+            metadata.ParentChineseTitle);
+    }
+
+    private static SearchMetadataSnapshot MergeSearchMetadata(
+        SearchMetadataSnapshot? primary,
+        SearchMetadataSnapshot fallback)
+    {
+        if (primary is null)
+        {
+            return fallback;
+        }
+
+        return new SearchMetadataSnapshot(
+            FirstPresent(primary.ChineseTitle, fallback.ChineseTitle),
+            FirstPresent(primary.ForeignTitle, fallback.ForeignTitle),
+            FirstPresent(primary.FullCleanTitle, fallback.FullCleanTitle),
+            FirstPresent(primary.ParentChineseTitle, fallback.ParentChineseTitle));
+    }
+
+    private static string? FirstPresent(string? primary, string? fallback)
+    {
+        return string.IsNullOrWhiteSpace(primary) ? fallback : primary;
     }
 
     private static string? ResolveSearchMetadataPath(

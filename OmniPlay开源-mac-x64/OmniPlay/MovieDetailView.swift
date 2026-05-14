@@ -269,33 +269,28 @@ struct MovieDetailView: View {
     }
 
     private func episodeBaseDisplayName(season: Int, episode: Int) -> String {
-        season == 0 ? "特别篇 第 \(episode) 集" : "第 \(season) 季 第 \(episode) 集"
-    }
-
-    private func episodeDetailSuffix(
-        from parsed: (season: Int, episode: Int, displayName: String, isTVShow: Bool, detectedSubtitle: String?)
-    ) -> String? {
-        let suffix = parsed.detectedSubtitle?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let suffix, !suffix.isEmpty else { return nil }
-        return suffix
+        season == 0 ? "特别篇第\(episode)集" : "第\(season)季第\(episode)集"
     }
 
     private func applyingDuplicateEpisodeSuffixes(
         to episodes: [EpisodeItem],
         eligibleEpisodeIDs: Set<String>,
-        explicitSubtitleFileIDs: Set<String>,
-        detailSuffixesByFileID: [String: String]
+        explicitSubtitleFileIDs: Set<String>
     ) -> [EpisodeItem] {
-        let duplicateCounts = Dictionary(
+        let duplicateGroups = Dictionary(
             grouping: episodes.filter { eligibleEpisodeIDs.contains($0.id) },
             by: { "\($0.season)#\($0.episode)" }
-        ).mapValues(\.count)
+        ).filter { $0.value.count > 1 }
+
+        var suffixesByFileID: [String: String] = [:]
+        for group in duplicateGroups.values {
+            let candidates = group.filter { !explicitSubtitleFileIDs.contains($0.id) }
+            let suffixes = episodePrefixDisambiguationSuffixes(for: candidates)
+            suffixesByFileID.merge(suffixes) { current, _ in current }
+        }
 
         return episodes.map { episode in
-            let key = "\(episode.season)#\(episode.episode)"
-            guard duplicateCounts[key, default: 0] > 1,
-                  !explicitSubtitleFileIDs.contains(episode.id),
-                  let suffix = detailSuffixesByFileID[episode.id],
+            guard let suffix = suffixesByFileID[episode.id],
                   !suffix.isEmpty else {
                 return episode
             }
@@ -307,6 +302,129 @@ struct MovieDetailView: View {
                 displayName: "\(episodeBaseDisplayName(season: episode.season, episode: episode.episode)) · \(suffix)"
             )
         }
+    }
+
+    private func episodePrefixDisambiguationSuffixes(for episodes: [EpisodeItem]) -> [String: String] {
+        guard episodes.count > 1 else { return [:] }
+        let tokenSets = episodes.map { episode in
+            (id: episode.id, tokens: episodePrefixTokens(from: episode.file.fileName))
+        }
+        guard tokenSets.contains(where: { !$0.tokens.isEmpty }) else { return [:] }
+
+        let allTokens = tokenSets.map(\.tokens)
+        let prefixCount = commonPrefixTokenCount(allTokens)
+        let suffixCount = commonSuffixTokenCount(allTokens, afterCommonPrefix: prefixCount)
+
+        var result: [String: String] = [:]
+        for item in tokenSets {
+            let end = max(prefixCount, item.tokens.count - suffixCount)
+            guard prefixCount < end else { continue }
+            let differenceTokens = Array(item.tokens[prefixCount..<end])
+            if let title = preferredEpisodeDifferenceTitle(from: differenceTokens) {
+                result[item.id] = title
+            }
+        }
+        return result
+    }
+
+    private func episodePrefixTokens(from fileName: String) -> [String] {
+        let stem = ((fileName as NSString).lastPathComponent as NSString).deletingPathExtension
+        guard let markerRange = episodeMarkerRange(in: stem) else { return [] }
+        let prefix = String(stem[..<markerRange.lowerBound])
+        let normalized = prefix
+            .replacingOccurrences(of: #"[\\[\\]\\(\\)\\{\\}【】（）《》「」『』〔〕〖〗,:：]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"[._\-–—]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+        return normalized
+            .split(separator: " ")
+            .map(String.init)
+            .filter { !isEpisodePrefixNoiseToken($0) }
+    }
+
+    private func episodeMarkerRange(in stem: String) -> Range<String.Index>? {
+        let patterns = [
+            #"[sS]\d{1,2}[eE][pP]?\d{1,3}"#,
+            #"[eE][pP]?\d{1,3}"#,
+            #"第\s*\d{1,3}\s*[集话]"#
+        ]
+        for pattern in patterns {
+            if let range = stem.range(of: pattern, options: .regularExpression) {
+                return range
+            }
+        }
+        return nil
+    }
+
+    private func commonPrefixTokenCount(_ tokenSets: [[String]]) -> Int {
+        guard let first = tokenSets.first, !first.isEmpty else { return 0 }
+        var count = 0
+        while count < first.count {
+            let token = normalizedEpisodeDifferenceToken(first[count])
+            guard tokenSets.allSatisfy({ $0.count > count && normalizedEpisodeDifferenceToken($0[count]) == token }) else {
+                break
+            }
+            count += 1
+        }
+        return count
+    }
+
+    private func commonSuffixTokenCount(_ tokenSets: [[String]], afterCommonPrefix prefixCount: Int) -> Int {
+        var count = 0
+        while true {
+            var candidate: String?
+            for tokens in tokenSets {
+                let index = tokens.count - count - 1
+                guard index >= prefixCount else { return count }
+                let token = normalizedEpisodeDifferenceToken(tokens[index])
+                if let candidate {
+                    guard candidate == token else { return count }
+                } else {
+                    candidate = token
+                }
+            }
+            count += 1
+        }
+    }
+
+    private func preferredEpisodeDifferenceTitle(from tokens: [String]) -> String? {
+        let chineseTokens = tokens.filter { $0.range(of: #"\p{Han}"#, options: .regularExpression) != nil }
+        if !chineseTokens.isEmpty {
+            let title = chineseTokens.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            return title.isEmpty ? nil : title
+        }
+
+        let englishTokens = tokens.filter {
+            $0.range(of: #"[A-Za-z]"#, options: .regularExpression) != nil &&
+            !isEpisodePrefixNoiseToken($0)
+        }
+        let title = englishTokens.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? nil : title
+    }
+
+    private func normalizedEpisodeDifferenceToken(_ token: String) -> String {
+        token.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isEpisodePrefixNoiseToken(_ token: String) -> Bool {
+        let lower = token.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lower.isEmpty { return true }
+        if lower.range(of: #"^(19|20)\d{2}$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^\d+$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^\d+(\.\d+)?$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(\d{3,4}p|[48]k|uhd|fhd|hd|sd)$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(8|10|12)bit$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(x|h)?26[45]$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^h\.?(264|265)$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^(aac|ac3|eac3|ddp|dts|truehd|lpcm|flac|mp3|opus)\d*(\.\d+)?$"#, options: .regularExpression) != nil { return true }
+        let releaseTokens: Set<String> = [
+            "blu", "ray", "bluray", "bdrip", "web", "dl", "webdl", "webrip", "hdtv", "uhdtv",
+            "remux", "avc", "hevc", "hdr", "dv", "dovi", "sdr", "hdr10", "hdr10plus",
+            "atmos", "nf", "netflix", "amzn", "amazon", "dsnp", "disney", "hulu", "atvp",
+            "max", "proper", "repack", "internal"
+        ]
+        return releaseTokens.contains(lower)
     }
 
     private func hasUnfinishedPlaybackProgress(_ file: VideoFile) -> Bool {
@@ -341,13 +459,8 @@ struct MovieDetailView: View {
         loadFileDetailsTask?.cancel()
         loadFileDetailsTask = Task {
             do {
-                let sourcePairs: [(VideoFile, MediaSource)] = try await AppDatabase.shared.dbQueue.read { db -> [(VideoFile, MediaSource)] in
-                    let files = try movie.request(for: Movie.videoFiles).fetchAll(db)
-                    return try files.compactMap { file -> (VideoFile, MediaSource)? in
-                        let source = try file.request(for: VideoFile.mediaSource).fetchOne(db)
-                        guard let source else { return nil }
-                        return (file, source)
-                    }
+                let sourcePairs = try await AppDatabase.shared.dbQueue.read { db in
+                    try VideoFile.fetchVisibleSourcePairs(movieId: movie.id, in: db)
                 }
                 if Task.isCancelled { return }
                 let files = sourcePairs.map(\.0)
@@ -358,7 +471,6 @@ struct MovieDetailView: View {
                 var episodes: [EpisodeItem] = []
                 var eligibleEpisodeIDs = Set<String>()
                 var explicitSubtitleFileIDs = Set<String>()
-                var detailSuffixesByFileID: [String: String] = [:]
                 var isShow = false
                 
                 for (index, file) in sortedFiles.enumerated() {
@@ -373,8 +485,6 @@ struct MovieDetailView: View {
                         if let customSubtitle, !customSubtitle.isEmpty {
                             dName += " · \(customSubtitle)"
                             explicitSubtitleFileIDs.insert(file.id)
-                        } else if let suffix = episodeDetailSuffix(from: parsed) {
-                            detailSuffixesByFileID[file.id] = suffix
                         }
                     } else if movie.title.contains("季") || movie.title.contains("集") {
                         isShow = true
@@ -398,8 +508,7 @@ struct MovieDetailView: View {
                 let sortedEpisodes = applyingDuplicateEpisodeSuffixes(
                     to: episodes,
                     eligibleEpisodeIDs: eligibleEpisodeIDs,
-                    explicitSubtitleFileIDs: explicitSubtitleFileIDs,
-                    detailSuffixesByFileID: detailSuffixesByFileID
+                    explicitSubtitleFileIDs: explicitSubtitleFileIDs
                 ).sorted { e1, e2 in
                     if e1.season != e2.season {
                         return seasonSortPriority(e1.season) < seasonSortPriority(e2.season)
@@ -667,6 +776,10 @@ struct EpisodeCardView: View {
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.appleLight.colors }
     @ObservedObject var cacheManager = OfflineCacheManager.shared
     @State private var isHoveringStill = false
+
+    private let thumbnailWidth: CGFloat = 260
+    private let thumbnailHeight: CGFloat = 146
+    private let thumbnailCornerRadius: CGFloat = 10
     
     var body: some View {
         let duration = ep.file.duration
@@ -681,21 +794,30 @@ struct EpisodeCardView: View {
         let downloadProgress = cacheManager.downloadProgress[ep.file.id]
         let isDownloading = downloadProgress != nil
         
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .center, spacing: 10) {
             ZStack {
                 Button(action: { currentVideoFileId = ep.file.id }) {
                     ZStack {
-                        EpisodeThumbnailView(fileId: ep.file.id, fallbackImage: localPoster)
+                        EpisodeThumbnailView(
+                            fileId: ep.file.id,
+                            fallbackImage: localPoster,
+                            width: thumbnailWidth,
+                            height: thumbnailHeight,
+                            cornerRadius: thumbnailCornerRadius
+                        )
                             .brightness(cardBrightness)
-                            .frame(width: 260, height: 146)
-                            .cornerRadius(10)
-                        Color.black.opacity(maskOpacity).cornerRadius(10)
+                        Color.black.opacity(maskOpacity)
                         if isEpWatched {
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: thumbnailCornerRadius)
                                 .stroke(Color.white.opacity(0.45), lineWidth: 1)
                         }
-                        if isSelected { RoundedRectangle(cornerRadius: 10).stroke(theme.accent, lineWidth: 1.5) }
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: thumbnailCornerRadius)
+                                .stroke(theme.accent, lineWidth: 1.5)
+                        }
                     }
+                    .frame(width: thumbnailWidth, height: thumbnailHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: thumbnailCornerRadius, style: .continuous))
                 }.buttonStyle(.plain)
 
                 if isDetailCacheModeActive {
@@ -724,7 +846,7 @@ struct EpisodeCardView: View {
                     .padding(8)
                     Spacer()
                 }
-                .frame(width: 260, height: 146)
+                .frame(width: thumbnailWidth, height: thumbnailHeight)
             }
             .onHover { hovering in
                 withAnimation(.easeInOut(duration: 0.12)) {
@@ -735,6 +857,8 @@ struct EpisodeCardView: View {
             Text(ep.displayName)
                 .font(.subheadline.bold())
                 .foregroundColor(theme.textPrimary.opacity(isSelected ? 1.0 : 0.8))
+                .frame(width: thumbnailWidth, alignment: .center)
+                .multilineTextAlignment(.center)
                 .lineLimit(2)
             
             if duration > 0 && !isEpWatched && ep.file.playProgress > 0 {
@@ -743,7 +867,7 @@ struct EpisodeCardView: View {
                         Rectangle().fill(theme.surface).frame(height: 4).cornerRadius(2)
                         Rectangle().fill(theme.accent).frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(progress))), height: 4).cornerRadius(2)
                     }
-                }.frame(width: 260, height: 4)
+                }.frame(width: thumbnailWidth, height: 4)
             } else { Spacer().frame(height: 4) }
         }
     }
@@ -900,19 +1024,40 @@ struct EpisodeMetadataEditSheet: View {
 struct EpisodeThumbnailView: View {
     let fileId: String
     let fallbackImage: NSImage?
+    let width: CGFloat
+    let height: CGFloat
+    let cornerRadius: CGFloat
     @State private var thumbnail: NSImage? = nil
     
     @AppStorage("appTheme") var appTheme = ThemeType.appleLight.rawValue
     var theme: AppTheme { ThemeType(rawValue: appTheme)?.colors ?? ThemeType.appleLight.colors }
     
     var body: some View {
-        Group {
-            if let img = thumbnail { Image(nsImage: img).resizable().aspectRatio(contentMode: .fill) }
-            else if let img = fallbackImage { Image(nsImage: img).resizable().aspectRatio(contentMode: .fill).blur(radius: 10).overlay(theme.background.opacity(0.5)) }
-            else { Rectangle().fill(theme.surface).overlay(Image(systemName: "photo").foregroundColor(theme.textSecondary.opacity(0.5))) }
+        ZStack {
+            if let img = thumbnail {
+                filledImage(img)
+            } else if let img = fallbackImage {
+                filledImage(img)
+                    .blur(radius: 10)
+                    .overlay(theme.background.opacity(0.5))
+            } else {
+                Rectangle()
+                    .fill(theme.surface)
+                    .overlay(Image(systemName: "photo").foregroundColor(theme.textSecondary.opacity(0.5)))
+            }
         }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .onAppear { loadThumbnail() }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ThumbnailGenerated_\(fileId)"))) { _ in loadThumbnail() }
+    }
+
+    private func filledImage(_ image: NSImage) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+            .frame(width: width, height: height)
+            .clipped()
     }
     
     private func loadThumbnail() {
