@@ -442,10 +442,44 @@ normalizePayloadPermissions(packageDir);
 
 console.log('==> Creating package.tgz');
 const packageTgzPath = path.join(spkRoot, 'package.tgz');
+const payloadTgzPath = path.join(spkRoot, 'payload.tgz');
 rmSync(packageTgzPath, { force: true });
+rmSync(payloadTgzPath, { force: true });
+run('tar', [
+  '--format',
+  'ustar',
+  '--no-xattrs',
+  '--uid',
+  '0',
+  '--gid',
+  '0',
+  '--uname',
+  'root',
+  '--gname',
+  'root',
+  '-czf',
+  payloadTgzPath,
+  '-C',
+  packageDir,
+  '.',
+]);
 writeFileSync(
   packageTgzPath,
-  gzipSync(createTarBuffer(collectTarEntries(buildDir, ['package'])), {
+  gzipSync(createTarBuffer([
+    {
+      name: 'package/',
+      type: 'directory',
+      mode: 0o755,
+      mtime: Math.floor(Date.now() / 1000),
+    },
+    {
+      name: 'package/PACKAGE_PLACEHOLDER',
+      type: 'file',
+      mode: 0o644,
+      mtime: Math.floor(Date.now() / 1000),
+      data: Buffer.from('OmniPlay payload is extracted by preinst from payload.tgz.\n', 'utf8'),
+    },
+  ]), {
     level: 9,
     mtime: 0,
   }),
@@ -453,7 +487,8 @@ writeFileSync(
 const packageChecksum = createHash('md5').update(readFileSync(packageTgzPath)).digest('hex');
 const packagePayloadSize = calculateDirectorySize(packageDir);
 const packageTgzSize = statSync(packageTgzPath).size;
-const extractSizeKb = Math.ceil((packagePayloadSize + packageTgzSize) / 1024);
+const payloadTgzSize = statSync(payloadTgzPath).size;
+const extractSizeKb = Math.ceil((packagePayloadSize + packageTgzSize + payloadTgzSize) / 1024) + 65536;
 
 console.log('==> Creating SPK metadata');
 const createInfo = (packageArch) => {
@@ -482,6 +517,7 @@ copyOrCreateIcon(largeIconPath, path.join(spkRoot, 'PACKAGE_ICON_256.PNG'), 256)
 const spkEntries = [
   'INFO',
   'package.tgz',
+  'payload.tgz',
   'scripts',
   'conf',
   'PACKAGE_ICON.PNG',
