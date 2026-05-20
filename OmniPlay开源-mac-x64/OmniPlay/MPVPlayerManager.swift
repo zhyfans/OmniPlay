@@ -566,6 +566,25 @@ class MPVPlayerManager: ObservableObject {
         }
     }
 
+    func seekAbsolute(seconds: Double) {
+        runOnControlQueue { [weak self] in
+            guard let self else { return }
+            mpv_command_string(self.mpv, String(format: "seek %.2f absolute", max(0, seconds)))
+        }
+    }
+
+    func playPlaylistIndex(_ index: Int, startPosition: Double = 0) {
+        runOnControlQueue { [weak self] in
+            guard let self else { return }
+            mpv_command_string(self.mpv, "playlist-play-index \(max(0, index))")
+            if startPosition > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self.seekAbsolute(seconds: startPosition)
+                }
+            }
+        }
+    }
+
     func seekRelative(seconds: Double) {
         runOnControlQueue { [weak self] in
             guard let self else { return }

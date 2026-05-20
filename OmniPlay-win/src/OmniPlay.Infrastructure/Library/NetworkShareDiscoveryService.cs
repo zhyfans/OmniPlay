@@ -19,8 +19,36 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
     private static readonly XNamespace DavNamespace = "DAV:";
     private static readonly Regex MultiSpace = new(@"\s{2,}", RegexOptions.Compiled);
     private static readonly TimeSpan MediaProbeTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan LanTcpProbeTimeout = TimeSpan.FromMilliseconds(600);
+    private static readonly string[] WebDavProbePaths =
+    [
+        "/",
+        "/dav/",
+        "/webdav/"
+    ];
+    private static readonly (string Scheme, int Port)[] LanHttpProbeEndpoints =
+    [
+        (Uri.UriSchemeHttp, 80),
+        (Uri.UriSchemeHttps, 443),
+        (Uri.UriSchemeHttp, 5005),
+        (Uri.UriSchemeHttps, 5006),
+        (Uri.UriSchemeHttp, 5244),
+        (Uri.UriSchemeHttp, 8080),
+        (Uri.UriSchemeHttps, 8443),
+        (Uri.UriSchemeHttp, 8096),
+        (Uri.UriSchemeHttps, 8096),
+        (Uri.UriSchemeHttp, 8097),
+        (Uri.UriSchemeHttps, 8097),
+        (Uri.UriSchemeHttp, 8098),
+        (Uri.UriSchemeHttps, 8098),
+        (Uri.UriSchemeHttp, 8099),
+        (Uri.UriSchemeHttps, 8099),
+        (Uri.UriSchemeHttps, 8920),
+        (Uri.UriSchemeHttp, 32400)
+    ];
     private readonly HttpClient httpClient;
     private readonly Func<CancellationToken, Task<IReadOnlyList<Uri>>> mediaServerEndpointProvider;
+    private readonly bool enableActiveLanDiscovery;
 
     public NetworkShareDiscoveryService(
         HttpClient httpClient,
@@ -28,11 +56,13 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
     {
         this.httpClient = httpClient;
         this.mediaServerEndpointProvider = mediaServerEndpointProvider ?? DiscoverMediaServerEndpointCandidatesAsync;
+        enableActiveLanDiscovery = mediaServerEndpointProvider is null;
     }
 
     public async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverAsync(CancellationToken cancellationToken = default)
     {
         Dictionary<string, NetworkSourceDiscoveryItem> results = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> smbServers = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (var drive in DriveInfo.GetDrives().Where(static drive => drive.DriveType == DriveType.Network))
         {
@@ -49,10 +79,15 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
                 BaseUrl = root,
                 Description = "Windows 已映射的网络文件夹。"
             };
+            if (TryGetSmbHost(root, out var mappedHost))
+            {
+                smbServers.Add($@"\\{mappedHost}");
+            }
         }
 
         foreach (var server in await ListSmbServersAsync(cancellationToken))
         {
+            smbServers.Add(server);
             results[$"smb:{server}"] = new NetworkSourceDiscoveryItem
             {
                 Name = server,
@@ -62,7 +97,22 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             };
         }
 
-        var httpCandidates = await LoadHttpEndpointCandidatesAsync(cancellationToken);
+        if (enableActiveLanDiscovery)
+        {
+            foreach (var server in await DiscoverSmbServersByTcpAsync(cancellationToken))
+            {
+                smbServers.Add(server);
+                results[$"smb:{server}"] = new NetworkSourceDiscoveryItem
+                {
+                    Name = server,
+                    ProtocolType = "smb",
+                    BaseUrl = server,
+                    Description = "预扫描到的 SMB 服务器。"
+                };
+            }
+        }
+
+        var httpCandidates = await LoadHttpEndpointCandidatesAsync(smbServers, cancellationToken);
         foreach (var webDavServer in await DiscoverWebDavServersAsync(httpCandidates, cancellationToken))
         {
             results[$"{webDavServer.ProtocolType}:{webDavServer.BaseUrl}"] = webDavServer;
@@ -94,16 +144,36 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
         };
     }
 
-    private async Task<IReadOnlyList<Uri>> LoadHttpEndpointCandidatesAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<Uri>> LoadHttpEndpointCandidatesAsync(
+        IEnumerable<string> knownSmbServers,
+        CancellationToken cancellationToken)
     {
+        Dictionary<string, Uri> results = new(StringComparer.OrdinalIgnoreCase);
         try
         {
-            return await mediaServerEndpointProvider(cancellationToken);
+            foreach (var uri in await mediaServerEndpointProvider(cancellationToken))
+            {
+                AddUri(results, uri);
+            }
         }
         catch
         {
-            return [];
         }
+
+        foreach (var uri in BuildLanHttpEndpointCandidatesFromSmbServers(knownSmbServers))
+        {
+            AddUri(results, uri);
+        }
+
+        if (enableActiveLanDiscovery)
+        {
+            foreach (var uri in await DiscoverLanHttpEndpointCandidatesAsync(cancellationToken))
+            {
+                AddUri(results, uri);
+            }
+        }
+
+        return results.Values.ToList();
     }
 
     private async Task<IReadOnlyList<NetworkSourceDiscoveryItem>> DiscoverWebDavServersAsync(
@@ -157,36 +227,37 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
         }
 
         var baseUri = new Uri(candidate.GetLeftPart(UriPartial.Authority));
-        using var request = BuildWebDavRequest(baseUri, null);
-
-        try
+        foreach (var probePath in WebDavProbePaths)
         {
-            using var response = await SendProbeAsync(request, cancellationToken);
-            if (response is null)
-            {
-                return null;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
+            var probeUri = new Uri(baseUri, probePath);
+            using var request = BuildWebDavRequest(probeUri, null);
 
-            var isMultiStatus = (int)response.StatusCode == 207;
-            var hasDavHeader = response.Headers.Contains("DAV");
-            if (!isMultiStatus && !hasDavHeader)
+            try
             {
-                return null;
-            }
+                using var response = await SendProbeAsync(request, cancellationToken);
+                if (response is null || !LooksLikeWebDavProbeResponse(probeUri, response))
+                {
+                    continue;
+                }
 
-            var normalized = MediaSourceNormalizer.NormalizeBaseUrl(MediaSourceProtocol.WebDav, baseUri.AbsoluteUri);
-            return new NetworkSourceDiscoveryItem
+                var normalized = MediaSourceNormalizer.NormalizeBaseUrl(
+                    MediaSourceProtocol.WebDav,
+                    probeUri.AbsoluteUri.TrimEnd('/'));
+                return new NetworkSourceDiscoveryItem
+                {
+                    Name = ResolveWebDavDiscoveryName(probeUri, normalized),
+                    ProtocolType = "webdav",
+                    BaseUrl = normalized,
+                    Description = $"预扫描到的 WebDAV 入口：{normalized}"
+                };
+            }
+            catch
             {
-                Name = "WebDAV",
-                ProtocolType = "webdav",
-                BaseUrl = normalized,
-                Description = $"Discovered WebDAV endpoint: {normalized}"
-            };
+            }
         }
-        catch
-        {
-            return null;
-        }
+
+        return null;
     }
 
     private async Task<NetworkSourceDiscoveryItem?> ProbeMediaServerAsync(Uri candidate, CancellationToken cancellationToken)
@@ -289,7 +360,9 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
                 ? MediaSourceProtocol.Jellyfin
                 : combined.Contains("Emby", StringComparison.OrdinalIgnoreCase)
                     ? MediaSourceProtocol.Emby
-                    : (MediaSourceProtocol?)null;
+                    : LooksLikeEmbyCompatiblePublicInfo(document.RootElement, baseUri)
+                        ? MediaSourceProtocol.Emby
+                        : (MediaSourceProtocol?)null;
             if (protocol is null)
             {
                 return null;
@@ -356,6 +429,319 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
         }
 
         return results.Values.ToList();
+    }
+
+    private static async Task<IReadOnlyList<Uri>> DiscoverLanHttpEndpointCandidatesAsync(CancellationToken cancellationToken)
+    {
+        var hosts = EnumerateLanProbeAddresses();
+        if (hosts.Count == 0)
+        {
+            return [];
+        }
+
+        var probes = hosts
+            .SelectMany(host => LanHttpProbeEndpoints.Select(endpoint => (Host: host, endpoint.Scheme, endpoint.Port)))
+            .ToList();
+        using var gate = new SemaphoreSlim(128);
+        var tasks = probes.Select(async probe =>
+        {
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                if (!await CanConnectTcpAsync(probe.Host, probe.Port, cancellationToken))
+                {
+                    return null;
+                }
+
+                return new Uri($"{probe.Scheme}://{probe.Host}:{probe.Port}");
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        return (await Task.WhenAll(tasks))
+            .OfType<Uri>()
+            .DistinctBy(static uri => uri.GetLeftPart(UriPartial.Authority), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IEnumerable<Uri> BuildLanHttpEndpointCandidatesFromSmbServers(IEnumerable<string> smbServers)
+    {
+        HashSet<string> hosts = new(StringComparer.OrdinalIgnoreCase);
+        foreach (var server in smbServers)
+        {
+            if (TryGetSmbHost(server, out var host))
+            {
+                if (IsValidHttpProbeHost(host))
+                {
+                    hosts.Add(host);
+                }
+            }
+        }
+
+        foreach (var host in hosts)
+        {
+            foreach (var endpoint in LanHttpProbeEndpoints)
+            {
+                yield return new Uri($"{endpoint.Scheme}://{host}:{endpoint.Port}");
+            }
+        }
+    }
+
+    private static async Task<IReadOnlyList<string>> DiscoverSmbServersByTcpAsync(CancellationToken cancellationToken)
+    {
+        var hosts = EnumerateLanProbeAddresses();
+        if (hosts.Count == 0)
+        {
+            return [];
+        }
+
+        using var gate = new SemaphoreSlim(128);
+        var tasks = hosts.Select(async host =>
+        {
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                return await CanConnectTcpAsync(host, 445, cancellationToken)
+                    ? $@"\\{host}"
+                    : null;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        return (await Task.WhenAll(tasks))
+            .Where(static server => !string.IsNullOrWhiteSpace(server))
+            .Select(static server => server!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static server => server, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static async Task<bool> CanConnectTcpAsync(string host, int port, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(LanTcpProbeTimeout);
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Parse(host), port, timeout.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static IReadOnlyList<string> EnumerateLanProbeAddresses()
+    {
+        List<string> addresses = [];
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+
+        void AddAddress(IPAddress candidate)
+        {
+            if (!IsPrivateProbeAddress(candidate))
+            {
+                return;
+            }
+
+            var value = candidate.ToString();
+            if (seen.Add(value))
+            {
+                addresses.Add(value);
+            }
+        }
+
+        AddAddress(IPAddress.Loopback);
+
+        try
+        {
+            foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (networkInterface.OperationalStatus != OperationalStatus.Up ||
+                    networkInterface.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+                {
+                    continue;
+                }
+
+                var properties = networkInterface.GetIPProperties();
+                foreach (var gateway in properties.GatewayAddresses)
+                {
+                    AddAddress(gateway.Address);
+                }
+
+                foreach (var unicast in properties.UnicastAddresses)
+                {
+                    if (unicast.Address.AddressFamily != AddressFamily.InterNetwork ||
+                        unicast.IPv4Mask is null ||
+                        !IsPrivateProbeAddress(unicast.Address))
+                    {
+                        continue;
+                    }
+
+                    AddAddress(unicast.Address);
+                    foreach (var address in EnumerateSubnetProbeAddresses(unicast.Address, unicast.IPv4Mask))
+                    {
+                        AddAddress(address);
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return addresses.Take(1024).ToList();
+    }
+
+    private static IEnumerable<IPAddress> EnumerateSubnetProbeAddresses(IPAddress address, IPAddress mask)
+    {
+        var addressValue = ToIPv4UInt32(address);
+        var maskValue = ToIPv4UInt32(mask);
+        var network = addressValue & maskValue;
+        var broadcast = network | ~maskValue;
+        var hostCount = broadcast > network ? broadcast - network - 1 : 0;
+        if (hostCount is > 0 and <= 510)
+        {
+            for (var value = network + 1; value < broadcast; value++)
+            {
+                yield return FromIPv4UInt32(value);
+            }
+
+            yield break;
+        }
+
+        var local24 = addressValue & 0xFFFFFF00u;
+        for (uint suffix = 1; suffix <= 254; suffix++)
+        {
+            yield return FromIPv4UInt32(local24 | suffix);
+        }
+    }
+
+    private static uint ToIPv4UInt32(IPAddress address)
+    {
+        var bytes = address.GetAddressBytes();
+        return ((uint)bytes[0] << 24) |
+               ((uint)bytes[1] << 16) |
+               ((uint)bytes[2] << 8) |
+               bytes[3];
+    }
+
+    private static IPAddress FromIPv4UInt32(uint value)
+    {
+        return new IPAddress(
+        [
+            (byte)(value >> 24),
+            (byte)(value >> 16),
+            (byte)(value >> 8),
+            (byte)value
+        ]);
+    }
+
+    private static bool IsPrivateProbeAddress(IPAddress address)
+    {
+        if (address.AddressFamily != AddressFamily.InterNetwork)
+        {
+            return false;
+        }
+
+        var bytes = address.GetAddressBytes();
+        return IPAddress.IsLoopback(address) ||
+               bytes[0] == 10 ||
+               bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127 ||
+               bytes[0] == 169 && bytes[1] == 254 ||
+               bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31 ||
+               bytes[0] == 192 && bytes[1] == 168;
+    }
+
+    private static bool TryGetSmbHost(string uncPath, out string host)
+    {
+        host = string.Empty;
+        var parts = uncPath.Trim()
+            .Trim('\\')
+            .Split('\\', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0 || string.IsNullOrWhiteSpace(parts[0]))
+        {
+            return false;
+        }
+
+        host = parts[0];
+        return true;
+    }
+
+    private static bool IsValidHttpProbeHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host) ||
+            host.Contains('\\', StringComparison.Ordinal) ||
+            host.Contains('/', StringComparison.Ordinal) ||
+            host.Contains(' ', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return Uri.CheckHostName(host) != UriHostNameType.Unknown;
+    }
+
+    private static string ResolveSmbDisplayName(string uncPath)
+    {
+        var parts = uncPath.Trim()
+            .Trim('\\')
+            .Split('\\', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length >= 2 && !string.IsNullOrWhiteSpace(parts[1]))
+        {
+            return parts[1];
+        }
+
+        return string.IsNullOrWhiteSpace(uncPath) ? "SMB" : uncPath.Trim();
+    }
+
+    private static bool LooksLikeWebDavProbeResponse(Uri probeUri, HttpResponseMessage response)
+    {
+        var isMultiStatus = (int)response.StatusCode == 207;
+        var hasDavHeader = response.Headers.Contains("DAV");
+        if (isMultiStatus || hasDavHeader)
+        {
+            return true;
+        }
+
+        if (response.StatusCode is not (HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden))
+        {
+            return false;
+        }
+
+        var path = probeUri.AbsolutePath.Trim('/');
+        return IsLikelyWebDavPort(probeUri.Port) ||
+               path.Equals("dav", StringComparison.OrdinalIgnoreCase) ||
+               path.Equals("webdav", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLikelyWebDavPort(int port)
+    {
+        return port is 5005 or 5006 or 5244;
+    }
+
+    private static bool LooksLikeEmbyCompatiblePublicInfo(JsonElement root, Uri baseUri)
+    {
+        if (root.ValueKind != JsonValueKind.Object ||
+            !IsLikelyEmbyCompatiblePort(baseUri.Port))
+        {
+            return false;
+        }
+
+        return TryGetJsonString(root, "ServerName", out _) ||
+               TryGetJsonString(root, "LocalAddress", out _) ||
+               TryGetJsonString(root, "Id", out _) ||
+               TryGetJsonString(root, "Version", out _);
+    }
+
+    private static bool IsLikelyEmbyCompatiblePort(int port)
+    {
+        return port is 8096 or 8097 or 8098 or 8099 or 8920;
     }
 
     private static async Task<IReadOnlyList<Uri>> DiscoverPlexGdmUrisAsync(CancellationToken cancellationToken)
@@ -736,7 +1122,7 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             return (await ListSmbSharesAsync(normalizedBaseUrl, cancellationToken))
                 .Select(share => new NetworkShareFolderItem
                 {
-                    Name = Path.GetFileName(share),
+                    Name = ResolveSmbDisplayName(share),
                     ProtocolType = "smb",
                     BaseUrl = share,
                     Description = share,
@@ -764,7 +1150,7 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             {
                 folders.Add(new NetworkShareFolderItem
                 {
-                    Name = Path.GetFileName(directory),
+                    Name = Path.GetFileName(directory.TrimEnd('\\')) ?? ResolveSmbDisplayName(directory),
                     ProtocolType = "smb",
                     BaseUrl = directory.TrimEnd('\\'),
                     Description = directory.TrimEnd('\\'),
@@ -799,15 +1185,26 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
             if (line.Length == 0 ||
                 line.StartsWith("Share name", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("共享名", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("在 \\\\", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Shared resources at", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Share resources at", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Server Name", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("服务器名称", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("The command", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("命令成功", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("没有", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("---", StringComparison.Ordinal))
             {
                 continue;
             }
 
             var shareName = MultiSpace.Split(line)[0];
-            if (shareName.Length == 0 || shareName.EndsWith('$'))
+            if (shareName.Length == 0 ||
+                shareName.EndsWith('$') ||
+                shareName.Contains('\\', StringComparison.Ordinal) ||
+                shareName.Contains(':', StringComparison.Ordinal) ||
+                shareName.Equals("Disk", StringComparison.OrdinalIgnoreCase) ||
+                shareName.Equals("磁盘", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -946,5 +1343,15 @@ public sealed class NetworkShareDiscoveryService : INetworkShareDiscoveryService
         return string.IsNullOrWhiteSpace(lastSegment)
             ? uri.Host
             : Uri.UnescapeDataString(lastSegment);
+    }
+
+    private static string ResolveWebDavDiscoveryName(Uri probeUri, string normalizedBaseUrl)
+    {
+        var path = probeUri.AbsolutePath.Trim('/');
+        return string.IsNullOrWhiteSpace(path) ||
+               path.Equals("dav", StringComparison.OrdinalIgnoreCase) ||
+               path.Equals("webdav", StringComparison.OrdinalIgnoreCase)
+            ? "WebDAV"
+            : ResolveWebDavName(normalizedBaseUrl);
     }
 }

@@ -225,7 +225,7 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
         {
             if (!hasDetectedEncoder || hasPreferredEncoder)
             {
-                details.Add($"未检测到这些常见编码的硬件解码路径：{string.Join(", ", missingCommonDecoders)}，对应视频会禁止软解转码");
+                details.Add($"未检测到这些常见编码的硬件解码路径：{string.Join(", ", missingCommonDecoders)}，对应视频可软件解码后再交给硬件编码器输出");
             }
         }
 
@@ -235,7 +235,7 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
             status,
             details.Count > 0
                 ? string.Join("；", details)
-                : "未发现 FFmpeg 暴露的硬件解码/编码能力。已禁止软件转码，需要启用 NAS 硬件转码能力或使用 Range 直出/HLS 转封装。",
+                : "未发现 FFmpeg 暴露的硬件解码/编码能力。需要转码的视频必须先修复 FFmpeg/VAAPI/QSV 硬件编码器检测。",
             new Dictionary<string, string>
             {
                 ["preferredEncoder"] = capabilities.PreferredHardwareEncoder ?? "",
@@ -302,6 +302,7 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
         {
             return error.Contains("Input/output error", StringComparison.OrdinalIgnoreCase)
                    || error.Contains("Failed to initialise VAAPI", StringComparison.OrdinalIgnoreCase)
+                   || error.Contains("No VA display found", StringComparison.OrdinalIgnoreCase)
                 ? $"VAAPI：{ResolveVaapiDevicePath()} 初始化失败，通常是 NAS 显卡驱动不可用、驱动不匹配，或该设备不支持 VAAPI 编码"
                 : $"VAAPI：{TrimHardwareProbeError(error)}";
         }
@@ -415,12 +416,20 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
     {
         var usesDriDevice = capabilities.HardwareAccelerators.Any(static accelerator =>
                                 accelerator is "vaapi" or "qsv")
+                            || (capabilities.DetectedHardwareAccelerators?.Any(static accelerator =>
+                                accelerator is "vaapi" or "qsv") ?? false)
                             || capabilities.HardwareDecoders.Any(static decoder =>
                                 decoder.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
                                 || decoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase))
+                            || (capabilities.DetectedHardwareDecoders?.Any(static decoder =>
+                                decoder.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
+                                || decoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase)) ?? false)
                             || capabilities.HardwareEncoders.Any(static encoder =>
                                 encoder.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
-                                || encoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase));
+                                || encoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase))
+                            || (capabilities.DetectedHardwareEncoders?.Any(static encoder =>
+                                encoder.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
+                                || encoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase)) ?? false);
         var usesV4l2Device = capabilities.HardwareAccelerators.Any(static accelerator => accelerator == "v4l2m2m")
                              || capabilities.HardwareDecoders.Any(static decoder =>
                                  decoder.EndsWith("_v4l2m2m", StringComparison.OrdinalIgnoreCase))

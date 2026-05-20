@@ -310,11 +310,17 @@ public partial class SettingsViewModel : ObservableObject
 
         try
         {
-            await settingsService.SaveAsync(BuildAppSettings());
+            var settings = BuildAppSettings();
+            await settingsService.SaveAsync(settings);
+            Apply(settings);
 
             loaded = true;
             StatusMessage = "设置已保存。";
             SettingsSaved?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"保存设置失败：{ex.Message}";
         }
         finally
         {

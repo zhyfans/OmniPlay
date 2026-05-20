@@ -43,6 +43,8 @@ public partial class PosterWallViewModel : ObservableObject
     private readonly List<TvShow> allTvShows = [];
     private readonly List<LibraryPosterItem> allLibraryItems = [];
     private readonly List<LibraryVideoItem> allDetailFiles = [];
+    private readonly HashSet<string> knownLibraryPosterIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> newlyDiscoveredPosterOrder = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim libraryRefreshGate = new(1, 1);
     private CancellationTokenSource? libraryAutomationCancellationTokenSource;
     private CancellationTokenSource? playbackProgressSyncCancellationTokenSource;
@@ -54,6 +56,10 @@ public partial class PosterWallViewModel : ObservableObject
     private string? suppressedPlaybackPersistenceVideoId;
     private string? autoAdvancedPlaybackVideoId;
     private bool isAutoAdvancingToNextEpisode;
+    private bool isAutoAdvancingToNextMoviePart;
+    private bool isMultipartTimelineSeekPreviewActive;
+    private double multipartTimelineSeekPreviewSeconds;
+    private double? nextPlaybackStartPositionOverride;
     private Task? libraryRefreshTask;
     private bool forceRefreshQueued;
     private bool startupScanAttempted;
@@ -68,6 +74,8 @@ public partial class PosterWallViewModel : ObservableObject
     private PlaybackMode currentPlaybackMode;
     private double lastSyncedPlaybackPositionSeconds = double.NaN;
     private double lastSyncedPlaybackDurationSeconds = double.NaN;
+    private long nextNewlyDiscoveredPosterOrder;
+    private bool libraryPosterTrackingInitialized;
     private bool suppressSortPreferencePersistence;
 
     public PosterWallViewModel(
@@ -111,10 +119,13 @@ public partial class PosterWallViewModel : ObservableObject
         Player = player;
 
         ScanCommand = new AsyncRelayCommand(ScanAsync, () => !IsBusy && !startupScanInProgress);
-        AddFolderSourceCommand = new AsyncRelayCommand(AddFolderSourceAsync, () => !IsBusy);
+        AddFolderSourceCommand = new AsyncRelayCommand(
+            AddFolderSourceAsync,
+            () => !IsBusy || IsLibraryScanInProgress,
+            AsyncRelayCommandOptions.AllowConcurrentExecutions);
         AddWebDavSourceCommand = new AsyncRelayCommand(AddWebDavSourceAsync, () => !IsBusy);
         TestWebDavSourceCommand = new AsyncRelayCommand(TestWebDavSourceAsync, () => !IsBusy);
-        OpenMediaServerPanelCommand = new RelayCommand(OpenMediaServerPanel, () => !IsBusy);
+        OpenMediaServerPanelCommand = new RelayCommand(OpenMediaServerPanel, () => !IsBusy || IsLibraryScanInProgress);
         CloseMediaServerPanelCommand = new RelayCommand(CloseMediaServerPanel, () => !IsBusy);
         PreScanMediaServerSourceCommand = new AsyncRelayCommand(PreScanMediaServerSourceAsync, () => IsMediaServerPanelOpen && !IsBusy);
         AuthorizePlexCommand = new AsyncRelayCommand(AuthorizePlexAsync, () => IsMediaServerPanelOpen && !IsBusy && !IsPlexAuthorizationInProgress && PendingMediaServerUsesPlex);
@@ -124,6 +135,8 @@ public partial class PosterWallViewModel : ObservableObject
         PlayPrimaryCommand = new AsyncRelayCommand(PlayPrimaryAsync, () => DetailPrimaryFile is not null);
         OpenStandalonePlayerCommand = new AsyncRelayCommand<LibraryVideoItem?>(OpenStandalonePlayerAsync, video => video is not null);
         OpenStandalonePrimaryCommand = new AsyncRelayCommand(OpenStandalonePrimaryAsync, () => DetailPrimaryFile is not null);
+        PlayerTimelineSeekBackwardCommand = new AsyncRelayCommand(() => SeekPlayerTimelineRelativeAsync(-10), CanSeekPlayerTimeline);
+        PlayerTimelineSeekForwardCommand = new AsyncRelayCommand(() => SeekPlayerTimelineRelativeAsync(10), CanSeekPlayerTimeline);
         RefreshDetailMetadataCommand = new AsyncRelayCommand(
             RefreshDetailMetadataAsync,
             () => (currentDetailMovieId.HasValue || currentDetailTvShowId.HasValue) && !IsBusy);
@@ -186,8 +199,8 @@ public partial class PosterWallViewModel : ObservableObject
             ToggleSourceEnabledAsync,
             source => source?.Id is not null && (!IsBusy || source.IsEnabled));
         RefreshNetworkSourcesCommand = new AsyncRelayCommand(RefreshNetworkSourcesAsync, () => !networkDiscoveryInProgress);
-        OpenNetworkLoginCommand = new RelayCommand<NetworkSourceDiscoveryItem?>(OpenNetworkLogin, item => item is not null && !IsBusy);
-        OpenManualNetworkLoginCommand = new RelayCommand(OpenManualNetworkLogin, () => !IsBusy);
+        OpenNetworkLoginCommand = new RelayCommand<NetworkSourceDiscoveryItem?>(OpenNetworkLogin, item => item is not null && (!IsBusy || IsLibraryScanInProgress));
+        OpenManualNetworkLoginCommand = new RelayCommand(OpenManualNetworkLogin, () => !IsBusy || IsLibraryScanInProgress);
         CloseNetworkLoginCommand = new RelayCommand(CloseNetworkLogin);
         SaveNetworkLoginCommand = new AsyncRelayCommand(SaveNetworkLoginAsync, () => IsNetworkLoginPanelOpen && !IsBusy);
         ToggleNetworkPasswordVisibilityCommand = new RelayCommand(ToggleNetworkPasswordVisibility);
@@ -256,7 +269,7 @@ public partial class PosterWallViewModel : ObservableObject
 
     public string PendingMediaServerTokenWatermark => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) == "plex"
         ? "Plex 访问令牌（X-Plex-Token）"
-        : "API Key / 访问令牌";
+        : "密码 / API Key / 访问令牌";
 
     public bool PendingMediaServerUsesUserId => NormalizeMediaServerProtocolType(PendingMediaServerProtocolType) != "plex";
 
@@ -295,6 +308,10 @@ public partial class PosterWallViewModel : ObservableObject
     public IAsyncRelayCommand<LibraryVideoItem?> OpenStandalonePlayerCommand { get; }
 
     public IAsyncRelayCommand OpenStandalonePrimaryCommand { get; }
+
+    public IAsyncRelayCommand PlayerTimelineSeekBackwardCommand { get; }
+
+    public IAsyncRelayCommand PlayerTimelineSeekForwardCommand { get; }
 
     public IAsyncRelayCommand RefreshDetailMetadataCommand { get; }
 
@@ -740,7 +757,61 @@ public partial class PosterWallViewModel : ObservableObject
     public bool CanShowDetailMetadataCandidatesPanel => HasDetailMetadataCandidates && !IsDetailMetadataCandidatePanelOpen;
 
     public bool CanShowDetailPrimaryProgress =>
-        DetailPrimaryFile is { Duration: > 0, PlayProgress: > 0 } file && !file.IsWatched;
+        IsDetailMultipartMovie
+            ? ResolveMultipartSavedTimeline().DurationSeconds > 0 &&
+              ResolveMultipartSavedTimeline().PositionSeconds > 0 &&
+              ResolveMultipartSavedTimeline().PositionSeconds < ResolveMultipartSavedTimeline().DurationSeconds * PlaybackProgressRules.CompletionRatio
+            : DetailPrimaryFile is { Duration: > 0, PlayProgress: > 0 } file && !file.IsWatched;
+
+    public double PlayerTimelineDurationSeconds => ResolvePlayerTimeline().DurationSeconds;
+
+    public double PlayerTimelineSeekPositionSeconds
+    {
+        get => !IsPlayingMultipartMovie
+            ? Player.SeekPositionSeconds
+            : isMultipartTimelineSeekPreviewActive
+            ? multipartTimelineSeekPreviewSeconds
+            : ResolvePlayerTimeline().PositionSeconds;
+        set
+        {
+            if (IsPlayingMultipartMovie)
+            {
+                multipartTimelineSeekPreviewSeconds = ClampPlayerTimelinePosition(value);
+                NotifyPlayerTimelineChanged();
+                return;
+            }
+
+            Player.UpdateSeekPreview(value);
+        }
+    }
+
+    public IReadOnlyList<double> PlayerTimelineSegmentBoundaries => ResolvePlayerTimelineSegmentBoundaries();
+
+    public string PlayerTimelineCurrentPositionText =>
+        !IsPlayingMultipartMovie
+            ? Player.CurrentPositionText
+            : FormatPlaybackTime(isMultipartTimelineSeekPreviewActive
+            ? multipartTimelineSeekPreviewSeconds
+            : ResolvePlayerTimeline().PositionSeconds);
+
+    public string PlayerTimelineRemainingTimeText
+    {
+        get
+        {
+            if (!IsPlayingMultipartMovie)
+            {
+                return Player.RemainingTimeText;
+            }
+
+            var timeline = ResolvePlayerTimeline();
+            if (timeline.DurationSeconds <= 0)
+            {
+                return "--:--";
+            }
+
+            return FormatPlaybackTime(timeline.DurationSeconds);
+        }
+    }
 
     public bool HasStatusMessage => ShouldShowHomeStatusMessage(HomeStatusMessage);
 
@@ -911,6 +982,7 @@ public partial class PosterWallViewModel : ObservableObject
                             StatusMessage = item.IsTvShow
                                 ? $"正在刮削剧集元数据和海报：{item.Title}..."
                                 : $"正在刮削电影元数据和海报：{item.Title}...";
+                            await ReloadLibraryAsync();
                             await RefreshIndexedScanItemArtworkAsync(item, token);
                         },
                     deferUnidentifiedGroups: true);
@@ -996,6 +1068,8 @@ public partial class PosterWallViewModel : ObservableObject
 
             var automationCancellationTokenSource = BeginLibraryAutomation();
             var cancellationToken = automationCancellationTokenSource.Token;
+            IsBusy = false;
+            OnCommandStateChanged();
             try
             {
                 StatusMessage = $"已添加本地媒体源：{source.Name}，正在扫描并刮削...";
@@ -1068,6 +1142,8 @@ public partial class PosterWallViewModel : ObservableObject
 
             var automationCancellationTokenSource = BeginLibraryAutomation();
             var cancellationToken = automationCancellationTokenSource.Token;
+            IsBusy = false;
+            OnCommandStateChanged();
             try
             {
                 StatusMessage = $"已添加 WebDAV 媒体源：{source.Name}，正在扫描并刮削...";
@@ -1322,7 +1398,10 @@ public partial class PosterWallViewModel : ObservableObject
         BuildSeasonState(files, isSeries);
         ApplyDetailFilter();
 
-        StatusMessage = $"\u5DF2\u6253\u5F00\u300A{title}\u300B\u8BE6\u60C5\u3002";
+        if (!IsLibraryScanInProgress)
+        {
+            StatusMessage = $"\u5DF2\u6253\u5F00\u300A{title}\u300B\u8BE6\u60C5\u3002";
+        }
         OnPropertyChanged(nameof(HasDetailFiles));
         OnCommandStateChanged();
     }
@@ -1751,7 +1830,8 @@ public partial class PosterWallViewModel : ObservableObject
         }
 
         ApplyPreferredDetailVideoSelection(video);
-        var playbackStartPosition = GetPlaybackStartPosition(video);
+        var playbackStartPosition = nextPlaybackStartPositionOverride ?? GetPlaybackStartPosition(video);
+        nextPlaybackStartPositionOverride = null;
         ApplyPlaybackPreferencesToPlayer();
 
         IsPlayerOverlayOpen = true;
@@ -1766,10 +1846,24 @@ public partial class PosterWallViewModel : ObservableObject
         ResetAutoAdvanceState();
         ResetPlaybackProgressSyncState();
         UpdatePlayerNextEpisodeAction();
+        NotifyPlayerTimelineChanged();
         StatusMessage = playbackStartPosition.HasValue
             ? $"\u6B63\u5728\u7EE7\u7EED\u64AD\u653E\uFF1A{video.FileName}"
             : $"\u6B63\u5728\u51C6\u5907\u64AD\u653E\uFF1A{video.FileName}";
         OnCommandStateChanged();
+    }
+
+    private async Task PlayVideoWithStartPositionAsync(LibraryVideoItem video, double? startPositionSeconds)
+    {
+        nextPlaybackStartPositionOverride = startPositionSeconds;
+        try
+        {
+            await PlayVideoAsync(video);
+        }
+        finally
+        {
+            nextPlaybackStartPositionOverride = null;
+        }
     }
 
     private Task OpenStandalonePlayerAsync(LibraryVideoItem? video)
@@ -1842,6 +1936,7 @@ public partial class PosterWallViewModel : ObservableObject
         ResetAutoAdvanceState();
         ResetPlaybackProgressSyncState();
         UpdatePlayerNextEpisodeAction();
+        NotifyPlayerTimelineChanged();
         if (Player.IsPlaying)
         {
             StartPlaybackProgressSync();
@@ -3319,6 +3414,7 @@ public partial class PosterWallViewModel : ObservableObject
         selectedPlaybackNavigationSeason = null;
         ResetAutoAdvanceState();
         UpdatePlayerNextEpisodeAction();
+        NotifyPlayerTimelineChanged();
         StatusMessage = "\u5DF2\u5173\u95ED\u64AD\u653E\u5668\u8986\u76D6\u5C42\u3002";
         OnCommandStateChanged();
     }
@@ -4004,6 +4100,8 @@ public partial class PosterWallViewModel : ObservableObject
                 : $"{folders.Count} 个文件夹";
             NetworkSourceStatus = $"已挂载媒体源：{folderSummary}，正在扫描并刮削...";
             StatusMessage = NetworkSourceStatus;
+            IsBusy = false;
+            OnCommandStateChanged();
 
             LastScanSummary = await RunLibraryScanAndArtworkAsync(
                 isExplicitRequest: true,
@@ -4289,7 +4387,7 @@ public partial class PosterWallViewModel : ObservableObject
         {
             MediaServerStatus = protocolKind == MediaSourceProtocol.Plex
                 ? "Plex 需要访问令牌（X-Plex-Token）才能读取媒体库。"
-                : $"{source.ProtocolLabel} 需要 API Key 或访问令牌才能读取媒体列表和生成播放地址。";
+                : $"{source.ProtocolLabel} 需要密码、API Key 或访问令牌才能读取媒体列表和生成播放地址。";
             return null;
         }
 
@@ -4351,8 +4449,8 @@ public partial class PosterWallViewModel : ObservableObject
         return NormalizeMediaServerProtocolType(protocolType) switch
         {
             "plex" => "Plex 默认地址为 http://127.0.0.1:32400，点击“登录 Plex”会自动获取访问令牌。",
-            "emby" => "Emby 默认地址为 http://127.0.0.1:8096，请填写 API Key 或访问令牌。",
-            "jellyfin" => "Jellyfin 默认地址为 http://127.0.0.1:8096，请填写 API Key 或访问令牌。",
+            "emby" => "Emby 默认地址为 http://127.0.0.1:8096，可填写用户名和密码，也可直接填写 API Key 或访问令牌。",
+            "jellyfin" => "Jellyfin 默认地址为 http://127.0.0.1:8096，可填写用户名和密码，也可直接填写 API Key 或访问令牌。",
             _ => "保存后会先预扫描媒体库列表；可给多个库点星标，关闭列表时统一挂载并扫描刮削。"
         };
     }
@@ -4616,6 +4714,8 @@ public partial class PosterWallViewModel : ObservableObject
             StatusMessage = $"已开启媒体源：{source.Name}，正在扫描并刮削...";
             var automationCancellationTokenSource = BeginLibraryAutomation();
             var cancellationToken = automationCancellationTokenSource.Token;
+            IsBusy = false;
+            OnCommandStateChanged();
             try
             {
                 LastScanSummary = await RunLibraryScanAndArtworkAsync(
@@ -4680,6 +4780,71 @@ public partial class PosterWallViewModel : ObservableObject
         }
     }
 
+    private static void SynchronizeLibraryPosterItems(
+        ObservableCollection<LibraryPosterItem> target,
+        IReadOnlyList<LibraryPosterItem> source)
+    {
+        for (var sourceIndex = 0; sourceIndex < source.Count; sourceIndex++)
+        {
+            var sourceItem = source[sourceIndex];
+            var existingIndex = IndexOfPosterItem(target, sourceItem.Id);
+            if (existingIndex < 0)
+            {
+                target.Insert(sourceIndex, sourceItem);
+                continue;
+            }
+
+            if (existingIndex != sourceIndex)
+            {
+                target.Move(existingIndex, sourceIndex);
+            }
+
+            if (!LibraryPosterItemsEqual(target[sourceIndex], sourceItem))
+            {
+                target[sourceIndex] = sourceItem;
+            }
+        }
+
+        while (target.Count > source.Count)
+        {
+            target.RemoveAt(target.Count - 1);
+        }
+    }
+
+    private static int IndexOfPosterItem(IReadOnlyList<LibraryPosterItem> items, string id)
+    {
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (string.Equals(items[index].Id, id, StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool LibraryPosterItemsEqual(LibraryPosterItem left, LibraryPosterItem right)
+    {
+        return string.Equals(left.Id, right.Id, StringComparison.Ordinal) &&
+               string.Equals(left.Title, right.Title, StringComparison.Ordinal) &&
+               string.Equals(left.Subtitle, right.Subtitle, StringComparison.Ordinal) &&
+               string.Equals(left.PosterPath, right.PosterPath, StringComparison.Ordinal) &&
+               left.VoteAverage == right.VoteAverage &&
+               string.Equals(left.MediaKind, right.MediaKind, StringComparison.Ordinal) &&
+               left.ContinueWatchingProgress == right.ContinueWatchingProgress &&
+               left.LastPlayedAt == right.LastPlayedAt &&
+               string.Equals(left.ContinueWatchingLabel, right.ContinueWatchingLabel, StringComparison.Ordinal) &&
+               left.IsContinuing == right.IsContinuing &&
+               left.WatchState == right.WatchState &&
+               left.OfflineCacheIsDownloading == right.OfflineCacheIsDownloading &&
+               left.OfflineCacheIsCached == right.OfflineCacheIsCached &&
+               left.OfflineCacheUnavailable == right.OfflineCacheUnavailable &&
+               left.OfflineCacheProgress == right.OfflineCacheProgress &&
+               left.MovieId == right.MovieId &&
+               left.TvShowId == right.TvShowId;
+    }
+
     private static void ReplaceItems<T>(ObservableCollection<T> target, IReadOnlyList<T> source)
     {
         if (target.SequenceEqual(source))
@@ -4700,10 +4865,21 @@ public partial class PosterWallViewModel : ObservableObject
         {
             if (Player.IsPlaybackCompleted)
             {
+                _ = TryAutoAdvanceToNextMoviePartAsync();
                 _ = TryAutoAdvanceToNextEpisodeAsync();
             }
 
+            NotifyPlayerTimelineChanged();
             return;
+        }
+
+        if (e.PropertyName is nameof(PlayerViewModel.CurrentPositionSeconds)
+            or nameof(PlayerViewModel.DurationSeconds)
+            or nameof(PlayerViewModel.SeekPositionSeconds)
+            or nameof(PlayerViewModel.IsPlaying)
+            or nameof(PlayerViewModel.IsPaused))
+        {
+            NotifyPlayerTimelineChanged();
         }
 
         if (e.PropertyName != nameof(PlayerViewModel.IsPlaying))
@@ -4745,6 +4921,34 @@ public partial class PosterWallViewModel : ObservableObject
         finally
         {
             isAutoAdvancingToNextEpisode = false;
+        }
+    }
+
+    private async Task TryAutoAdvanceToNextMoviePartAsync()
+    {
+        if (isAutoAdvancingToNextMoviePart ||
+            !HasActivePlaybackSession() ||
+            string.IsNullOrWhiteSpace(currentPlayingVideoId) ||
+            string.Equals(autoAdvancedPlaybackVideoId, currentPlayingVideoId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var currentPart = ResolveCurrentPlaybackMoviePart();
+        if (currentPart is null || FindNextMoviePart(currentPart) is null)
+        {
+            return;
+        }
+
+        autoAdvancedPlaybackVideoId = currentPlayingVideoId;
+        isAutoAdvancingToNextMoviePart = true;
+        try
+        {
+            await PlayNextMoviePartAsync();
+        }
+        finally
+        {
+            isAutoAdvancingToNextMoviePart = false;
         }
     }
 
@@ -4931,9 +5135,83 @@ public partial class PosterWallViewModel : ObservableObject
             items = items.Where(x => x.Title.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
         }
 
-        items = SortLibraryItems(items).Select(ApplyOfflineCacheState);
+        var sortedItems = SortLibraryItems(items)
+            .Select(ApplyOfflineCacheState)
+            .ToList();
 
-        ReplaceItems(LibraryItems, items.ToList());
+        SynchronizeLibraryPosterItems(LibraryItems, ArrangeLibraryItemsForPresentation(sortedItems));
+    }
+
+    private IReadOnlyList<LibraryPosterItem> ArrangeLibraryItemsForPresentation(IReadOnlyList<LibraryPosterItem> sortedItems)
+    {
+        UpdateLibraryPosterTracking();
+        if (newlyDiscoveredPosterOrder.Count == 0)
+        {
+            return sortedItems;
+        }
+
+        var pinnedItems = sortedItems
+            .Where(item => newlyDiscoveredPosterOrder.ContainsKey(item.Id))
+            .OrderByDescending(item => newlyDiscoveredPosterOrder[item.Id])
+            .ToList();
+        if (pinnedItems.Count == 0)
+        {
+            return sortedItems;
+        }
+
+        return pinnedItems
+            .Concat(sortedItems.Where(item => !newlyDiscoveredPosterOrder.ContainsKey(item.Id)))
+            .ToList();
+    }
+
+    private void UpdateLibraryPosterTracking()
+    {
+        var currentIds = allLibraryItems
+            .Select(static item => item.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (!libraryPosterTrackingInitialized)
+        {
+            knownLibraryPosterIds.Clear();
+            knownLibraryPosterIds.UnionWith(currentIds);
+            libraryPosterTrackingInitialized = true;
+            return;
+        }
+
+        foreach (var removedId in knownLibraryPosterIds.Except(currentIds).ToList())
+        {
+            knownLibraryPosterIds.Remove(removedId);
+            newlyDiscoveredPosterOrder.Remove(removedId);
+        }
+
+        foreach (var item in allLibraryItems)
+        {
+            if (knownLibraryPosterIds.Add(item.Id) && IsLibraryScanInProgress)
+            {
+                newlyDiscoveredPosterOrder[item.Id] = ++nextNewlyDiscoveredPosterOrder;
+            }
+        }
+
+        if (!IsLibraryScanInProgress)
+        {
+            newlyDiscoveredPosterOrder.Clear();
+            return;
+        }
+
+        foreach (var item in allLibraryItems)
+        {
+            if (newlyDiscoveredPosterOrder.ContainsKey(item.Id) && HasSettledPosterMetadata(item))
+            {
+                newlyDiscoveredPosterOrder.Remove(item.Id);
+            }
+        }
+    }
+
+    private static bool HasSettledPosterMetadata(LibraryPosterItem item)
+    {
+        return !string.IsNullOrWhiteSpace(item.PosterPath) ||
+               item.VoteAverage.HasValue ||
+               SortYearValue(item).HasValue;
     }
 
     private IEnumerable<LibraryPosterItem> SortLibraryItems(IEnumerable<LibraryPosterItem> items)
@@ -5465,6 +5743,8 @@ public partial class PosterWallViewModel : ObservableObject
             .Where(static file => !file.IsWatched)
             .OrderBy(static file => file.SeasonNumber == 0 ? int.MaxValue : file.SeasonNumber)
             .ThenBy(static file => file.EpisodeNumber)
+            .ThenBy(static file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(static file => file.FileName, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
         var nextUp = recentUnfinished ?? nextUnwatched;
 
@@ -5492,9 +5772,7 @@ public partial class PosterWallViewModel : ObservableObject
         }
         else
         {
-            filtered = allDetailFiles
-                .OrderBy(static file => file.FileName, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            filtered = OrderMovieFilesForPlayback(allDetailFiles);
         }
 
         filtered = filtered.Select(ApplyOfflineCacheState).ToList();
@@ -5553,6 +5831,20 @@ public partial class PosterWallViewModel : ObservableObject
     private void UpdatePlayerNextEpisodeAction()
     {
         UpdatePlayerPlaybackNavigation();
+
+        var currentMoviePart = ResolveCurrentPlaybackMoviePart();
+        if (currentMoviePart is not null)
+        {
+            var previousPart = FindPreviousMoviePart(currentMoviePart);
+            var nextPart = FindNextMoviePart(currentMoviePart);
+            Player.ConfigurePreviousEpisodeAction(
+                previousPart is null ? null : PlayPreviousMoviePartAsync,
+                previousPart is null ? null : $"播放上一段 · {BuildMoviePartLabel(previousPart)}");
+            Player.ConfigureNextEpisodeAction(
+                nextPart is null ? null : PlayNextMoviePartAsync,
+                nextPart is null ? null : $"播放下一段 · {BuildMoviePartLabel(nextPart)}");
+            return;
+        }
 
         var currentEpisode = ResolveCurrentPlaybackEpisode();
         var previousEpisode = currentEpisode is null ? null : FindPreviousEpisode(currentEpisode);
@@ -5651,6 +5943,183 @@ public partial class PosterWallViewModel : ObservableObject
             string.Equals(file.Id, currentPlayingVideoId, StringComparison.Ordinal));
     }
 
+    private LibraryVideoItem? ResolveCurrentPlaybackMoviePart()
+    {
+        if (!currentDetailMovieId.HasValue ||
+            IsDetailSeries ||
+            string.IsNullOrWhiteSpace(currentPlayingVideoId))
+        {
+            return null;
+        }
+
+        var parts = GetOrderedMovieParts();
+        return parts.Count > 1
+            ? parts.FirstOrDefault(file => string.Equals(file.Id, currentPlayingVideoId, StringComparison.Ordinal))
+            : null;
+    }
+
+    private List<LibraryVideoItem> GetOrderedMovieParts()
+    {
+        return OrderMovieFilesForPlayback(allDetailFiles.Where(static file => !file.IsTvEpisode));
+    }
+
+    private static List<LibraryVideoItem> OrderMovieFilesForPlayback(IEnumerable<LibraryVideoItem> files)
+    {
+        var ordered = files.ToList();
+        ordered.Sort(CompareMovieFilesForPlayback);
+        return ordered;
+    }
+
+    private static int CompareMovieFilesForPlayback(LibraryVideoItem left, LibraryVideoItem right)
+    {
+        var partComparison = ResolveMoviePartSortIndex(left).CompareTo(ResolveMoviePartSortIndex(right));
+        if (partComparison != 0)
+        {
+            return partComparison;
+        }
+
+        var pathComparison = StringComparer.OrdinalIgnoreCase.Compare(left.RelativePath, right.RelativePath);
+        if (pathComparison != 0)
+        {
+            return pathComparison;
+        }
+
+        var nameComparison = StringComparer.OrdinalIgnoreCase.Compare(left.FileName, right.FileName);
+        return nameComparison != 0
+            ? nameComparison
+            : StringComparer.OrdinalIgnoreCase.Compare(left.Id, right.Id);
+    }
+
+    private static int ResolveMoviePartSortIndex(LibraryVideoItem file)
+    {
+        var raw = $"{file.RelativePath}/{file.FileName}";
+        var tokens = Regex
+            .Split(raw, @"[\\/\s._\-\[\]\(\)\{\}【】（）,:：]+")
+            .Where(static token => !string.IsNullOrWhiteSpace(token))
+            .ToArray();
+        for (var index = 0; index < tokens.Length; index++)
+        {
+            var rawToken = tokens[index];
+            if (TryParseChineseMoviePartToken(rawToken, out var chinesePart))
+            {
+                return chinesePart;
+            }
+
+            var token = rawToken.ToLowerInvariant();
+            foreach (var prefix in MoviePartPrefixes)
+            {
+                if (string.Equals(token, prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (index + 1 < tokens.Length && TryParseMoviePartToken(tokens[index + 1], out var separatedPart))
+                    {
+                        return separatedPart;
+                    }
+                }
+                else if (token.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                         TryParseMoviePartToken(token[prefix.Length..], out var joinedPart))
+                {
+                    return joinedPart;
+                }
+            }
+        }
+
+        return int.MaxValue;
+    }
+
+    private static readonly string[] MoviePartPrefixes =
+    [
+        "volume",
+        "part",
+        "disc",
+        "disk",
+        "dvd",
+        "vol",
+        "pt",
+        "cd"
+    ];
+
+    private static bool TryParseMoviePartToken(string token, out int partIndex)
+    {
+        token = token.Trim();
+        if (int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out partIndex) && partIndex > 0)
+        {
+            return true;
+        }
+
+        if (TryParseChineseMoviePartToken(token, out partIndex))
+        {
+            return true;
+        }
+
+        return TryParseRomanNumber(token, out partIndex);
+    }
+
+    private static bool TryParseChineseMoviePartToken(string token, out int partIndex)
+    {
+        partIndex = token switch
+        {
+            "上" or "上半" or "上篇" or "前篇" => 1,
+            "下" or "下半" or "下篇" or "后篇" or "後篇" => 2,
+            _ => 0
+        };
+        return partIndex > 0;
+    }
+
+    private static bool TryParseRomanNumber(string token, out int value)
+    {
+        value = 0;
+        token = token.Trim().ToUpperInvariant();
+        if (token.Length == 0 || token.Any(static ch => ch is not ('I' or 'V' or 'X' or 'L' or 'C' or 'D' or 'M')))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < token.Length; index++)
+        {
+            var current = RomanDigitValue(token[index]);
+            var next = index + 1 < token.Length ? RomanDigitValue(token[index + 1]) : 0;
+            value += current < next ? -current : current;
+        }
+
+        return value > 0;
+    }
+
+    private static int RomanDigitValue(char ch)
+    {
+        return ch switch
+        {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => 0
+        };
+    }
+
+    private LibraryVideoItem? FindPreviousMoviePart(LibraryVideoItem currentPart)
+    {
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(file => string.Equals(file.Id, currentPart.Id, StringComparison.Ordinal));
+        return currentIndex > 0 ? parts[currentIndex - 1] : null;
+    }
+
+    private LibraryVideoItem? FindNextMoviePart(LibraryVideoItem currentPart)
+    {
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(file => string.Equals(file.Id, currentPart.Id, StringComparison.Ordinal));
+        return currentIndex >= 0 && currentIndex + 1 < parts.Count ? parts[currentIndex + 1] : null;
+    }
+
+    private static string BuildMoviePartLabel(LibraryVideoItem part)
+    {
+        return string.IsNullOrWhiteSpace(part.RelativePath)
+            ? part.FileName
+            : part.RelativePath;
+    }
+
     private List<LibraryVideoItem> GetOrderedEpisodes()
     {
         return allDetailFiles
@@ -5725,6 +6194,44 @@ public partial class PosterWallViewModel : ObservableObject
         return orderedEpisodes[currentIndex + 1];
     }
 
+    private async Task PlayPreviousMoviePartAsync()
+    {
+        var currentPart = ResolveCurrentPlaybackMoviePart();
+        var previousPart = currentPart is null ? null : FindPreviousMoviePart(currentPart);
+        if (currentPart is null || previousPart is null)
+        {
+            UpdatePlayerNextEpisodeAction();
+            return;
+        }
+
+        if (!MediaSourcePathResolver.IsPlayableLocation(previousPart.EffectivePlaybackPath))
+        {
+            StatusMessage = $"上一段文件不可播放：{previousPart.FileName}";
+            return;
+        }
+
+        await TransitionToMoviePartAsync(previousPart);
+    }
+
+    private async Task PlayNextMoviePartAsync()
+    {
+        var currentPart = ResolveCurrentPlaybackMoviePart();
+        var nextPart = currentPart is null ? null : FindNextMoviePart(currentPart);
+        if (currentPart is null || nextPart is null)
+        {
+            UpdatePlayerNextEpisodeAction();
+            return;
+        }
+
+        if (!MediaSourcePathResolver.IsPlayableLocation(nextPart.EffectivePlaybackPath))
+        {
+            StatusMessage = $"下一段文件不可播放：{nextPart.FileName}";
+            return;
+        }
+
+        await TransitionToMoviePartAsync(nextPart, markCurrentAsFinished: true);
+    }
+
     private async Task PlayPreviousEpisodeAsync()
     {
         var currentEpisode = ResolveCurrentPlaybackEpisode();
@@ -5790,6 +6297,67 @@ public partial class PosterWallViewModel : ObservableObject
         }
 
         await TransitionToEpisodeAsync(targetEpisode);
+    }
+
+    private async Task TransitionToMoviePartAsync(
+        LibraryVideoItem targetPart,
+        bool markCurrentAsFinished = false,
+        double? startPositionSeconds = null)
+    {
+        if (!MediaSourcePathResolver.IsPlayableLocation(targetPart.EffectivePlaybackPath))
+        {
+            StatusMessage = $"文件不可播放：{targetPart.FileName}";
+            return;
+        }
+
+        if (string.Equals(currentPlayingVideoId, targetPart.Id, StringComparison.Ordinal))
+        {
+            ApplyPreferredDetailVideoSelection(targetPart);
+            if (startPositionSeconds.HasValue)
+            {
+                await Player.CommitSeekAsync(startPositionSeconds.Value);
+            }
+            return;
+        }
+
+        var currentPart = ResolveCurrentPlaybackMoviePart();
+        if (currentPart is not null)
+        {
+            StopPlaybackProgressSync();
+            await PersistTransitionPlaybackStateAsync(currentPart, markAsFinished: markCurrentAsFinished);
+            suppressedPlaybackPersistenceVideoId =
+                currentPlaybackMode == PlaybackMode.Overlay
+                    ? currentPart.Id
+                    : null;
+        }
+        else
+        {
+            suppressedPlaybackPersistenceVideoId = null;
+        }
+
+        preferredDetailVideoId = targetPart.Id;
+        await RefreshDetailFilesAsync();
+        await RefreshContinueWatchingAsync();
+
+        var resolvedTargetPart = ResolveDetailVideo(targetPart.Id) ?? targetPart;
+        ApplyPreferredDetailVideoSelection(resolvedTargetPart);
+
+        switch (currentPlaybackMode)
+        {
+            case PlaybackMode.Overlay:
+                await PlayVideoWithStartPositionAsync(resolvedTargetPart, startPositionSeconds);
+                break;
+            case PlaybackMode.Standalone:
+                await OpenStandalonePlayerInternalAsync(
+                    resolvedTargetPart,
+                    replaceCurrentSession: true,
+                    persistCurrentPlaybackState: false);
+                break;
+            default:
+                suppressedPlaybackPersistenceVideoId = null;
+                UpdatePlayerNextEpisodeAction();
+                break;
+        }
     }
 
     private async Task TransitionToEpisodeAsync(LibraryVideoItem targetEpisode, bool markCurrentAsFinished = false)
@@ -5916,6 +6484,253 @@ public partial class PosterWallViewModel : ObservableObject
     {
         autoAdvancedPlaybackVideoId = null;
         isAutoAdvancingToNextEpisode = false;
+        isAutoAdvancingToNextMoviePart = false;
+    }
+
+    private bool IsDetailMultipartMovie => currentDetailMovieId.HasValue && !IsDetailSeries && GetOrderedMovieParts().Count > 1;
+
+    private bool IsPlayingMultipartMovie => Player.IsPlaying && ResolveCurrentPlaybackMoviePart() is not null;
+
+    private (double PositionSeconds, double DurationSeconds) ResolveMultipartSavedTimeline()
+    {
+        var position = 0d;
+        var duration = 0d;
+        foreach (var part in GetOrderedMovieParts())
+        {
+            if (part.Duration <= 0)
+            {
+                continue;
+            }
+
+            duration += part.Duration;
+            position += part.IsWatched
+                ? part.Duration
+                : Math.Min(Math.Max(part.PlayProgress, 0), part.Duration);
+        }
+
+        return (position, duration);
+    }
+
+    private (double PositionSeconds, double DurationSeconds) ResolvePlayerTimeline()
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            return (Math.Max(Player.CurrentPositionSeconds, 0), Math.Max(Player.DurationSeconds, 0));
+        }
+
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(part => string.Equals(part.Id, currentPlayingVideoId, StringComparison.Ordinal));
+        if (currentIndex < 0)
+        {
+            return (Math.Max(Player.CurrentPositionSeconds, 0), Math.Max(Player.DurationSeconds, 0));
+        }
+
+        var position = 0d;
+        var duration = 0d;
+        for (var index = 0; index < parts.Count; index++)
+        {
+            var partDuration = index == currentIndex
+                ? Math.Max(parts[index].Duration, Math.Max(Player.DurationSeconds, Player.CurrentPositionSeconds))
+                : parts[index].Duration;
+            partDuration = Math.Max(partDuration, 0);
+            if (index < currentIndex)
+            {
+                position += partDuration;
+            }
+            duration += partDuration;
+        }
+
+        position += Math.Max(Player.CurrentPositionSeconds, 0);
+        return (Math.Min(position, Math.Max(duration, position)), duration);
+    }
+
+    private IReadOnlyList<double> ResolvePlayerTimelineSegmentBoundaries()
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            return [];
+        }
+
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(part => string.Equals(part.Id, currentPlayingVideoId, StringComparison.Ordinal));
+        if (parts.Count <= 1 || currentIndex < 0)
+        {
+            return [];
+        }
+
+        var durations = parts
+            .Select((part, index) => index == currentIndex
+                ? Math.Max(part.Duration, Math.Max(Player.DurationSeconds, Player.CurrentPositionSeconds))
+                : Math.Max(part.Duration, 0))
+            .ToArray();
+        var totalDuration = durations.Sum();
+        if (totalDuration <= 0)
+        {
+            return [];
+        }
+
+        var boundaries = new List<double>(Math.Max(parts.Count - 1, 0));
+        var cursor = 0d;
+        for (var index = 0; index < durations.Length - 1; index++)
+        {
+            cursor += durations[index];
+            if (cursor > 0 && cursor < totalDuration)
+            {
+                boundaries.Add(cursor / totalDuration);
+            }
+        }
+
+        return boundaries;
+    }
+
+    private double ClampPlayerTimelinePosition(double value)
+    {
+        var duration = PlayerTimelineDurationSeconds;
+        if (duration <= 0)
+        {
+            return Math.Max(value, 0);
+        }
+
+        return Math.Clamp(value, 0, duration);
+    }
+
+    private (LibraryVideoItem Part, double LocalPositionSeconds)? ResolveMultipartSeekTarget(double targetSeconds)
+    {
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(part => string.Equals(part.Id, currentPlayingVideoId, StringComparison.Ordinal));
+        var cursor = 0d;
+        for (var index = 0; index < parts.Count; index++)
+        {
+            var part = parts[index];
+            var duration = index == currentIndex
+                ? Math.Max(part.Duration, Math.Max(Player.DurationSeconds, Player.CurrentPositionSeconds))
+                : part.Duration;
+            duration = Math.Max(duration, 0);
+            if (duration <= 0)
+            {
+                continue;
+            }
+
+            if (targetSeconds <= cursor + duration || index == parts.Count - 1)
+            {
+                return (part, Math.Clamp(targetSeconds - cursor, 0, duration));
+            }
+
+            cursor += duration;
+        }
+
+        var fallback = parts.LastOrDefault();
+        return fallback is null ? null : (fallback, 0);
+    }
+
+    private static string FormatPlaybackTime(double seconds)
+    {
+        var safeSeconds = Math.Max(0, (int)Math.Floor(double.IsFinite(seconds) ? seconds : 0));
+        return TimeSpan.FromSeconds(safeSeconds).ToString(safeSeconds >= 3600 ? @"h\:mm\:ss" : @"m\:ss", CultureInfo.InvariantCulture);
+    }
+
+    private void NotifyPlayerTimelineChanged()
+    {
+        OnPropertyChanged(nameof(PlayerTimelineDurationSeconds));
+        OnPropertyChanged(nameof(PlayerTimelineSeekPositionSeconds));
+        OnPropertyChanged(nameof(PlayerTimelineSegmentBoundaries));
+        OnPropertyChanged(nameof(PlayerTimelineCurrentPositionText));
+        OnPropertyChanged(nameof(PlayerTimelineRemainingTimeText));
+        PlayerTimelineSeekBackwardCommand.NotifyCanExecuteChanged();
+        PlayerTimelineSeekForwardCommand.NotifyCanExecuteChanged();
+    }
+
+    public void BeginPlayerTimelineSeekInteraction()
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            Player.BeginSeekInteraction();
+            return;
+        }
+
+        isMultipartTimelineSeekPreviewActive = true;
+        multipartTimelineSeekPreviewSeconds = ResolvePlayerTimeline().PositionSeconds;
+        NotifyPlayerTimelineChanged();
+    }
+
+    public void UpdatePlayerTimelineSeekPreview(double value)
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            Player.UpdateSeekPreview(value);
+            return;
+        }
+
+        if (!isMultipartTimelineSeekPreviewActive)
+        {
+            return;
+        }
+
+        multipartTimelineSeekPreviewSeconds = ClampPlayerTimelinePosition(value);
+        NotifyPlayerTimelineChanged();
+    }
+
+    public async Task CommitPlayerTimelineSeekAsync(double value)
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            await Player.CommitSeekAsync(value);
+            return;
+        }
+
+        var target = ResolveMultipartSeekTarget(ClampPlayerTimelinePosition(value));
+        isMultipartTimelineSeekPreviewActive = false;
+        if (target is null)
+        {
+            NotifyPlayerTimelineChanged();
+            return;
+        }
+
+        if (string.Equals(target.Value.Part.Id, currentPlayingVideoId, StringComparison.Ordinal))
+        {
+            await Player.CommitSeekAsync(target.Value.LocalPositionSeconds);
+        }
+        else
+        {
+            await TransitionToMoviePartAsync(
+                target.Value.Part,
+                markCurrentAsFinished: IsSeekTargetAfterCurrentPart(target.Value.Part),
+                startPositionSeconds: target.Value.LocalPositionSeconds);
+        }
+
+        NotifyPlayerTimelineChanged();
+    }
+
+    private async Task SeekPlayerTimelineRelativeAsync(double deltaSeconds)
+    {
+        if (!IsPlayingMultipartMovie)
+        {
+            if (deltaSeconds < 0)
+            {
+                await Player.SeekBackwardCommand.ExecuteAsync(null);
+            }
+            else
+            {
+                await Player.SeekForwardCommand.ExecuteAsync(null);
+            }
+            return;
+        }
+
+        var timeline = ResolvePlayerTimeline();
+        await CommitPlayerTimelineSeekAsync(Math.Clamp(timeline.PositionSeconds + deltaSeconds, 0, timeline.DurationSeconds));
+    }
+
+    private bool CanSeekPlayerTimeline()
+    {
+        return Player.IsPlaying && Player.IsAvailable && PlayerTimelineDurationSeconds > 0;
+    }
+
+    private bool IsSeekTargetAfterCurrentPart(LibraryVideoItem targetPart)
+    {
+        var parts = GetOrderedMovieParts();
+        var currentIndex = parts.FindIndex(part => string.Equals(part.Id, currentPlayingVideoId, StringComparison.Ordinal));
+        var targetIndex = parts.FindIndex(part => string.Equals(part.Id, targetPart.Id, StringComparison.Ordinal));
+        return currentIndex >= 0 && targetIndex > currentIndex;
     }
 
     private void RefreshDetailHeaderState()
@@ -5954,17 +6769,24 @@ public partial class PosterWallViewModel : ObservableObject
 
         var detailWatchState = ResolveDetailWatchState();
         var detailProgressRatio = ResolveDetailProgressRatio(detailWatchState);
+        var multipartTimeline = IsDetailMultipartMovie ? ResolveMultipartSavedTimeline() : default;
 
         DetailPrimaryProgressRatio = detailProgressRatio;
-        DetailPlaybackProgressRatio = DetailPrimaryFile.ProgressRatio;
-        DetailPrimaryFileProgressText = DetailPrimaryFile.ProgressText;
-        DetailPrimaryTimeText = $"{DetailPrimaryFile.PositionText} / {DetailPrimaryFile.DurationText}";
+        DetailPlaybackProgressRatio = IsDetailMultipartMovie ? detailProgressRatio : DetailPrimaryFile.ProgressRatio;
+        DetailPrimaryFileProgressText = IsDetailMultipartMovie
+            ? FormatWatchStateSummary(detailWatchState, detailProgressRatio)
+            : DetailPrimaryFile.ProgressText;
+        DetailPrimaryTimeText = IsDetailMultipartMovie && multipartTimeline.DurationSeconds > 0
+            ? $"{FormatPlaybackTime(multipartTimeline.PositionSeconds)} / {FormatPlaybackTime(multipartTimeline.DurationSeconds)}"
+            : $"{DetailPrimaryFile.PositionText} / {DetailPrimaryFile.DurationText}";
         DetailPrimaryActionText = BuildPrimaryActionText(DetailPrimaryFile);
         DetailProgressSummary = FormatWatchStateSummary(detailWatchState, detailProgressRatio);
 
         DetailSelectionHint = DetailPrimaryFile.IsTvEpisode
             ? $"\u5F53\u524D\u4E3B\u96C6\uFF1A{FormatEpisodeTitle(DetailPrimaryFile)}"
-            : "\u5F53\u524D\u4E3B\u6587\u4EF6\u5DF2\u9009\u4E2D\u3002";
+            : IsDetailMultipartMovie
+                ? $"多段电影 · 当前分段：{BuildMoviePartLabel(DetailPrimaryFile)}"
+                : "\u5F53\u524D\u4E3B\u6587\u4EF6\u5DF2\u9009\u4E2D\u3002";
         DetailWatchedActionText = DetailPrimaryFile.WatchStateText;
         OnPropertyChanged(nameof(CanShowDetailPrimaryProgress));
     }
@@ -5978,6 +6800,13 @@ public partial class PosterWallViewModel : ObservableObject
         }
 
         if (IsDetailSeries)
+        {
+            return files.All(static file => file.WatchState == PlaybackWatchState.Watched)
+                ? PlaybackWatchState.Watched
+                : PlaybackWatchState.InProgress;
+        }
+
+        if (IsDetailMultipartMovie)
         {
             return files.All(static file => file.WatchState == PlaybackWatchState.Watched)
                 ? PlaybackWatchState.Watched
@@ -6005,6 +6834,14 @@ public partial class PosterWallViewModel : ObservableObject
         if (IsDetailSeries)
         {
             return files.Average(static file => file.WatchState == PlaybackWatchState.Watched ? 1 : file.ProgressRatio);
+        }
+
+        if (IsDetailMultipartMovie)
+        {
+            var timeline = ResolveMultipartSavedTimeline();
+            return timeline.DurationSeconds > 0
+                ? Math.Clamp(timeline.PositionSeconds / timeline.DurationSeconds, 0, 1)
+                : files.Max(static file => file.ProgressRatio);
         }
 
         return files.Max(static file => file.ProgressRatio);
@@ -6154,9 +6991,10 @@ public partial class PosterWallViewModel : ObservableObject
         CancellationToken cancellationToken)
     {
         var tmdbSettings = Settings.BuildTmdbSettings();
+        await ReloadLibraryAsync();
+
         if (!tmdbSettings.EnableMetadataEnrichment && !tmdbSettings.EnablePosterDownloads)
         {
-            await ReloadLibraryAsync();
             return;
         }
 

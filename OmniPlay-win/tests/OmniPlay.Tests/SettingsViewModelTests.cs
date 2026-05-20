@@ -164,6 +164,53 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task SaveCommand_PersistsEditableSettingsAndAppliesSavedState()
+    {
+        var settingsService = new FakeSettingsService();
+        var viewModel = CreateViewModel(settingsService: settingsService);
+        var eventCount = 0;
+        viewModel.SettingsSaved += (_, _) => eventCount++;
+
+        viewModel.AutoScanOnStartup = false;
+        viewModel.AutoCheckUpdatesOnStartup = false;
+        viewModel.ShowMediaSourceRealPath = false;
+        viewModel.EnableLocalMetadataImport = true;
+        viewModel.EnableLocalMetadataExport = true;
+        viewModel.EnableBuiltInPublicTmdbSource = false;
+        viewModel.CustomTmdbCredential = "  custom-key  ";
+        viewModel.SelectedTmdbLanguageOption = viewModel.TmdbLanguageOptions.Single(option => option.Value == "en-US");
+        viewModel.SelectedDefaultAudioTrackOption = viewModel.DefaultAudioTrackOptions.Single(option => option.Value == PlaybackPreferenceSettings.AudioJapanese);
+        viewModel.SelectedDefaultSubtitleTrackOption = viewModel.DefaultSubtitleTrackOptions.Single(option => option.Value == PlaybackPreferenceSettings.SubtitleEnglish);
+
+        await viewModel.SaveCommand.ExecuteAsync(null);
+
+        var savedSettings = Assert.IsType<AppSettings>(settingsService.SavedSettings);
+        Assert.False(savedSettings.AutoScanOnStartup);
+        Assert.False(savedSettings.AutoCheckUpdatesOnStartup);
+        Assert.False(savedSettings.ShowMediaSourceRealPath);
+        Assert.True(savedSettings.LocalMetadata.EnableLocalMetadataImport);
+        Assert.True(savedSettings.LocalMetadata.EnableLocalMetadataExport);
+        Assert.False(savedSettings.Tmdb.EnableBuiltInPublicSource);
+        Assert.Equal("custom-key", savedSettings.Tmdb.CustomApiKey);
+        Assert.Equal("en-US", savedSettings.Tmdb.Language);
+        Assert.Equal(PlaybackPreferenceSettings.AudioJapanese, savedSettings.Playback.DefaultAudioTrack);
+        Assert.Equal(PlaybackPreferenceSettings.SubtitleEnglish, savedSettings.Playback.DefaultSubtitleTrack);
+
+        Assert.False(viewModel.AutoScanOnStartup);
+        Assert.False(viewModel.AutoCheckUpdatesOnStartup);
+        Assert.False(viewModel.ShowMediaSourceRealPath);
+        Assert.True(viewModel.EnableLocalMetadataImport);
+        Assert.True(viewModel.EnableLocalMetadataExport);
+        Assert.False(viewModel.EnableBuiltInPublicTmdbSource);
+        Assert.Equal("custom-key", viewModel.CustomTmdbCredential);
+        Assert.Equal("en-US", viewModel.TmdbLanguage);
+        Assert.Equal(PlaybackPreferenceSettings.AudioJapanese, viewModel.DefaultAudioTrackMode);
+        Assert.Equal(PlaybackPreferenceSettings.SubtitleEnglish, viewModel.DefaultSubtitleTrack);
+        Assert.Equal("设置已保存。", viewModel.StatusMessage);
+        Assert.Equal(1, eventCount);
+    }
+
+    [Fact]
     public void BuildTmdbSettings_UsesDefaultLanguageWhenBlank()
     {
         var viewModel = CreateViewModel();

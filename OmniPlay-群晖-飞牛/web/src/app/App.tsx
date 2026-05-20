@@ -1,8 +1,9 @@
-import { type FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import {
   ArrowLeft,
-  Bug,
+  ChevronDown,
+  ChevronRight,
   CheckCircle2,
   Circle,
   CircleStop,
@@ -10,8 +11,9 @@ import {
   FolderPlus,
   LogOut,
   Captions,
+  CirclePause,
+  CirclePlay,
   Music2,
-  Pause,
   Pencil,
   Play,
   Save,
@@ -41,7 +43,6 @@ import {
   cleanupAssetCache,
   cleanupHlsCache,
   EpisodeDetail,
-  FfmpegTranscodeCapabilities,
   getBackgroundTasks,
   getAppSettings,
   getAuthStatus,
@@ -49,8 +50,6 @@ import {
   getLibraryScanStatus,
   getMetadataEnrichmentStatus,
   getPlaybackDecision,
-  getPlaybackDiagnostics,
-  getPlaybackCapabilities,
   getPlaybackCacheStatus,
   getPlaybackSubtitles,
   getRuntimeSelfCheck,
@@ -60,6 +59,7 @@ import {
   LibraryItemDetail,
   LibraryItemCustomMetadataUpdateRequest,
   LibraryItemSummary,
+  LibraryMetadataEnrichmentProgress,
   LibraryMetadataEnrichmentStatus,
   LibraryScanStatus,
   login,
@@ -67,7 +67,6 @@ import {
   logout,
   MediaSourceSummary,
   PlaybackCacheStatus,
-  PlaybackDiagnostics,
   PlaybackSubtitleTrack,
   ProxyConnectionTestResult,
   ProxySettings,
@@ -107,8 +106,30 @@ type MetadataSearchState = {
 
 type CustomMetadataEditState = {
   detail: LibraryItemDetail;
+  episode?: EpisodeDetail | null;
   isSaving: boolean;
   error: string;
+};
+
+type WebSubtitleCue = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+const defaultPlaybackSettings: AppSettingsSnapshot["playback"] = {
+  directStream: true,
+  hlsRemux: true,
+  transcode: true,
+  showEpisodeDetails: true,
+  playbackQualityPreference: "auto",
+  defaultAudioLanguage: "smart",
+  defaultSubtitleLanguage: "zh",
+};
+
+const defaultAutomationSettings: AppSettingsSnapshot["automation"] = {
+  scheduledLibraryRefreshEnabled: false,
+  scheduledLibraryRefreshIntervalHours: 24,
 };
 
 export function App() {
@@ -136,6 +157,7 @@ export function App() {
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeStatus, setScrapeStatus] = useState<LibraryMetadataEnrichmentStatus | null>(null);
   const [selectedDetail, setSelectedDetail] = useState<LibraryItemDetail | null>(null);
+  const [selectedSeasonByDetailId, setSelectedSeasonByDetailId] = useState<Record<string, string>>({});
   const [metadataSearch, setMetadataSearch] = useState<MetadataSearchState | null>(null);
   const [customMetadataEdit, setCustomMetadataEdit] = useState<CustomMetadataEditState | null>(null);
   const [playingFile, setPlayingFile] = useState<VideoFileSummary | null>(null);
@@ -148,6 +170,7 @@ export function App() {
   const cacheCleanupWasRunningRef = useRef(false);
   const sourceCleanupWasRunningRef = useRef(false);
   const selectedDetailRef = useRef<LibraryItemDetail | null>(null);
+  const libraryScrollYRef = useRef(0);
 
   const loadData = useCallback(async () => {
     setErrorText("");
@@ -647,12 +670,13 @@ export function App() {
     cache: CacheSettings,
     playback: AppSettingsSnapshot["playback"],
     proxy: ProxySettings,
+    automation: AppSettingsSnapshot["automation"],
   ) {
     setErrorText("");
     setStatusText("正在保存设置");
     setIsSavingSettings(true);
     try {
-      const nextSettings = await updateAppSettings({ tmdb, cache, playback, proxy });
+      const nextSettings = await updateAppSettings({ tmdb, cache, playback, proxy, automation });
       setSettings(nextSettings);
       setStatusText("设置已保存");
       setIsSettingsOpen(false);
@@ -767,11 +791,17 @@ export function App() {
     setStatusText("正在读取条目资料");
     try {
       const detail = await getLibraryItemDetail(item.id);
-      setCustomMetadataEdit({ detail, isSaving: false, error: "" });
+      setCustomMetadataEdit({ detail, episode: null, isSaving: false, error: "" });
       setStatusText("");
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function handleOpenCustomMetadataEditFromDetail(detail: LibraryItemDetail, episode?: EpisodeDetail | null) {
+    setErrorText("");
+    setStatusText("");
+    setCustomMetadataEdit({ detail, episode: episode ?? null, isSaving: false, error: "" });
   }
 
   async function handleSaveCustomMetadata(request: LibraryItemCustomMetadataUpdateRequest) {
@@ -806,6 +836,7 @@ export function App() {
   }
 
   async function openDetail(item: LibraryItemSummary) {
+    libraryScrollYRef.current = window.scrollY;
     setIsDetailLoading(true);
     setErrorText("");
     setPlayingFile(null);
@@ -816,6 +847,13 @@ export function App() {
     } finally {
       setIsDetailLoading(false);
     }
+  }
+
+  function restoreLibraryScroll() {
+    const scrollY = libraryScrollYRef.current;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => window.scrollTo({ top: scrollY }));
+    });
   }
 
   async function refreshCurrentDetail() {
@@ -851,22 +889,43 @@ export function App() {
           setPlayingFile(null);
           void refreshCurrentDetail();
         }}
+        playbackSettings={normalizePlaybackSettings(settings?.playback)}
       />
     );
   }
 
   if (selectedDetail) {
     return (
-      <DetailView
-        detail={selectedDetail}
-        errorText={errorText}
-        showEpisodeDetails={settings?.playback.showEpisodeDetails ?? true}
-        onBack={() => {
-          setPlayingFile(null);
-          setSelectedDetail(null);
-        }}
-        onPlay={(file) => setPlayingFile(file)}
-      />
+      <>
+        <DetailView
+          detail={selectedDetail}
+          errorText={errorText}
+          selectedSeasonId={selectedSeasonByDetailId[selectedDetail.id] ?? ""}
+          showEpisodeDetails={normalizePlaybackSettings(settings?.playback).showEpisodeDetails}
+          onBack={() => {
+            setPlayingFile(null);
+            setSelectedDetail(null);
+            restoreLibraryScroll();
+          }}
+          onEditMetadata={(episode) => handleOpenCustomMetadataEditFromDetail(selectedDetail, episode)}
+          onPlay={(file) => setPlayingFile(file)}
+          onSeasonChange={(seasonId) =>
+            setSelectedSeasonByDetailId((current) =>
+              current[selectedDetail.id] === seasonId ? current : { ...current, [selectedDetail.id]: seasonId },
+            )
+          }
+        />
+        {customMetadataEdit ? (
+          <CustomMetadataEditModal
+            errorText={customMetadataEdit.error}
+            isSaving={customMetadataEdit.isSaving}
+            detail={customMetadataEdit.detail}
+            episode={customMetadataEdit.episode}
+            onClose={() => setCustomMetadataEdit(null)}
+            onSave={(request) => void handleSaveCustomMetadata(request)}
+          />
+        ) : null}
+      </>
     );
   }
 
@@ -931,7 +990,9 @@ export function App() {
         <SettingsPanel
           isSaving={isSavingSettings}
           onClose={() => setIsSettingsOpen(false)}
-          onSave={(tmdb, cache, playback, proxy) => void handleSaveAppSettings(tmdb, cache, playback, proxy)}
+          onSave={(tmdb, cache, playback, proxy, automation) =>
+            void handleSaveAppSettings(tmdb, cache, playback, proxy, automation)
+          }
           settings={settings}
         />
       ) : null}
@@ -952,6 +1013,7 @@ export function App() {
           errorText={customMetadataEdit.error}
           isSaving={customMetadataEdit.isSaving}
           detail={customMetadataEdit.detail}
+          episode={customMetadataEdit.episode}
           onClose={() => setCustomMetadataEdit(null)}
           onSave={(request) => void handleSaveCustomMetadata(request)}
         />
@@ -1253,10 +1315,8 @@ function formatScrapeStatus(status: LibraryMetadataEnrichmentStatus): string {
         "downloading-poster": "下载海报",
         updating: "写入元数据",
       }[progress.phase] ?? "正在刮削";
-    const itemCount =
-      progress.targetItemCount > 0
-        ? `${Math.min(progress.processedItemCount, progress.targetItemCount)}/${progress.targetItemCount}`
-        : "";
+    const count = scrapeStatusDisplayCount(progress);
+    const itemCount = count ? `${Math.min(count.processed, count.target)}/${count.target}` : "";
     const title = progress.currentTitle ? ` · ${progress.currentTitle}` : "";
     return `${phaseLabel}${itemCount ? ` ${itemCount}` : ""}${title}`;
   }
@@ -1278,11 +1338,38 @@ function formatScrapeStatus(status: LibraryMetadataEnrichmentStatus): string {
 
 function scrapeProgressPercent(status: LibraryMetadataEnrichmentStatus | null): number | null {
   const progress = status?.progress;
-  if (!status?.isRunning || !progress || progress.targetItemCount <= 0) {
+  if (!status?.isRunning || !progress) {
     return null;
   }
 
-  return Math.round((progress.processedItemCount / progress.targetItemCount) * 100);
+  const count = scrapeStatusDisplayCount(progress);
+  if (!count) {
+    return null;
+  }
+
+  return Math.round((count.processed / count.target) * 100);
+}
+
+function scrapeStatusDisplayCount(progress: LibraryMetadataEnrichmentProgress): { processed: number; target: number } | null {
+  if (
+    progress.phase === "fetching-episodes" &&
+    typeof progress.phaseTargetCount === "number" &&
+    progress.phaseTargetCount > 0
+  ) {
+    return {
+      processed: Math.max(0, progress.phaseProcessedCount ?? 0),
+      target: progress.phaseTargetCount,
+    };
+  }
+
+  if (progress.targetItemCount <= 0) {
+    return null;
+  }
+
+  return {
+    processed: Math.max(0, progress.processedItemCount),
+    target: progress.targetItemCount,
+  };
 }
 
 function SourceManagerPanel({
@@ -1558,6 +1645,7 @@ function SettingsPanel({
     cache: CacheSettings,
     playback: AppSettingsSnapshot["playback"],
     proxy: ProxySettings,
+    automation: AppSettingsSnapshot["automation"],
   ) => void;
   settings: AppSettingsSnapshot;
 }) {
@@ -1569,12 +1657,17 @@ function SettingsPanel({
   const [cache, setCache] = useState(settings.cache);
   const [playback, setPlayback] = useState(normalizePlaybackSettings(settings.playback));
   const [proxy, setProxy] = useState(settings.proxy);
+  const [automation, setAutomation] = useState(normalizeAutomationSettings(settings.automation));
+  const [automationIntervalHours, setAutomationIntervalHours] = useState(
+    String(normalizeAutomationSettings(settings.automation).scheduledLibraryRefreshIntervalHours),
+  );
   const [proxyTest, setProxyTest] = useState<ProxyConnectionTestResult | null>(null);
   const [proxyTestError, setProxyTestError] = useState("");
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [selfCheck, setSelfCheck] = useState<RuntimeSelfCheckSnapshot | null>(null);
   const [selfCheckError, setSelfCheckError] = useState("");
   const [isCheckingRuntime, setIsCheckingRuntime] = useState(false);
+  const [isSelfCheckExpanded, setIsSelfCheckExpanded] = useState(false);
 
   useEffect(() => {
     setTmdb(settings.tmdb);
@@ -1584,6 +1677,8 @@ function SettingsPanel({
     setCache(settings.cache);
     setPlayback(normalizePlaybackSettings(settings.playback));
     setProxy(settings.proxy);
+    setAutomation(normalizeAutomationSettings(settings.automation));
+    setAutomationIntervalHours(String(normalizeAutomationSettings(settings.automation).scheduledLibraryRefreshIntervalHours));
     setProxyTest(null);
     setProxyTestError("");
   }, [settings]);
@@ -1603,8 +1698,17 @@ function SettingsPanel({
         webDavRetentionHours: Math.min(720, Math.max(1, Math.round(cache.webDavRetentionHours || 72))),
         webDavMaxGb: Math.min(1024, Math.max(1, Math.round(cache.webDavMaxGb || 20))),
       },
-      playback,
+      {
+        ...playback,
+        directStream: true,
+        hlsRemux: true,
+        transcode: true,
+      },
       normalizeProxySettings(proxy),
+      normalizeAutomationSettings({
+        ...automation,
+        scheduledLibraryRefreshIntervalHours: parsePositiveIntegerInput(automationIntervalHours, 24),
+      }),
     );
   }
 
@@ -1633,6 +1737,7 @@ function SettingsPanel({
     setIsCheckingRuntime(true);
     try {
       setSelfCheck(await getRuntimeSelfCheck());
+      setIsSelfCheckExpanded(true);
     } catch (error) {
       setSelfCheckError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1653,7 +1758,49 @@ function SettingsPanel({
     }
   }
 
-  const hasPlaybackStrategy = playback.directStream || playback.hlsRemux || playback.transcode;
+  const runtimeSelfCheckSection = (
+    <section className="settingsSection runtimeCheckSection">
+      <div className="settingsSectionHeader">
+        <h3>运行自检</h3>
+        <button disabled={isCheckingRuntime} onClick={() => void handleRuntimeSelfCheck()} type="button">
+          <RefreshCw size={15} className={isCheckingRuntime ? "spin" : ""} />
+          <span>{isCheckingRuntime ? "检查中" : "检查"}</span>
+        </button>
+      </div>
+      {selfCheckError ? <p className="runtimeCheckError">{selfCheckError}</p> : null}
+      {selfCheck ? (
+        <>
+          <div className="runtimeCheckSummaryRow">
+            <div className={`runtimeCheckSummary ${selfCheck.status}`}>
+              <strong>{selfCheck.status}</strong>
+              <span>{formatDateTime(selfCheck.checkedAt)}</span>
+            </div>
+            <button
+              aria-expanded={isSelfCheckExpanded}
+              className="runtimeCheckToggle"
+              onClick={() => setIsSelfCheckExpanded((current) => !current)}
+              type="button"
+            >
+              {isSelfCheckExpanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+              <span>{isSelfCheckExpanded ? "收起自检信息" : "展开自检信息"}</span>
+            </button>
+          </div>
+          {isSelfCheckExpanded ? (
+            <div className="runtimeCheckList">
+              {selfCheck.items.map((item) => (
+                <article className={`runtimeCheckItem ${item.status}`} key={item.key}>
+                  <span>{item.label}</span>
+                  <p>{item.detail}</p>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <p className="runtimeCheckHint">检查 FFmpeg、监听端口、缓存目录、SQLite 和硬件解码/编码。</p>
+      )}
+    </section>
+  );
 
   return (
     <div className="settingsOverlay" role="dialog" aria-label="settings panel" aria-modal="true">
@@ -1664,7 +1811,7 @@ function SettingsPanel({
             <h2>设置</h2>
           </div>
           <div className="settingsHeaderActions">
-            <button disabled={isSaving || !hasPlaybackStrategy} form="app-settings-form" type="submit">
+            <button disabled={isSaving} form="app-settings-form" type="submit">
               <Save size={15} />
               <span>{isSaving ? "保存中" : "保存"}</span>
             </button>
@@ -1692,11 +1839,11 @@ function SettingsPanel({
               <span>内置公开源</span>
             </label>
             <label className="settingsField">
-              <span>API 凭据</span>
+              <span>自定义 API</span>
               <input
                 autoComplete="off"
                 onChange={(event) => setTmdbCredential(event.target.value)}
-                placeholder="API Key 或 Bearer Token"
+                placeholder="API Key 或 Bearer Token，填写后优先使用"
                 type="password"
                 value={tmdbCredential}
               />
@@ -1744,6 +1891,8 @@ function SettingsPanel({
             {proxyTestError ? <p className="runtimeCheckError">{proxyTestError}</p> : null}
           </section>
 
+          {runtimeSelfCheckSection}
+
           <section className="settingsSection">
             <h3>缓存</h3>
             <label className="settingsField">
@@ -1769,31 +1918,34 @@ function SettingsPanel({
           </section>
 
           <section className="settingsSection">
+            <h3>自动扫描</h3>
+            <label className="settingsToggle">
+              <input
+                checked={automation.scheduledLibraryRefreshEnabled}
+                onChange={(event) =>
+                  setAutomation({ ...automation, scheduledLibraryRefreshEnabled: event.target.checked })
+                }
+                type="checkbox"
+              />
+              <span>定时扫描刮削</span>
+            </label>
+            <label className="settingsField">
+              <span>扫描间隔（小时）</span>
+              <input
+                disabled={!automation.scheduledLibraryRefreshEnabled}
+                inputMode="numeric"
+                max={720}
+                min={1}
+                onChange={(event) => setAutomationIntervalHours(event.target.value.replace(/[^\d]/g, ""))}
+                pattern="[0-9]*"
+                type="text"
+                value={automationIntervalHours}
+              />
+            </label>
+          </section>
+
+          <section className="settingsSection">
             <h3>播放</h3>
-            <label className="settingsToggle">
-              <input
-                checked={playback.directStream}
-                onChange={(event) => setPlayback({ ...playback, directStream: event.target.checked })}
-                type="checkbox"
-              />
-              <span>Range 直出</span>
-            </label>
-            <label className="settingsToggle">
-              <input
-                checked={playback.hlsRemux}
-                onChange={(event) => setPlayback({ ...playback, hlsRemux: event.target.checked })}
-                type="checkbox"
-              />
-              <span>HLS 转封装</span>
-            </label>
-            <label className="settingsToggle">
-              <input
-                checked={playback.transcode}
-                onChange={(event) => setPlayback({ ...playback, transcode: event.target.checked })}
-                type="checkbox"
-              />
-              <span>HLS 硬件转码</span>
-            </label>
             <label className="settingsToggle">
               <input
                 checked={playback.showEpisodeDetails}
@@ -1802,37 +1954,41 @@ function SettingsPanel({
               />
               <span>分集详情</span>
             </label>
-            {!hasPlaybackStrategy ? <strong className="settingsWarning">至少保留一种播放策略</strong> : null}
+            <label className="settingsField">
+              <span>浏览器播放质量</span>
+              <select
+                onChange={(event) => setPlayback({ ...playback, playbackQualityPreference: event.target.value })}
+                value={playback.playbackQualityPreference}
+              >
+                <option value="original-priority">原画优先</option>
+                <option value="auto">自动</option>
+                <option value="compatibility">兼容优先</option>
+              </select>
+            </label>
+            <label className="settingsField">
+              <span>默认音轨</span>
+              <select
+                onChange={(event) => setPlayback({ ...playback, defaultAudioLanguage: event.target.value })}
+                value={playback.defaultAudioLanguage}
+              >
+                <option value="smart">智能匹配（制片国家）</option>
+                <option value="en">英语</option>
+                <option value="ja">日语</option>
+                <option value="zh">中文</option>
+              </select>
+            </label>
+            <label className="settingsField">
+              <span>默认字幕</span>
+              <select
+                onChange={(event) => setPlayback({ ...playback, defaultSubtitleLanguage: event.target.value })}
+                value={playback.defaultSubtitleLanguage}
+              >
+                <option value="zh">中文</option>
+                <option value="en">英语</option>
+              </select>
+            </label>
           </section>
 
-          <section className="settingsSection runtimeCheckSection">
-            <div className="settingsSectionHeader">
-              <h3>运行时自检</h3>
-              <button disabled={isCheckingRuntime} onClick={() => void handleRuntimeSelfCheck()} type="button">
-                <RefreshCw size={15} />
-                <span>{isCheckingRuntime ? "检查中" : "检查"}</span>
-              </button>
-            </div>
-            {selfCheck ? (
-              <div className={`runtimeCheckSummary ${selfCheck.status}`}>
-                <strong>{selfCheck.status}</strong>
-                <span>{formatDateTime(selfCheck.checkedAt)}</span>
-              </div>
-            ) : null}
-            {selfCheckError ? <p className="runtimeCheckError">{selfCheckError}</p> : null}
-            {selfCheck ? (
-              <div className="runtimeCheckList">
-                {selfCheck.items.map((item) => (
-                  <article className={`runtimeCheckItem ${item.status}`} key={item.key}>
-                    <span>{item.label}</span>
-                    <p>{item.detail}</p>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <p className="runtimeCheckHint">检查 FFmpeg、监听端口、缓存目录、SQLite 和硬件解码/编码。</p>
-            )}
-          </section>
         </form>
       </aside>
     </div>
@@ -1868,11 +2024,49 @@ function looksLikeTmdbAccessToken(value: string): boolean {
   return token.startsWith("eyJ") || token.length > 80;
 }
 
-function normalizePlaybackSettings(settings: AppSettingsSnapshot["playback"]): AppSettingsSnapshot["playback"] {
+function normalizePlaybackSettings(settings?: Partial<AppSettingsSnapshot["playback"]> | null): AppSettingsSnapshot["playback"] {
+  const audioLanguage = settings?.defaultAudioLanguage;
+  const subtitleLanguage = settings?.defaultSubtitleLanguage;
   return {
+    ...defaultPlaybackSettings,
     ...settings,
-    showEpisodeDetails: settings.showEpisodeDetails ?? true,
+    directStream: true,
+    hlsRemux: true,
+    transcode: true,
+    showEpisodeDetails: settings?.showEpisodeDetails ?? true,
+    defaultAudioLanguage:
+      audioLanguage === "en" || audioLanguage === "ja" || audioLanguage === "zh" ? audioLanguage : "smart",
+    defaultSubtitleLanguage: subtitleLanguage === "en" ? "en" : "zh",
+    playbackQualityPreference: normalizePlaybackQualityPreference(settings?.playbackQualityPreference),
   };
+}
+
+function normalizePlaybackQualityPreference(value?: string | null): AppSettingsSnapshot["playback"]["playbackQualityPreference"] {
+  if (value === "original-priority" || value === "compatibility") {
+    return value;
+  }
+
+  return "auto";
+}
+
+function normalizeAutomationSettings(
+  settings?: Partial<AppSettingsSnapshot["automation"]> | null,
+): AppSettingsSnapshot["automation"] {
+  return {
+    ...defaultAutomationSettings,
+    ...settings,
+    scheduledLibraryRefreshEnabled: settings?.scheduledLibraryRefreshEnabled ?? false,
+    scheduledLibraryRefreshIntervalHours: normalizeIntervalHours(settings?.scheduledLibraryRefreshIntervalHours),
+  };
+}
+
+function normalizeIntervalHours(value?: number | null): number {
+  return Math.min(720, Math.max(1, Math.round(value || 24)));
+}
+
+function parsePositiveIntegerInput(value: string, fallback: number): number {
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function normalizeProxySettings(settings: ProxySettings): ProxySettings {
@@ -2159,12 +2353,14 @@ function MetadataSearchModal({
 
 function CustomMetadataEditModal({
   detail,
+  episode,
   errorText,
   isSaving,
   onClose,
   onSave,
 }: {
   detail: LibraryItemDetail;
+  episode?: EpisodeDetail | null;
   errorText: string;
   isSaving: boolean;
   onClose: () => void;
@@ -2176,6 +2372,7 @@ function CustomMetadataEditModal({
     typeof detail.voteAverage === "number" && Number.isFinite(detail.voteAverage) ? detail.voteAverage.toFixed(1) : "",
   );
   const [overview, setOverview] = useState(detail.overview ?? "");
+  const [episodeSubtitle, setEpisodeSubtitle] = useState(extractEpisodeSubtitle(episode?.title));
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [posterPreview, setPosterPreview] = useState<string | null>(null);
   const [localError, setLocalError] = useState("");
@@ -2214,10 +2411,13 @@ function CustomMetadataEditModal({
       overview: overview.trim() || null,
       voteAverage: parsedVote,
       posterFile,
+      episodeId: episode?.id ?? null,
+      episodeSubtitle: episode ? episodeSubtitle.trim() : null,
     });
   }
 
   const currentPoster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
+  const episodeLabel = episode ? episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber) : null;
 
   return (
     <div className="settingsOverlay modalOverlay" role="dialog" aria-label="custom metadata editor" aria-modal="true">
@@ -2226,7 +2426,7 @@ function CustomMetadataEditModal({
         <header className="settingsHeader">
           <div>
             <h2>手动编辑资料</h2>
-            <span>{detail.title}</span>
+            <span>{episodeLabel ? `${detail.title} · ${episodeLabel}` : detail.title}</span>
           </div>
           <button aria-label="close custom editor" onClick={onClose} type="button">
             <X size={18} />
@@ -2238,7 +2438,7 @@ function CustomMetadataEditModal({
             <h3>源文件信息</h3>
             <div className="sourceInfoBox compact">
               <span>文件</span>
-              <strong>{sourceFileLabel(detail)}</strong>
+              <strong>{episodeSourceFileLabel(episode) ?? sourceFileLabel(detail)}</strong>
             </div>
           </section>
 
@@ -2273,6 +2473,21 @@ function CustomMetadataEditModal({
             <h3>剧情简介</h3>
             <textarea disabled={isSaving} onChange={(event) => setOverview(event.target.value)} value={overview} />
           </section>
+
+          {episode ? (
+            <section className="editSection">
+              <h3>分集信息</h3>
+              <label className="settingsField">
+                <span>副标题</span>
+                <input
+                  disabled={isSaving}
+                  onChange={(event) => setEpisodeSubtitle(event.target.value)}
+                  placeholder="例如：播客"
+                  value={episodeSubtitle}
+                />
+              </label>
+            </section>
+          ) : null}
 
           <section className="editSection">
             <h3>海报管理</h3>
@@ -2316,6 +2531,24 @@ function sourceFileLabel(detail: LibraryItemDetail | null): string {
   }
 
   return file.relativePath || file.fileName || "未知文件名";
+}
+
+function episodeSourceFileLabel(episode?: EpisodeDetail | null): string | null {
+  const file = episode?.videoFile ?? null;
+  if (!file) {
+    return null;
+  }
+
+  return file.relativePath || file.fileName || "未知文件名";
+}
+
+function extractEpisodeSubtitle(title?: string | null): string {
+  if (!title) {
+    return "";
+  }
+
+  const separatorIndex = title.indexOf("·");
+  return separatorIndex < 0 ? "" : title.slice(separatorIndex + 1).trim();
 }
 
 function PosterCard({
@@ -2408,15 +2641,21 @@ function playbackProgressPercent(item: LibraryItemSummary): number {
 function DetailView({
   detail,
   errorText,
+  selectedSeasonId,
   showEpisodeDetails,
   onBack,
+  onEditMetadata,
   onPlay,
+  onSeasonChange,
 }: {
   detail: LibraryItemDetail;
   errorText: string;
+  selectedSeasonId: string;
   showEpisodeDetails: boolean;
   onBack: () => void;
+  onEditMetadata: (episode: EpisodeDetail) => void;
   onPlay: (file: VideoFileSummary) => void;
+  onSeasonChange: (seasonId: string) => void;
 }) {
   const poster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
   const year = detail.releaseDate?.slice(0, 4);
@@ -2428,30 +2667,34 @@ function DetailView({
         playableEpisodes[0] ??
         null
       : null;
-  const mainFile = mainEpisode?.videoFile ?? detail.videoFiles[0] ?? null;
-  const mainProgressPercent = fileProgressPercent(mainFile);
-  const mainStatusLabel = watchedStatusLabel(mainFile);
-  const mainElapsedLabel = mainFile ? formatPlaybackTime(mainFile.positionSeconds) : "0:00";
-  const mainDurationLabel = mainFile && mainFile.durationSeconds > 0 ? formatPlaybackTime(mainFile.durationSeconds) : "--:--";
+  const movieFiles = detail.itemKind === "movie" ? moviePlaybackFiles(detail) : [];
+  const mainMovieFile = detail.itemKind === "movie" ? resolveMovieMainFile(movieFiles) : null;
+  const mainFile = mainEpisode?.videoFile ?? mainMovieFile ?? null;
+  const mainTimeline = detail.itemKind === "movie"
+    ? multipartSavedTimeline(movieFiles)
+    : savedFileTimeline(mainFile);
+  const mainProgressPercent = mainTimeline.durationSeconds > 0
+    ? Math.round((Math.min(mainTimeline.positionSeconds, mainTimeline.durationSeconds) / mainTimeline.durationSeconds) * 100)
+    : fileProgressPercent(mainFile);
+  const mainStatusLabel = detail.itemKind === "movie" ? watchedStatusLabelForFiles(movieFiles) : watchedStatusLabel(mainFile);
+  const mainElapsedLabel = formatPlaybackTime(mainTimeline.positionSeconds);
+  const mainDurationLabel = mainTimeline.durationSeconds > 0 ? formatPlaybackTime(mainTimeline.durationSeconds) : "--:--";
   const playButtonText = [
-    mainFile && mainFile.positionSeconds > 5 ? "继续播放" : "开始播放",
+    mainTimeline.positionSeconds > 5 ? "继续播放" : "开始播放",
     mainEpisode ? episodeDisplayLabel(mainEpisode.seasonNumber, mainEpisode.episodeNumber) : null,
   ]
     .filter(Boolean)
     .join(" ");
-  const [selectedSeasonId, setSelectedSeasonId] = useState(detail.seasons[0]?.id ?? "");
-  const selectedSeason = detail.seasons.find((season) => season.id === selectedSeasonId) ?? detail.seasons[0] ?? null;
+  const resolvedSelectedSeasonId = detail.seasons.some((season) => season.id === selectedSeasonId)
+    ? selectedSeasonId
+    : detail.seasons[0]?.id ?? "";
+  const selectedSeason = detail.seasons.find((season) => season.id === resolvedSelectedSeasonId) ?? null;
 
   useEffect(() => {
-    if (detail.seasons.length === 0) {
-      setSelectedSeasonId("");
-      return;
+    if (resolvedSelectedSeasonId !== selectedSeasonId) {
+      onSeasonChange(resolvedSelectedSeasonId);
     }
-
-    if (!detail.seasons.some((season) => season.id === selectedSeasonId)) {
-      setSelectedSeasonId(detail.seasons[0].id);
-    }
-  }, [detail.id, detail.seasons, selectedSeasonId]);
+  }, [detail.id, onSeasonChange, resolvedSelectedSeasonId, selectedSeasonId]);
 
   return (
     <main className="detailShell">
@@ -2507,12 +2750,12 @@ function DetailView({
           <div className="seasonHeader">
             <select
               aria-label="season"
-              onChange={(event) => setSelectedSeasonId(event.target.value)}
+              onChange={(event) => onSeasonChange(event.target.value)}
               value={selectedSeason.id}
             >
               {detail.seasons.map((season) => (
                 <option key={season.id} value={season.id}>
-                  {season.title ?? (season.seasonNumber === 0 ? "特别篇" : `第 ${season.seasonNumber} 季`)}
+                  {seasonDisplayLabel(season, detail.title)}
                 </option>
               ))}
             </select>
@@ -2522,7 +2765,7 @@ function DetailView({
               <EpisodeCard
                 episode={episode}
                 key={episode.id}
-                onPlay={onPlay}
+                onEditMetadata={onEditMetadata}
                 poster={poster}
                 showDetails={showEpisodeDetails}
               />
@@ -2536,48 +2779,52 @@ function DetailView({
 
 function EpisodeCard({
   episode,
-  onPlay,
+  onEditMetadata,
   poster,
   showDetails,
 }: {
   episode: EpisodeDetail;
-  onPlay: (file: VideoFileSummary) => void;
+  onEditMetadata: (episode: EpisodeDetail) => void;
   poster: string | null;
   showDetails: boolean;
 }) {
   const file = episode.videoFile;
   const episodeLabel = episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber);
+  const title = episodeTitleDisplay(episode, episodeLabel, showDetails);
   const facts = [episode.title ? episodeLabel : null, episode.airDate].filter(Boolean).join(" · ");
   const progressPercent = fileProgressPercent(file);
   const showProgress = progressPercent > 0 && progressPercent < 95;
-  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    if (!file || (event.key !== "Enter" && event.key !== " ")) {
-      return;
-    }
-
-    event.preventDefault();
-    onPlay(file);
-  };
 
   return (
     <article
-      className={[file ? "episodeCard clickableEpisode" : "episodeCard", showDetails ? "" : "simpleEpisode"]
+      className={["episodeCard", showDetails ? "" : "simpleEpisode"]
         .filter(Boolean)
         .join(" ")}
-      onClick={file ? () => onPlay(file) : undefined}
-      onKeyDown={handleKeyDown}
-      role={file ? "button" : undefined}
-      tabIndex={file ? 0 : undefined}
     >
-      {episode.stillAssetId ? (
-        <img alt="" className="episodeStill" src={thumbnailUrl(episode.stillAssetId)} />
-      ) : (
-        <div className="episodeStill episodeStillPlaceholder">
-          {poster ? <img alt="" src={poster} /> : null}
-        </div>
-      )}
+      <div className="episodeStillFrame">
+        {episode.stillAssetId ? (
+          <img alt="" className="episodeStill" src={thumbnailUrl(episode.stillAssetId)} />
+        ) : (
+          <div className="episodeStill episodeStillPlaceholder">
+            {poster ? <img alt="" src={poster} /> : null}
+          </div>
+        )}
+        <button
+          aria-label="自定义编辑"
+          className="episodeStillEdit"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onEditMetadata(episode);
+          }}
+          title="自定义编辑"
+          type="button"
+        >
+          <Pencil size={15} />
+        </button>
+      </div>
       <div className="episodeBody">
-        <h3>{showDetails ? episode.title ?? episodeLabel : episodeLabel}</h3>
+        <h3>{title}</h3>
         {showDetails && facts ? <p>{facts}</p> : null}
         {showDetails && episode.overview ? <span>{episode.overview}</span> : null}
         {showDetails && showProgress ? (
@@ -2601,12 +2848,291 @@ function episodeDisplayLabel(seasonNumber: number, episodeNumber: number): strin
   return seasonNumber === 0 ? `特别篇第 ${episodeNumber} 集` : `第 ${seasonNumber} 季第 ${episodeNumber} 集`;
 }
 
+function episodeTitleDisplay(episode: EpisodeDetail, episodeLabel: string, showDetails: boolean): string {
+  if (showDetails) {
+    return episode.title ?? episodeLabel;
+  }
+
+  const subtitle = extractEpisodeSubtitle(episode.title);
+  return subtitle ? `${episodeLabel}·${subtitle}` : episodeLabel;
+}
+
+function seasonDisplayLabel(season: { seasonNumber: number; title: string | null }, showTitle: string): string {
+  const fallback = season.seasonNumber === 0 ? "特别篇" : `第 ${season.seasonNumber} 季`;
+  const title = season.title?.trim();
+  if (!title) {
+    return fallback;
+  }
+
+  const compactTitle = normalizeCompactTitle(title);
+  const compactShowTitle = normalizeCompactTitle(showTitle);
+  if (compactShowTitle && compactTitle.includes(compactShowTitle) && compactTitle !== normalizeCompactTitle(fallback)) {
+    return fallback;
+  }
+
+  return title;
+}
+
+function normalizeCompactTitle(value: string): string {
+  return value.replace(/[\s._\-:：'’!！]+/g, "").toLowerCase();
+}
+
 function fileProgressPercent(file: VideoFileSummary | null): number {
   if (!file || file.durationSeconds <= 0 || file.positionSeconds <= 0) {
     return 0;
   }
 
   return Math.round((Math.min(file.positionSeconds, file.durationSeconds) / file.durationSeconds) * 100);
+}
+
+const unknownMoviePartIndex = Number.MAX_SAFE_INTEGER;
+const moviePartPrefixes = ["volume", "part", "disc", "disk", "dvd", "vol", "pt", "cd"];
+const chineseMoviePartIndexes: Record<string, number> = {
+  上: 1,
+  上半: 1,
+  上篇: 1,
+  前篇: 1,
+  下: 2,
+  下半: 2,
+  下篇: 2,
+  后篇: 2,
+  後篇: 2,
+};
+
+function parseRomanNumber(value: string): number | null {
+  const roman = value.trim().toLowerCase();
+  if (!/^[ivxlcdm]+$/.test(roman)) {
+    return null;
+  }
+
+  const values: Record<string, number> = { i: 1, v: 5, x: 10, l: 50, c: 100, d: 500, m: 1000 };
+  let total = 0;
+  for (let index = 0; index < roman.length; index += 1) {
+    const current = values[roman[index]] ?? 0;
+    const next = values[roman[index + 1]] ?? 0;
+    total += current < next ? -current : current;
+  }
+  return total > 0 ? total : null;
+}
+
+function parseMoviePartToken(value: string | undefined): number | null {
+  const token = (value ?? "").trim().toLowerCase();
+  if (!token) {
+    return null;
+  }
+
+  if (/^\d{1,3}$/.test(token)) {
+    const numeric = Number(token);
+    return numeric > 0 ? numeric : null;
+  }
+
+  if (chineseMoviePartIndexes[value ?? ""]) {
+    return chineseMoviePartIndexes[value ?? ""];
+  }
+
+  return parseRomanNumber(token);
+}
+
+function moviePartSortIndex(file: VideoFileSummary): number {
+  const raw = `${file.relativePath || ""}/${file.fileName || ""}`;
+  const tokens = raw.split(/[\\/\s._\-\[\]\(\)\{\}【】（）,:：]+/u).filter(Boolean);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const rawToken = tokens[index];
+    const token = rawToken.toLowerCase();
+    if (chineseMoviePartIndexes[rawToken]) {
+      return chineseMoviePartIndexes[rawToken];
+    }
+
+    for (const prefix of moviePartPrefixes) {
+      if (token === prefix) {
+        const parsed = parseMoviePartToken(tokens[index + 1]);
+        if (parsed !== null) {
+          return parsed;
+        }
+      } else if (token.startsWith(prefix)) {
+        const parsed = parseMoviePartToken(token.slice(prefix.length));
+        if (parsed !== null) {
+          return parsed;
+        }
+      }
+    }
+  }
+
+  return unknownMoviePartIndex;
+}
+
+function compareVideoFilesForPlayback(lhs: VideoFileSummary, rhs: VideoFileSummary): number {
+  const lhsPartIndex = moviePartSortIndex(lhs);
+  const rhsPartIndex = moviePartSortIndex(rhs);
+  if (lhsPartIndex !== rhsPartIndex) {
+    return lhsPartIndex - rhsPartIndex;
+  }
+
+  return lhs.relativePath.localeCompare(rhs.relativePath, undefined, { numeric: true, sensitivity: "base" }) ||
+    lhs.fileName.localeCompare(rhs.fileName, undefined, { numeric: true, sensitivity: "base" }) ||
+    lhs.id.localeCompare(rhs.id);
+}
+
+function moviePlaybackFiles(detail: LibraryItemDetail): VideoFileSummary[] {
+  if (detail.itemKind !== "movie") {
+    return [];
+  }
+
+  return [...detail.videoFiles].sort(compareVideoFilesForPlayback);
+}
+
+function resolveMovieMainFile(files: VideoFileSummary[]): VideoFileSummary | null {
+  return files.find((file) => hasUnfinishedProgress(file)) ??
+    files.find((file) => !isEffectivelyWatched(file)) ??
+    files[0] ??
+    null;
+}
+
+function isEffectivelyWatched(file: VideoFileSummary | null | undefined): boolean {
+  return !!file && (file.isWatched || fileProgressPercent(file) >= 95);
+}
+
+function savedFileTimeline(file: VideoFileSummary | null): { positionSeconds: number; durationSeconds: number } {
+  if (!file) {
+    return { positionSeconds: 0, durationSeconds: 0 };
+  }
+
+  const durationSeconds = Math.max(0, file.durationSeconds);
+  const positionSeconds = durationSeconds > 0
+    ? Math.min(Math.max(0, file.positionSeconds), durationSeconds)
+    : Math.max(0, file.positionSeconds);
+  return { positionSeconds, durationSeconds };
+}
+
+function multipartSavedTimeline(files: VideoFileSummary[]): { positionSeconds: number; durationSeconds: number } {
+  return files.reduce(
+    (summary, file) => {
+      const durationSeconds = Math.max(0, file.durationSeconds);
+      if (durationSeconds <= 0) {
+        return summary;
+      }
+
+      summary.durationSeconds += durationSeconds;
+      summary.positionSeconds += isEffectivelyWatched(file)
+        ? durationSeconds
+        : Math.min(Math.max(0, file.positionSeconds), durationSeconds);
+      return summary;
+    },
+    { positionSeconds: 0, durationSeconds: 0 },
+  );
+}
+
+function multipartLiveTimeline(
+  files: VideoFileSummary[],
+  currentIndex: number,
+  currentTime: number,
+  currentDuration: number,
+  bufferedUntil: number,
+): { positionSeconds: number; bufferedSeconds: number; durationSeconds: number } {
+  let offsetSeconds = 0;
+  let durationSeconds = 0;
+  for (let index = 0; index < files.length; index += 1) {
+    const fileDuration = Math.max(
+      0,
+      index === currentIndex
+        ? Math.max(files[index].durationSeconds, currentDuration, currentTime, bufferedUntil)
+        : files[index].durationSeconds,
+    );
+    if (index < currentIndex) {
+      offsetSeconds += fileDuration;
+    }
+    durationSeconds += fileDuration;
+  }
+
+  return {
+    positionSeconds: offsetSeconds + Math.max(0, currentTime),
+    bufferedSeconds: offsetSeconds + Math.max(0, bufferedUntil),
+    durationSeconds,
+  };
+}
+
+type MultipartTimelineSegment = {
+  durationText: string;
+  isCurrent: boolean;
+  key: string;
+  label: string;
+  startPercent: number;
+  widthPercent: number;
+};
+
+function multipartTimelineSegments(
+  files: VideoFileSummary[],
+  currentIndex: number,
+  currentTime: number,
+  currentDuration: number,
+  bufferedUntil: number,
+): MultipartTimelineSegment[] {
+  const durations = files.map((file, index) => Math.max(
+    0,
+    index === currentIndex
+      ? Math.max(file.durationSeconds, currentDuration, currentTime, bufferedUntil)
+      : file.durationSeconds,
+  ));
+  const totalDuration = durations.reduce((total, durationSeconds) => total + durationSeconds, 0);
+  if (files.length <= 1 || totalDuration <= 0) {
+    return [];
+  }
+
+  let cursor = 0;
+  return files.map((file, index) => {
+    const durationSeconds = durations[index] ?? 0;
+    const segment = {
+      durationText: formatPlaybackTime(durationSeconds),
+      isCurrent: index === currentIndex,
+      key: file.id,
+      label: `第 ${index + 1} 段`,
+      startPercent: (cursor / totalDuration) * 100,
+      widthPercent: (durationSeconds / totalDuration) * 100,
+    };
+    cursor += durationSeconds;
+    return segment;
+  });
+}
+
+function resolveMultipartSeekTarget(
+  files: VideoFileSummary[],
+  currentIndex: number,
+  currentDuration: number,
+  currentTime: number,
+  targetSeconds: number,
+): { index: number; seconds: number } {
+  let cursor = 0;
+  for (let index = 0; index < files.length; index += 1) {
+    const durationSeconds = Math.max(
+      0,
+      index === currentIndex
+        ? Math.max(files[index].durationSeconds, currentDuration, currentTime)
+        : files[index].durationSeconds,
+    );
+    if (durationSeconds <= 0) {
+      continue;
+    }
+
+    if (targetSeconds <= cursor + durationSeconds || index === files.length - 1) {
+      return { index, seconds: Math.max(0, Math.min(durationSeconds, targetSeconds - cursor)) };
+    }
+
+    cursor += durationSeconds;
+  }
+
+  return { index: Math.max(0, files.length - 1), seconds: 0 };
+}
+
+function watchedStatusLabelForFiles(files: VideoFileSummary[]): string {
+  if (files.length === 0) {
+    return "未播";
+  }
+
+  if (files.every((file) => isEffectivelyWatched(file))) {
+    return "已播";
+  }
+
+  return files.some((file) => file.positionSeconds > 5 || isEffectivelyWatched(file)) ? "未播完" : "未播";
 }
 
 function hasUnfinishedProgress(file: VideoFileSummary | null | undefined): boolean {
@@ -2670,29 +3196,372 @@ function formatMediaProbe(file: VideoFileSummary): string {
 }
 
 function formatAudioTrack(track: VideoFileSummary["audioTracks"][number]): string {
-  return [
-    `音轨 ${track.index + 1}`,
-    track.language,
-    track.title,
-    track.codec,
-    track.channelLayout ?? (track.channels ? `${track.channels}ch` : null),
-    track.isDefault ? "默认" : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  return `${formatLanguageLabel(track.language, track.title)} - ${formatAudioTrackCodec(track)}`;
 }
 
 function formatSubtitleStream(stream: VideoFileSummary["subtitleStreams"][number]): string {
+  return `${formatLanguageLabel(stream.language, stream.title)} - ${formatSubtitleCodec(stream.codec)}`;
+}
+
+function formatExternalSubtitleTrack(subtitle: PlaybackSubtitleTrack): string {
+  return `${formatLanguageLabel(subtitle.language, subtitle.fileName)} - ${formatSubtitleCodec(subtitle.format)}`;
+}
+
+function formatLanguageLabel(language?: string | null, fallback?: string | null): string {
+  const text = normalizeSearchText([language, fallback]);
+  const tokens = tokenizeSearchText(text);
+  if (tokens.some((token) => ["zh", "zho", "chi", "chs", "cht", "cmn", "yue", "cn"].includes(token))
+      || /中文|国语|國語|粤语|粵語|简体|簡體|繁体|繁體/.test(text)) {
+    return "中文";
+  }
+
+  if (tokens.some((token) => ["en", "eng", "english"].includes(token)) || /英语|英文|英語/.test(text)) {
+    return "英语";
+  }
+
+  if (tokens.some((token) => ["ja", "jp", "jpn", "japanese"].includes(token)) || /日本|日语|日語|日文/.test(text)) {
+    return "日语";
+  }
+
+  if (tokens.some((token) => ["ko", "kor", "korean"].includes(token)) || /韩语|韓語|韩文|韓文|韩国|韓国|韓國/.test(text)) {
+    return "韩语";
+  }
+
+  if (tokens.some((token) => ["fr", "fre", "fra", "french"].includes(token))) {
+    return "法语";
+  }
+
+  if (tokens.some((token) => ["de", "ger", "deu", "german"].includes(token))) {
+    return "德语";
+  }
+
+  if (tokens.some((token) => ["es", "spa", "spanish"].includes(token))) {
+    return "西语";
+  }
+
+  return language?.trim() || "未知";
+}
+
+function formatAudioTrackCodec(track: VideoFileSummary["audioTracks"][number]): string {
+  const channelText = formatAudioChannels(track.channels, track.channelLayout);
+  const codecText = formatAudioCodec(track.codec, track.title);
+  return [codecText, channelText].filter(Boolean).join(" ") || "未知音轨";
+}
+
+function formatAudioChannels(channels?: number | null, channelLayout?: string | null): string | null {
+  if (channels && channels > 0) {
+    if (channels === 8) {
+      return "7.1";
+    }
+    if (channels === 7) {
+      return "6.1";
+    }
+    if (channels === 6) {
+      return "5.1";
+    }
+    if (channels === 2) {
+      return "2.0";
+    }
+    if (channels === 1) {
+      return "1.0";
+    }
+    return `${channels}ch`;
+  }
+
+  const layout = channelLayout?.trim().toLowerCase();
+  if (!layout) {
+    return null;
+  }
+
+  if (layout.includes("7.1")) {
+    return "7.1";
+  }
+  if (layout.includes("6.1")) {
+    return "6.1";
+  }
+  if (layout.includes("5.1")) {
+    return "5.1";
+  }
+  if (layout.includes("stereo") || layout.includes("2.0")) {
+    return "2.0";
+  }
+  if (layout.includes("mono") || layout.includes("1.0")) {
+    return "1.0";
+  }
+
+  return channelLayout ?? null;
+}
+
+function formatAudioCodec(codec?: string | null, title?: string | null): string | null {
+  const normalized = (codec ?? "").trim().toLowerCase();
+  const titleText = (title ?? "").trim().toLowerCase();
+  const hasAtmos = titleText.includes("atmos") || normalized.includes("atmos");
+  const base = (() => {
+    switch (normalized) {
+      case "truehd":
+      case "mlp":
+        return "TrueHD";
+      case "eac3":
+      case "e-ac-3":
+      case "eac-3":
+        return "DD+";
+      case "ac3":
+      case "ac-3":
+        return "DD";
+      case "dts":
+        return titleText.includes("dts-hd") || titleText.includes("ma") ? "DTS-HD MA" : "DTS";
+      case "dts_hd_ma":
+      case "dts-hd-ma":
+        return "DTS-HD MA";
+      case "flac":
+        return "FLAC";
+      case "aac":
+        return "AAC";
+      case "opus":
+        return "Opus";
+      case "mp3":
+        return "MP3";
+      default:
+        return codec?.trim() || null;
+    }
+  })();
+
+  return hasAtmos && base && !base.includes("Atmos") ? `${base} Atmos` : base;
+}
+
+function formatSubtitleCodec(codec?: string | null): string {
+  switch ((codec ?? "").trim().toLowerCase().replace("-", "_")) {
+    case "hdmv_pgs_subtitle":
+    case "pgs":
+      return "PGS";
+    case "ass":
+      return "ASS";
+    case "ssa":
+      return "SSA";
+    case "subrip":
+    case "srt":
+      return "SRT";
+    case "webvtt":
+    case "vtt":
+      return "WebVTT";
+    case "mov_text":
+      return "MOV Text";
+    case "dvd_subtitle":
+    case "dvdsub":
+      return "DVD";
+    default:
+      return codec?.trim() || "字幕";
+  }
+}
+
+function embeddedSubtitleId(stream: VideoFileSummary["subtitleStreams"][number], ordinal: number): string {
+  return `embedded_${stream.index}_si_${ordinal}`;
+}
+
+function isEmbeddedSubtitleIdForStream(
+  subtitleId: string,
+  stream: VideoFileSummary["subtitleStreams"][number],
+  ordinal: number,
+): boolean {
+  return subtitleId === embeddedSubtitleId(stream, ordinal) || subtitleId === `embedded_${stream.index}`;
+}
+
+function findSelectedEmbeddedSubtitle(
+  file: VideoFileSummary,
+  subtitleId: string,
+): VideoFileSummary["subtitleStreams"][number] | null {
+  if (!subtitleId.startsWith("embedded_")) {
+    return null;
+  }
+
+  return file.subtitleStreams.find((stream, ordinal) => isEmbeddedSubtitleIdForStream(subtitleId, stream, ordinal)) ?? null;
+}
+
+function findSelectedEmbeddedSubtitleOrdinal(file: VideoFileSummary, subtitleId: string): number | null {
+  if (!subtitleId.startsWith("embedded_")) {
+    return null;
+  }
+
+  const index = file.subtitleStreams.findIndex((stream, ordinal) => isEmbeddedSubtitleIdForStream(subtitleId, stream, ordinal));
+  return index >= 0 ? index : null;
+}
+
+function canUseEmbeddedSubtitleAsWebTrack(stream: VideoFileSummary["subtitleStreams"][number]): boolean {
+  const codec = (stream.codec ?? "").trim().toLowerCase();
   return [
-    `字幕 ${stream.index + 1}`,
-    stream.language,
-    stream.title,
-    stream.codec,
-    stream.isForced ? "强制" : null,
-    stream.isDefault ? "默认" : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+    "ass",
+    "ssa",
+    "subrip",
+    "srt",
+    "webvtt",
+    "mov_text",
+    "text",
+  ].includes(codec);
+}
+
+function embeddedSubtitleWebVttUrl(fileId: string, ordinal: number): string {
+  return `/api/playback/files/${encodeURIComponent(fileId)}/embedded-subtitles/${ordinal}.vtt`;
+}
+
+function resolvePreferredAudioTrack(
+  detail: LibraryItemDetail,
+  file: VideoFileSummary,
+  preference: string,
+): string {
+  if (file.audioTracks.length === 0) {
+    return "auto";
+  }
+
+  const defaultTrack = file.audioTracks.find((track) => track.isDefault) ?? null;
+  const requestedLanguage = preference === "smart" ? resolveSmartAudioLanguage(detail, file) : preference;
+  const matchedTrack = requestedLanguage
+    ? file.audioTracks.find((track) =>
+        matchesLanguagePreference(
+          [track.language, track.title, track.codec, track.channelLayout, track.channels ? `${track.channels}ch` : null],
+          requestedLanguage,
+        ),
+      ) ?? null
+    : null;
+
+  return String((matchedTrack ?? defaultTrack ?? file.audioTracks[0]).index);
+}
+
+function resolveSmartAudioLanguage(detail: LibraryItemDetail, file: VideoFileSummary): "en" | "ja" | "zh" | null {
+  const text = normalizeSearchText([
+    detail.title,
+    file.fileName,
+    file.relativePath,
+    file.episodeTitle,
+  ]);
+  const tokens = tokenizeSearchText(text);
+  if (tokens.some((token) => ["japan", "japanese", "jpn", "jp", "anime"].includes(token)) || /[\u3040-\u30ff]/.test(text)) {
+    return "ja";
+  }
+
+  if (tokens.some((token) => ["china", "chinese", "mandarin", "cantonese", "chn", "cn", "hk", "tw"].includes(token))) {
+    return "zh";
+  }
+
+  if (tokens.some((token) => ["usa", "us", "uk", "gb", "english", "eng", "america", "britain"].includes(token))) {
+    return "en";
+  }
+
+  return null;
+}
+
+function resolvePreferredSubtitleSelection(
+  file: VideoFileSummary,
+  subtitles: PlaybackSubtitleTrack[],
+  preference: string,
+): { id: string; mode: string } | null {
+  const language = preference === "en" ? "en" : "zh";
+  const externalMatch = subtitles.find((subtitle) =>
+    matchesLanguagePreference([subtitle.language, subtitle.fileName, subtitle.format], language),
+  );
+  if (externalMatch) {
+    return { id: externalMatch.id, mode: "burn" };
+  }
+
+  const embeddedMatchIndex = file.subtitleStreams.findIndex((stream) =>
+    matchesLanguagePreference([stream.language, stream.title, stream.codec], language),
+  );
+  if (embeddedMatchIndex >= 0) {
+    const embeddedMatch = file.subtitleStreams[embeddedMatchIndex];
+    return {
+      id: embeddedSubtitleId(embeddedMatch, embeddedMatchIndex),
+      mode: isBitmapSubtitleCodec(embeddedMatch.codec) ? "burn-bitmap" : "burn",
+    };
+  }
+
+  const fallbackExternal = subtitles.at(-1);
+  if (fallbackExternal) {
+    return { id: fallbackExternal.id, mode: "burn" };
+  }
+
+  const lastEmbeddedIndex = file.subtitleStreams.length - 1;
+  const lastEmbedded = lastEmbeddedIndex >= 0 ? file.subtitleStreams[lastEmbeddedIndex] : null;
+  if (lastEmbedded) {
+    return {
+      id: embeddedSubtitleId(lastEmbedded, lastEmbeddedIndex),
+      mode: isBitmapSubtitleCodec(lastEmbedded.codec) ? "burn-bitmap" : "burn",
+    };
+  }
+
+  return null;
+}
+
+function resolveSubtitlePlaybackMode(
+  subtitleId: string,
+  file: VideoFileSummary,
+  subtitles: PlaybackSubtitleTrack[],
+): string {
+  if (!subtitleId) {
+    return "off";
+  }
+
+  if (file.subtitleStreams.some((stream, ordinal) => isEmbeddedSubtitleIdForStream(subtitleId, stream, ordinal))) {
+    const stream = file.subtitleStreams.find((candidate, ordinal) => isEmbeddedSubtitleIdForStream(subtitleId, candidate, ordinal));
+    return stream && isBitmapSubtitleCodec(stream.codec) ? "burn-bitmap" : "burn";
+  }
+
+  const externalSubtitle = subtitles.find((subtitle) => subtitle.id === subtitleId);
+  return externalSubtitle ? "burn" : "off";
+}
+
+function resolveBurnedSubtitlePlaybackMode(subtitleId: string, file: VideoFileSummary): string {
+  const embeddedSubtitle = findSelectedEmbeddedSubtitle(file, subtitleId);
+  if (!embeddedSubtitle) {
+    return "burn";
+  }
+
+  return isBitmapSubtitleCodec(embeddedSubtitle.codec) ? "burn-bitmap" : "burn";
+}
+
+function isBitmapSubtitleCodec(codec?: string | null): boolean {
+  const normalized = (codec ?? "").trim().toLowerCase().replace("-", "_");
+  return ["hdmv_pgs_subtitle", "pgs", "dvd_subtitle", "dvdsub"].includes(normalized);
+}
+
+function matchesLanguagePreference(values: Array<string | null | undefined>, preference: string): boolean {
+  const language = preference === "ja" || preference === "zh" || preference === "en" ? preference : "zh";
+  const text = normalizeSearchText(values);
+  const tokens = tokenizeSearchText(text);
+  const exactAliases: Record<"en" | "ja" | "zh", string[]> = {
+    en: ["en", "eng", "english"],
+    ja: ["ja", "jp", "jpn", "japanese"],
+    zh: ["zh", "zho", "chi", "chs", "cht", "cmn", "yue", "cn", "chinese"],
+  };
+  const phraseAliases: Record<"en" | "ja" | "zh", string[]> = {
+    en: ["english", "英语", "英文", "英語"],
+    ja: ["japanese", "日本語", "日语", "日語", "日文"],
+    zh: [
+      "chinese",
+      "mandarin",
+      "cantonese",
+      "中文",
+      "国语",
+      "國語",
+      "普通话",
+      "普通話",
+      "粤语",
+      "粵語",
+      "简体",
+      "簡體",
+      "繁体",
+      "繁體",
+    ],
+  };
+
+  return exactAliases[language].some((alias) => tokens.includes(alias)) ||
+    phraseAliases[language].some((alias) => text.includes(alias));
+}
+
+function normalizeSearchText(values: Array<string | null | undefined>): string {
+  return values.filter(Boolean).join(" ").normalize("NFKC").toLowerCase();
+}
+
+function tokenizeSearchText(value: string): string[] {
+  return value.split(/[^a-z0-9]+/).filter(Boolean);
 }
 
 function formatPlaybackCacheStatus(status: PlaybackCacheStatus): string {
@@ -2710,51 +3579,128 @@ function formatPlaybackCacheStatus(status: PlaybackCacheStatus): string {
 
 function PlayerView({
   detail,
-  file,
+  file: initialFile,
   onBack,
+  playbackSettings,
 }: {
   detail: LibraryItemDetail;
   file: VideoFileSummary;
   onBack: () => void;
+  playbackSettings: AppSettingsSnapshot["playback"];
 }) {
+  const playlistFiles = useMemo(() => {
+    if (detail.itemKind !== "movie") {
+      return [initialFile];
+    }
+
+    const files = moviePlaybackFiles(detail);
+    return files.length > 0 ? files : [initialFile];
+  }, [detail, initialFile]);
+  const [currentFileId, setCurrentFileId] = useState(initialFile.id);
+  const requestedFileIndex = playlistFiles.findIndex((candidate) => candidate.id === currentFileId);
+  const initialFileIndex = playlistFiles.findIndex((candidate) => candidate.id === initialFile.id);
+  const currentFileIndex = requestedFileIndex >= 0 ? requestedFileIndex : Math.max(0, initialFileIndex);
+  const file = playlistFiles[currentFileIndex] ?? initialFile;
+  const isMultipartMovie = detail.itemKind === "movie" && playlistFiles.length > 1;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const lastSavedAtRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const hlsSessionIdsRef = useRef<Set<string>>(new Set());
   const controlsHideTimerRef = useRef(0);
+  const playbackPositionRef = useRef(file.positionSeconds);
+  const pendingSeekSecondsRef = useRef<number | null>(file.positionSeconds > 1 ? file.positionSeconds : null);
+  const pendingUserSeekRef = useRef<number | null>(null);
+  const seekHoldUntilRef = useRef(0);
+  const subtitleCueCacheRef = useRef<Map<string, WebSubtitleCue[]>>(new Map());
+  const suppressProgressSaveRef = useRef(false);
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [playbackMode, setPlaybackMode] = useState<"direct" | "hls" | null>(null);
   const [playerStatus, setPlayerStatus] = useState("正在准备播放");
   const [playerError, setPlayerError] = useState("");
-  const [quality, setQuality] = useState("original");
-  const [audioTrack, setAudioTrack] = useState("auto");
+  const [audioTrack, setAudioTrack] = useState(() =>
+    resolvePreferredAudioTrack(detail, file, playbackSettings.defaultAudioLanguage),
+  );
   const [subtitleMode, setSubtitleMode] = useState("off");
   const [selectedSubtitleId, setSelectedSubtitleId] = useState("");
-  const [useHardware, setUseHardware] = useState(true);
-  const [capabilities, setCapabilities] = useState<FfmpegTranscodeCapabilities | null>(null);
+  const [useHardware] = useState(true);
   const [subtitles, setSubtitles] = useState<PlaybackSubtitleTrack[]>([]);
   const [cacheStatus, setCacheStatus] = useState<PlaybackCacheStatus | null>(null);
-  const [diagnostics, setDiagnostics] = useState<PlaybackDiagnostics | null>(null);
-  const [diagnosticsError, setDiagnosticsError] = useState("");
-  const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false);
-  const [cleanupText, setCleanupText] = useState("");
   const [showPlayerControls, setShowPlayerControls] = useState(true);
-  const [isPaused, setIsPaused] = useState(true);
+  const [openPlayerMenu, setOpenPlayerMenu] = useState<"audio" | "subtitle" | null>(null);
+  const [isPaused, setIsPaused] = useState(false);
+  const [subtitleCues, setSubtitleCues] = useState<WebSubtitleCue[]>([]);
   const [currentTime, setCurrentTime] = useState(file.positionSeconds);
   const [duration, setDuration] = useState(file.durationSeconds);
+  const [bufferedUntil, setBufferedUntil] = useState(0);
   const title = formatPlayerTitle(detail, file);
   const subTitle = playerSubTitle(file);
+  const selectedAudioTrack = audioTrack === "auto"
+    ? null
+    : file.audioTracks.find((track) => String(track.index) === audioTrack) ?? null;
+  const implicitAudioTrack = file.audioTracks.find((track) => track.isDefault) ?? file.audioTracks[0] ?? null;
+  const requestedAudioTrackIndex =
+    selectedAudioTrack && implicitAudioTrack && selectedAudioTrack.index !== implicitAudioTrack.index
+      ? selectedAudioTrack.index
+      : null;
+  const selectedAudioTrackLabel = selectedAudioTrack ? formatAudioTrack(selectedAudioTrack) : "默认音轨";
   const selectedSubtitle = subtitles.find((subtitle) => subtitle.id === selectedSubtitleId) ?? null;
-  const selectedEmbeddedSubtitle = selectedSubtitleId.startsWith("embedded_")
-    ? file.subtitleStreams.find((stream) => `embedded_${stream.index}` === selectedSubtitleId) ?? null
+  const selectedEmbeddedSubtitle = findSelectedEmbeddedSubtitle(file, selectedSubtitleId);
+  const selectedEmbeddedSubtitleOrdinal = findSelectedEmbeddedSubtitleOrdinal(file, selectedSubtitleId);
+  const canFallbackToBurnedSubtitle =
+    subtitleMode === "web" &&
+    !!selectedSubtitleId &&
+    (!!selectedSubtitle || !!selectedEmbeddedSubtitle);
+  const selectedEmbeddedSubtitleWebVttUrl =
+    selectedEmbeddedSubtitle &&
+    selectedEmbeddedSubtitleOrdinal !== null &&
+    subtitleMode === "web" &&
+    canUseEmbeddedSubtitleAsWebTrack(selectedEmbeddedSubtitle)
+      ? embeddedSubtitleWebVttUrl(file.id, selectedEmbeddedSubtitleOrdinal)
+      : null;
+  const selectedWebSubtitleUrl = subtitleMode === "web"
+    ? selectedSubtitle?.webVttUrl ?? selectedEmbeddedSubtitleWebVttUrl
     : null;
+  const selectedSubtitleLabel = selectedEmbeddedSubtitle
+    ? formatSubtitleStream(selectedEmbeddedSubtitle)
+    : selectedSubtitle
+      ? formatExternalSubtitleTrack(selectedSubtitle)
+      : "关闭字幕";
   const requiresFullCacheForPlayback =
-    quality !== "original" ||
-    audioTrack !== "auto" ||
-    (!!selectedSubtitleId && subtitleMode === "burn");
+    requestedAudioTrackIndex !== null ||
+    (!!selectedSubtitleId && subtitleMode.startsWith("burn")) ||
+    (!!selectedEmbeddedSubtitle && subtitleMode === "web");
   const isPlaybackCachePlayable =
     cacheStatus?.isReady || (!!cacheStatus?.canStreamDirect && !requiresFullCacheForPlayback) || false;
   const seekSeconds = 10;
-  const progressValue = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+  const timeline = isMultipartMovie
+    ? multipartLiveTimeline(playlistFiles, currentFileIndex, currentTime, duration, bufferedUntil)
+    : {
+        positionSeconds: currentTime,
+        bufferedSeconds: bufferedUntil,
+        durationSeconds: duration,
+      };
+  const progressValue = timeline.durationSeconds > 0
+    ? Math.min(100, Math.max(0, (timeline.positionSeconds / timeline.durationSeconds) * 100))
+    : 0;
+  const bufferedValue = timeline.durationSeconds > 0
+    ? Math.min(100, Math.max(progressValue, (timeline.bufferedSeconds / timeline.durationSeconds) * 100))
+    : 0;
+  const timelineSegments = isMultipartMovie
+    ? multipartTimelineSegments(playlistFiles, currentFileIndex, currentTime, duration, bufferedUntil)
+    : [];
+  const playbackDecisionSubtitleMode = selectedWebSubtitleUrl ? "off" : selectedSubtitleId ? subtitleMode : "off";
+  const playbackDecisionSubtitleId = selectedWebSubtitleUrl ? null : selectedSubtitleId || null;
+  const activeSubtitleText = selectedWebSubtitleUrl
+    ? subtitleCues
+        .filter((cue) => currentTime >= cue.start && currentTime <= cue.end)
+        .map((cue) => cue.text)
+        .filter(Boolean)
+        .join("\n")
+    : "";
+
+  useEffect(() => {
+    setCurrentFileId(initialFile.id);
+  }, [detail.id, initialFile.id]);
 
   const resetControlTimer = useCallback((forceVisible = true) => {
     window.clearTimeout(controlsHideTimerRef.current);
@@ -2776,16 +3722,56 @@ function PlayerView({
     return () => window.clearTimeout(controlsHideTimerRef.current);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      void stopAllHlsSessions();
+    };
+  }, []);
+
+  useEffect(() => {
+    setAudioTrack(resolvePreferredAudioTrack(detail, file, playbackSettings.defaultAudioLanguage));
+    setSelectedSubtitleId("");
+    setSubtitleMode("off");
+    setSubtitles([]);
+    setSubtitleCues([]);
+    setOpenPlayerMenu(null);
+    setCurrentTime(file.positionSeconds);
+    setDuration(file.durationSeconds);
+    setBufferedUntil(0);
+    setIsPaused(false);
+    setPlaybackMode(null);
+    setPlaybackUrl(null);
+    playbackPositionRef.current = file.positionSeconds;
+    pendingSeekSecondsRef.current = file.positionSeconds > 1 ? file.positionSeconds : null;
+    pendingUserSeekRef.current = null;
+    seekHoldUntilRef.current = 0;
+    suppressProgressSaveRef.current = false;
+  }, [
+    detail.title,
+    file.id,
+    file.relativePath,
+    playbackSettings.defaultAudioLanguage,
+  ]);
+
+  useEffect(() => {
+    if (!showPlayerControls) {
+      setOpenPlayerMenu(null);
+    }
+  }, [showPlayerControls]);
+
   const saveProgress = useCallback(
     async (force = false) => {
+      if (suppressProgressSaveRef.current) {
+        return;
+      }
+
       const video = videoRef.current;
       if (!video) {
         return;
       }
 
-      const positionSeconds = Number.isFinite(video.currentTime) ? video.currentTime : file.positionSeconds;
-      const durationSeconds =
-        Number.isFinite(video.duration) && video.duration > 0 ? video.duration : file.durationSeconds;
+      const positionSeconds = readCurrentPlaybackTime();
+      const durationSeconds = resolvePlaybackDuration(video.duration, duration || file.durationSeconds);
       if (!force && Math.abs(positionSeconds - lastSavedAtRef.current) < 10) {
         return;
       }
@@ -2797,37 +3783,12 @@ function PlayerView({
         // Playback must keep running even if a transient progress save fails.
       }
     },
-    [file.id, file.durationSeconds, file.positionSeconds],
+    [duration, file.id, file.durationSeconds, file.positionSeconds],
   );
 
   useEffect(() => {
     lastSavedAtRef.current = file.positionSeconds;
   }, [file.id, file.positionSeconds]);
-
-  useEffect(() => {
-    if (!isPlaybackCachePlayable) {
-      return;
-    }
-
-    let isCancelled = false;
-    void getPlaybackCapabilities()
-      .then((nextCapabilities) => {
-        if (isCancelled) {
-          return;
-        }
-
-        setCapabilities(nextCapabilities);
-      })
-      .catch((error: unknown) => {
-        if (!isCancelled) {
-          setPlayerError(error instanceof Error ? error.message : String(error));
-        }
-      });
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [file.id, isPlaybackCachePlayable]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -2881,9 +3842,8 @@ function PlayerView({
       }
     }
 
+    rememberPlaybackPosition();
     setCacheStatus(null);
-    setPlaybackMode(null);
-    setPlaybackUrl(null);
     setPlayerStatus("正在准备缓存");
     setPlayerError("");
     void pollCache(true);
@@ -2907,13 +3867,23 @@ function PlayerView({
         }
 
         setSubtitles(nextSubtitles);
-        setSelectedSubtitleId((current) =>
-          current &&
-          (nextSubtitles.some((subtitle) => subtitle.id === current) ||
-            file.subtitleStreams.some((stream) => `embedded_${stream.index}` === current))
-            ? current
-            : "",
-        );
+        setSelectedSubtitleId((current) => {
+          const stillAvailable =
+            current &&
+            (nextSubtitles.some((subtitle) => subtitle.id === current) ||
+              file.subtitleStreams.some((stream, ordinal) => isEmbeddedSubtitleIdForStream(current, stream, ordinal)));
+          if (stillAvailable) {
+            return current;
+          }
+
+          const preferred = resolvePreferredSubtitleSelection(
+            file,
+            nextSubtitles,
+            playbackSettings.defaultSubtitleLanguage,
+          );
+          setSubtitleMode(preferred?.mode ?? "off");
+          return preferred?.id ?? "";
+        });
       })
       .catch((error: unknown) => {
         if (!isCancelled) {
@@ -2924,7 +3894,7 @@ function PlayerView({
     return () => {
       isCancelled = true;
     };
-  }, [file.id, file.subtitleStreams, isPlaybackCachePlayable]);
+  }, [file, file.id, file.subtitleStreams, isPlaybackCachePlayable, playbackSettings.defaultSubtitleLanguage]);
 
   useEffect(() => {
     if (!isPlaybackCachePlayable) {
@@ -2933,38 +3903,43 @@ function PlayerView({
 
     let isCancelled = false;
     let retryHandle = 0;
-    let activeSessionId: string | null = null;
 
     async function resolvePlayback(attempt: number) {
       try {
-        const effectiveSubtitleMode = selectedSubtitleId ? subtitleMode : "off";
         const decision = await getPlaybackDecision(file.id, {
-          quality,
-          audioTrackIndex: audioTrack === "auto" ? null : Number(audioTrack),
-          subtitleMode: selectedEmbeddedSubtitle && effectiveSubtitleMode === "web" ? "burn" : effectiveSubtitleMode,
-          subtitleId: selectedSubtitleId || null,
+          audioTrackIndex: requestedAudioTrackIndex,
+          subtitleMode: playbackDecisionSubtitleMode,
+          subtitleId: playbackDecisionSubtitleId,
           hardware: useHardware,
         });
         if (isCancelled) {
           return;
         }
 
+        if (decision.durationSeconds && decision.durationSeconds > 0) {
+          setDuration((current) => Math.max(current, decision.durationSeconds ?? 0));
+        }
+
         sessionIdRef.current = decision.sessionId;
-        activeSessionId = decision.sessionId;
+        if (decision.sessionId) {
+          hlsSessionIdsRef.current.add(decision.sessionId);
+        }
         if (decision.mode === "direct" && decision.streamUrl) {
           setPlaybackMode("direct");
           setPlaybackUrl(decision.streamUrl);
           setPlayerStatus("");
           setPlayerError("");
+          void stopStaleHlsSessions(null);
           return;
         }
 
         if (decision.mode.startsWith("hls") && decision.manifestUrl) {
-          if (decision.isReady || attempt >= 10) {
+          if (decision.isReady) {
             setPlaybackMode("hls");
             setPlaybackUrl(decision.manifestUrl);
             setPlayerStatus("");
             setPlayerError("");
+            void stopStaleHlsSessions(decision.sessionId);
             return;
           }
 
@@ -2981,8 +3956,7 @@ function PlayerView({
       }
     }
 
-    setPlaybackMode(null);
-    setPlaybackUrl(null);
+    rememberPlaybackPosition();
     setPlayerStatus("正在准备播放");
     setPlayerError("");
     void resolvePlayback(0);
@@ -2990,19 +3964,15 @@ function PlayerView({
     return () => {
       isCancelled = true;
       window.clearTimeout(retryHandle);
-      if (activeSessionId) {
-        void stopHlsSession(activeSessionId).catch(() => undefined);
-      }
     };
   }, [
     audioTrack,
     file.id,
     file.subtitleStreams,
     isPlaybackCachePlayable,
-    quality,
-    selectedEmbeddedSubtitle,
-    selectedSubtitleId,
-    subtitleMode,
+    playbackDecisionSubtitleId,
+    playbackDecisionSubtitleMode,
+    requestedAudioTrackIndex,
     useHardware,
   ]);
 
@@ -3013,8 +3983,32 @@ function PlayerView({
     }
 
     let hls: Hls | null = null;
+    suppressProgressSaveRef.current = false;
+    const resumeSeconds = resolveResumeSeconds();
+    if (resumeSeconds > 0) {
+      setCurrentTime(resumeSeconds);
+    }
+
+    const startPlayback = () => {
+      setIsPaused(false);
+      void video.play().catch((error: unknown) => {
+        if (!isAutoplayIgnoredError(error)) {
+          setIsPaused(true);
+          setPlayerError(error instanceof Error ? error.message : String(error));
+        }
+      });
+    };
+
     if (playbackMode === "hls" && Hls.isSupported()) {
-      hls = new Hls({ enableWorker: true });
+      hls = new Hls({
+        enableWorker: true,
+        startPosition: resumeSeconds,
+        startFragPrefetch: true,
+        maxBufferLength: 45,
+        maxMaxBufferLength: 90,
+        backBufferLength: 30,
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
     } else if (
@@ -3025,14 +4019,69 @@ function PlayerView({
       return;
     } else {
       video.src = playbackUrl;
+      startPlayback();
     }
 
     return () => {
+      rememberPlaybackPosition(false);
+      suppressProgressSaveRef.current = true;
       hls?.destroy();
       video.removeAttribute("src");
       video.load();
+      window.setTimeout(() => {
+        suppressProgressSaveRef.current = false;
+      }, 0);
     };
   }, [playbackMode, playbackUrl]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    if (!selectedWebSubtitleUrl) {
+      setSubtitleCues([]);
+      return;
+    }
+
+    const cached = subtitleCueCacheRef.current.get(selectedWebSubtitleUrl);
+    if (cached) {
+      setSubtitleCues(cached);
+      if (cached.length === 0 && canFallbackToBurnedSubtitle) {
+        fallbackToBurnedSubtitle();
+      }
+      return () => controller.abort();
+    }
+
+    setSubtitleCues([]);
+    fetch(selectedWebSubtitleUrl, { credentials: "same-origin", signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`subtitle request failed: ${response.status}`);
+        }
+
+        return response.text();
+      })
+      .then((text) => {
+        if (!controller.signal.aborted) {
+          const cues = parseWebVttCues(text);
+          subtitleCueCacheRef.current.set(selectedWebSubtitleUrl, cues);
+          setSubtitleCues(cues);
+          if (cues.length === 0 && canFallbackToBurnedSubtitle) {
+            fallbackToBurnedSubtitle();
+          }
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setSubtitleCues([]);
+          if (canFallbackToBurnedSubtitle) {
+            fallbackToBurnedSubtitle();
+          }
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [canFallbackToBurnedSubtitle, selectedWebSubtitleUrl]);
 
   useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
@@ -3063,19 +4112,94 @@ function PlayerView({
     return () => window.removeEventListener("keydown", handleKeyDown);
   });
 
+  function readCurrentPlaybackTime(): number {
+    const video = videoRef.current;
+    const hasLoadedSource =
+      !!video &&
+      Boolean(video.currentSrc || video.getAttribute("src")) &&
+      video.readyState > 0;
+    if (
+      video &&
+      hasLoadedSource &&
+      !suppressProgressSaveRef.current &&
+      Number.isFinite(video.currentTime)
+    ) {
+      return Math.max(0, video.currentTime);
+    }
+
+    return Math.max(0, playbackPositionRef.current);
+  }
+
+  function rememberPlaybackPosition(updateState = true) {
+    const nextTime = readCurrentPlaybackTime();
+    playbackPositionRef.current = nextTime;
+    pendingSeekSecondsRef.current = nextTime > 1 ? nextTime : null;
+    if (updateState) {
+      setCurrentTime(nextTime);
+    }
+  }
+
+  function resolveResumeSeconds(): number {
+    const target = Math.max(0, pendingSeekSecondsRef.current ?? playbackPositionRef.current ?? file.positionSeconds);
+    const effectiveDuration = duration || file.durationSeconds;
+    if (target <= 1) {
+      return 0;
+    }
+
+    return effectiveDuration <= 0 || target < effectiveDuration - 8 ? target : 0;
+  }
+
+  function updateBufferedProgress() {
+    const video = videoRef.current;
+    const effectiveDuration = video ? resolvePlaybackDuration(video.duration, duration || file.durationSeconds) : 0;
+    if (!video || effectiveDuration <= 0 || video.buffered.length === 0) {
+      setBufferedUntil((current) => (current === 0 ? current : 0));
+      return;
+    }
+
+    const playbackTime = Number.isFinite(video.currentTime) ? video.currentTime : playbackPositionRef.current;
+    let nextBufferedUntil = 0;
+    for (let index = 0; index < video.buffered.length; index += 1) {
+      const start = video.buffered.start(index);
+      const end = video.buffered.end(index);
+      if (start <= playbackTime + 0.5 && end >= playbackTime) {
+        nextBufferedUntil = Math.max(nextBufferedUntil, end);
+      } else if (end > playbackTime && nextBufferedUntil <= playbackTime) {
+        nextBufferedUntil = Math.max(nextBufferedUntil, end);
+      }
+    }
+
+    setBufferedUntil(Math.min(effectiveDuration, Math.max(0, nextBufferedUntil)));
+  }
+
   function handleLoadedMetadata() {
     const video = videoRef.current;
     if (!video) {
       return;
     }
 
-    const duration = Number.isFinite(video.duration) ? video.duration : file.durationSeconds;
-    setDuration(duration);
-    setIsPaused(video.paused);
-    if (duration <= 0 || file.positionSeconds < duration - 8) {
-      video.currentTime = file.positionSeconds;
-      setCurrentTime(file.positionSeconds);
+    const nextDuration = resolvePlaybackDuration(video.duration, duration || file.durationSeconds);
+    setDuration(nextDuration);
+    setIsPaused(false);
+    const resumeSeconds = resolveResumeSeconds();
+    if (resumeSeconds > 0) {
+      video.currentTime = resumeSeconds;
+      playbackPositionRef.current = resumeSeconds;
+      pendingSeekSecondsRef.current = null;
+      setCurrentTime(resumeSeconds);
+    } else if (pendingSeekSecondsRef.current !== null) {
+      pendingSeekSecondsRef.current = null;
+      playbackPositionRef.current = 0;
+      setCurrentTime(0);
     }
+    updateBufferedProgress();
+
+    void video.play().catch((error: unknown) => {
+      if (!isAutoplayIgnoredError(error)) {
+        setIsPaused(true);
+        setPlayerError(error instanceof Error ? error.message : String(error));
+      }
+    });
   }
 
   function handleTimeUpdate() {
@@ -3084,10 +4208,29 @@ function PlayerView({
       return;
     }
 
-    setCurrentTime(Number.isFinite(video.currentTime) ? video.currentTime : 0);
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-      setDuration(video.duration);
+    const nextCurrentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const pendingSeek = pendingUserSeekRef.current;
+    if (
+      pendingSeek !== null &&
+      performance.now() < seekHoldUntilRef.current &&
+      Math.abs(nextCurrentTime - pendingSeek) > 1.5
+    ) {
+      updateBufferedProgress();
+      return;
     }
+
+    if (pendingSeek !== null && Math.abs(nextCurrentTime - pendingSeek) <= 1.5) {
+      pendingUserSeekRef.current = null;
+      seekHoldUntilRef.current = 0;
+    }
+
+    playbackPositionRef.current = nextCurrentTime;
+    setCurrentTime(nextCurrentTime);
+    const nextDuration = resolvePlaybackDuration(video.duration, duration || file.durationSeconds);
+    if (nextDuration > 0) {
+      setDuration(nextDuration);
+    }
+    updateBufferedProgress();
     void saveProgress(false);
   }
 
@@ -3103,8 +4246,12 @@ function PlayerView({
     }
 
     if (video.paused) {
+      setIsPaused(false);
       void video.play().catch((error: unknown) => {
-        setPlayerError(error instanceof Error ? error.message : String(error));
+        if (!isPlaybackAbortError(error)) {
+          setIsPaused(true);
+          setPlayerError(error instanceof Error ? error.message : String(error));
+        }
       });
     } else {
       video.pause();
@@ -3112,39 +4259,143 @@ function PlayerView({
     resetControlTimer(true);
   }
 
-  function seekRelative(seconds: number) {
+  function applyCurrentFileSeek(nextTime: number) {
     const video = videoRef.current;
     if (!video) {
       return;
     }
 
-    const nextTime = Math.max(0, Math.min(duration || video.duration || 0, video.currentTime + seconds));
     video.currentTime = nextTime;
+    playbackPositionRef.current = nextTime;
+    pendingSeekSecondsRef.current = nextTime > 1 ? nextTime : null;
+    pendingUserSeekRef.current = nextTime;
+    seekHoldUntilRef.current = performance.now() + 3000;
     setCurrentTime(nextTime);
     resetControlTimer(true);
   }
 
-  function handleSeekPercent(value: string) {
+  function seekRelative(seconds: number) {
     const video = videoRef.current;
-    if (!video || duration <= 0) {
+    const effectiveDuration = video ? resolvePlaybackDuration(video.duration, duration || file.durationSeconds) : 0;
+    if (!video || effectiveDuration <= 0) {
       return;
     }
 
-    const nextTime = (Number(value) / 100) * duration;
-    video.currentTime = nextTime;
+    if (isMultipartMovie && timeline.durationSeconds > 0) {
+      const target = resolveMultipartSeekTarget(
+        playlistFiles,
+        currentFileIndex,
+        effectiveDuration,
+        video.currentTime,
+        Math.max(0, Math.min(timeline.durationSeconds, timeline.positionSeconds + seconds)),
+      );
+      void switchPlaylistFile(target.index, target.seconds);
+      return;
+    }
+
+    applyCurrentFileSeek(Math.max(0, Math.min(effectiveDuration, video.currentTime + seconds)));
+  }
+
+  async function handleSeekPercent(value: string) {
+    const video = videoRef.current;
+    const effectiveDuration = video ? resolvePlaybackDuration(video.duration, duration || file.durationSeconds) : 0;
+    if (!video || effectiveDuration <= 0) {
+      return;
+    }
+
+    const numericValue = Number(value);
+    if (isMultipartMovie && timeline.durationSeconds > 0) {
+      const target = resolveMultipartSeekTarget(
+        playlistFiles,
+        currentFileIndex,
+        effectiveDuration,
+        video.currentTime,
+        (numericValue / 100) * timeline.durationSeconds,
+      );
+      await switchPlaylistFile(target.index, target.seconds);
+      return;
+    }
+
+    applyCurrentFileSeek((numericValue / 100) * effectiveDuration);
+  }
+
+  function handleSeeked() {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    const nextTime = Number.isFinite(video.currentTime) ? video.currentTime : playbackPositionRef.current;
+    pendingUserSeekRef.current = null;
+    seekHoldUntilRef.current = 0;
+    playbackPositionRef.current = nextTime;
+    pendingSeekSecondsRef.current = nextTime > 1 ? nextTime : null;
     setCurrentTime(nextTime);
+    updateBufferedProgress();
+  }
+
+  async function switchPlaylistFile(targetIndex: number, startSeconds: number, persistCurrent = true) {
+    if (!playlistFiles[targetIndex]) {
+      return;
+    }
+
+    if (targetIndex === currentFileIndex) {
+      applyCurrentFileSeek(startSeconds);
+      return;
+    }
+
+    if (persistCurrent) {
+      await saveProgress(true);
+    }
+    const targetFile = playlistFiles[targetIndex];
+    playbackPositionRef.current = startSeconds;
+    pendingSeekSecondsRef.current = startSeconds > 1 ? startSeconds : null;
+    pendingUserSeekRef.current = startSeconds;
+    seekHoldUntilRef.current = performance.now() + 3000;
+    setCurrentTime(startSeconds);
+    setDuration(targetFile.durationSeconds);
+    setBufferedUntil(0);
+    setCurrentFileId(targetFile.id);
     resetControlTimer(true);
+  }
+
+  async function handleEnded() {
+    await saveProgress(true);
+    if (!isMultipartMovie || currentFileIndex + 1 >= playlistFiles.length) {
+      return;
+    }
+
+    const video = videoRef.current;
+    const finishedDuration = resolvePlaybackDuration(video?.duration ?? 0, duration || file.durationSeconds);
+    if (finishedDuration > 0) {
+      await updatePlaybackProgress(file.id, finishedDuration, finishedDuration).catch(() => undefined);
+    }
+    await switchPlaylistFile(currentFileIndex + 1, 0, false);
   }
 
   async function handleBack() {
     await saveProgress(true);
-    if (sessionIdRef.current) {
-      await stopHlsSession(sessionIdRef.current).catch(() => undefined);
-    }
+    await stopAllHlsSessions();
     if (cacheStatus?.canCancel) {
       await cancelPlaybackCache(file.id).catch(() => undefined);
     }
     onBack();
+  }
+
+  async function stopAllHlsSessions() {
+    const sessionIds = Array.from(hlsSessionIdsRef.current);
+    hlsSessionIdsRef.current.clear();
+    sessionIdRef.current = null;
+    await Promise.all(sessionIds.map((sessionId) => stopHlsSession(sessionId).catch(() => undefined)));
+  }
+
+  async function stopStaleHlsSessions(activeSessionId: string | null) {
+    const staleSessionIds = Array.from(hlsSessionIdsRef.current)
+      .filter((sessionId) => sessionId !== activeSessionId);
+    for (const sessionId of staleSessionIds) {
+      hlsSessionIdsRef.current.delete(sessionId);
+    }
+    await Promise.all(staleSessionIds.map((sessionId) => stopHlsSession(sessionId).catch(() => undefined)));
   }
 
   async function handleCancelCache() {
@@ -3158,33 +4409,17 @@ function PlayerView({
     }
   }
 
-  async function handleCleanupCache() {
-    const task = await cleanupHlsCache();
-    setCleanupText(task.isRunning ? "缓存清理已提交" : (task.resultText ?? "缓存清理已提交"));
+  function handleSelectSubtitle(subtitleId: string) {
+    rememberPlaybackPosition(false);
+    setSelectedSubtitleId(subtitleId);
+    setSubtitleMode(resolveSubtitlePlaybackMode(subtitleId, file, subtitles));
+    setOpenPlayerMenu(null);
   }
 
-  async function handleLoadDiagnostics() {
-    const nextOpen = !isDiagnosticsOpen;
-    setIsDiagnosticsOpen(nextOpen);
-    if (!nextOpen) {
-      return;
-    }
-
-    setDiagnosticsError("");
-    setDiagnostics(null);
-    try {
-      const effectiveSubtitleMode = selectedSubtitleId ? subtitleMode : "off";
-      const nextDiagnostics = await getPlaybackDiagnostics(file.id, {
-        quality,
-        audioTrackIndex: audioTrack === "auto" ? null : Number(audioTrack),
-        subtitleMode: selectedEmbeddedSubtitle && effectiveSubtitleMode === "web" ? "burn" : effectiveSubtitleMode,
-        subtitleId: selectedSubtitleId || null,
-        hardware: useHardware,
-      });
-      setDiagnostics(nextDiagnostics);
-    } catch (error) {
-      setDiagnosticsError(error instanceof Error ? error.message : String(error));
-    }
+  function fallbackToBurnedSubtitle() {
+    rememberPlaybackPosition(false);
+    setPlayerStatus("字幕转换失败，正在切换为烧录字幕");
+    setSubtitleMode(resolveBurnedSubtitlePlaybackMode(selectedSubtitleId, file));
   }
 
   return (
@@ -3193,20 +4428,26 @@ function PlayerView({
         <video
           autoPlay
           onClick={(event) => event.stopPropagation()}
-          onEnded={() => void saveProgress(true)}
+          onEnded={() => void handleEnded()}
           onLoadedMetadata={handleLoadedMetadata}
           onPause={() => {
             handlePlayStateChange(true);
             void saveProgress(true);
           }}
           onPlay={() => handlePlayStateChange(false)}
+          onProgress={updateBufferedProgress}
+          onSeeked={handleSeeked}
           onTimeUpdate={handleTimeUpdate}
           ref={videoRef}
-        >
-          {subtitleMode === "web" && selectedSubtitle?.webVttUrl ? (
-            <track default kind="subtitles" label={selectedSubtitle.language ?? selectedSubtitle.fileName} src={selectedSubtitle.webVttUrl} />
-          ) : null}
-        </video>
+        />
+
+        {activeSubtitleText ? (
+          <div className="playerSubtitleOverlay">
+            {activeSubtitleText.split("\n").map((line, index) => (
+              <span key={`${index}-${line}`}>{line}</span>
+            ))}
+          </div>
+        ) : null}
 
         <div className={showPlayerControls ? "playerChrome visible" : "playerChrome"}>
           <header className="playerTopbar">
@@ -3220,13 +4461,12 @@ function PlayerView({
           </header>
 
           <div className="playerBottomBar" onClick={(event) => event.stopPropagation()}>
-            {cleanupText ? <div className="playerNotice">{cleanupText}</div> : null}
             <div className="playerTransport">
               <button aria-label="backward" onClick={() => seekRelative(-seekSeconds)} type="button">
                 <SkipBack size={34} />
               </button>
               <button className="playerPlayButton" aria-label={isPaused ? "play" : "pause"} onClick={togglePlayPause} type="button">
-                {isPaused ? <Play size={58} /> : <Pause size={58} />}
+                {isPaused ? <CirclePlay size={62} /> : <CirclePause size={62} />}
               </button>
               <button aria-label="forward" onClick={() => seekRelative(seekSeconds)} type="button">
                 <SkipForward size={34} />
@@ -3234,98 +4474,127 @@ function PlayerView({
             </div>
 
             <div className="playerTimeline">
-              <span>{formatPlaybackTime(currentTime)}</span>
-              <input
-                aria-label="播放进度"
-                max={100}
-                min={0}
-                onChange={(event) => handleSeekPercent(event.target.value)}
-                step={0.1}
-                type="range"
-                value={progressValue}
-              />
-              <span>{duration > 0 ? `-${formatPlaybackTime(Math.max(0, duration - currentTime))}` : "--:--"}</span>
+              <span>{formatPlaybackTime(timeline.positionSeconds)}</span>
+              <div className="playerTimelineTrack">
+                <input
+                  aria-label="播放进度"
+                  max={100}
+                  min={0}
+                  onChange={(event) => void handleSeekPercent(event.target.value)}
+                  onInput={(event) => void handleSeekPercent(event.currentTarget.value)}
+                  step={0.1}
+                  style={{
+                    "--player-progress": `${progressValue}%`,
+                    "--player-buffered": `${bufferedValue}%`,
+                  } as CSSProperties}
+                  type="range"
+                  value={progressValue}
+                />
+                {timelineSegments.length > 1 && (
+                  <div aria-hidden="true" className="playerTimelineSegments">
+                    {timelineSegments.map((segment) => (
+                      <span
+                        className={`playerTimelineSegment${segment.isCurrent ? " current" : ""}`}
+                        key={segment.key}
+                        style={{
+                          left: `${segment.startPercent}%`,
+                          width: `${segment.widthPercent}%`,
+                        }}
+                        title={`${segment.label} ${segment.durationText}`}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+              <span>{timeline.durationSeconds > 0 ? (isMultipartMovie ? formatPlaybackTime(timeline.durationSeconds) : `-${formatPlaybackTime(Math.max(0, timeline.durationSeconds - timeline.positionSeconds))}`) : "--:--"}</span>
             </div>
 
             <div className="playerMenuBar">
-              <label title="清晰度">
-                <SlidersHorizontal size={16} />
-                <select aria-label="quality" onChange={(event) => setQuality(event.target.value)} value={quality}>
-                  <option value="original">原始</option>
-                  <option value="1080p">1080p</option>
-                  <option value="720p">720p</option>
-                  <option value="480p">480p</option>
-                  <option value="360p">360p</option>
-                </select>
-              </label>
-              <label title="音轨">
-                <Music2 size={16} />
-                <select aria-label="audio track" onChange={(event) => setAudioTrack(event.target.value)} value={audioTrack}>
-                  <option value="auto">默认音轨</option>
-                  {file.audioTracks.length > 0 ? (
-                    file.audioTracks.map((track) => (
-                      <option key={track.index} value={String(track.index)}>
-                        {formatAudioTrack(track)}
-                      </option>
-                    ))
-                  ) : (
-                    <>
-                      <option value="0">音轨 1</option>
-                      <option value="1">音轨 2</option>
-                      <option value="2">音轨 3</option>
-                      <option value="3">音轨 4</option>
-                    </>
-                  )}
-                </select>
-              </label>
-              <label title="字幕">
-                <Captions size={16} />
-                <select
-                  aria-label="subtitle"
-                  onChange={(event) => {
-                    setSelectedSubtitleId(event.target.value);
-                    if (event.target.value.startsWith("embedded_")) {
-                      setSubtitleMode("burn");
-                    }
-                  }}
-                  value={selectedSubtitleId}
+              <div className="playerMenuItem">
+                <button
+                  aria-expanded={openPlayerMenu === "audio"}
+                  aria-label="音轨"
+                  className={openPlayerMenu === "audio" ? "playerMenuTrigger active" : "playerMenuTrigger"}
+                  onClick={() => setOpenPlayerMenu((current) => (current === "audio" ? null : "audio"))}
+                  title={`音轨：${selectedAudioTrackLabel}`}
+                  type="button"
                 >
-                  <option value="">关闭字幕</option>
-                  {file.subtitleStreams.length > 0 ? (
-                    <optgroup label="内嵌字幕">
-                      {file.subtitleStreams.map((stream) => (
-                        <option key={stream.index} value={`embedded_${stream.index}`}>
-                          {formatSubtitleStream(stream)}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ) : null}
-                  {subtitles.map((subtitle) => (
-                    <option key={subtitle.id} value={subtitle.id}>
-                      {subtitle.language ?? subtitle.fileName}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label title="字幕方式">
-                <Settings size={16} />
-                <select
-                  aria-label="subtitle mode"
-                  disabled={!selectedSubtitleId}
-                  onChange={(event) => setSubtitleMode(event.target.value)}
-                  value={subtitleMode}
+                  <Music2 size={17} />
+                </button>
+                {openPlayerMenu === "audio" ? (
+                  <div className="playerMenuPopover audioMenu">
+                    {file.audioTracks.length > 0 ? (
+                      file.audioTracks.map((track) => (
+                        <button
+                          className={String(track.index) === audioTrack ? "active" : ""}
+                          key={track.index}
+                          onClick={() => {
+                            setAudioTrack(String(track.index));
+                            setOpenPlayerMenu(null);
+                          }}
+                          type="button"
+                        >
+                          <span className="playerMenuCheck">{String(track.index) === audioTrack ? "✓" : ""}</span>
+                          <span>{formatAudioTrack(track)}</span>
+                        </button>
+                      ))
+                    ) : (
+                      <span className="playerMenuEmpty">无音轨信息</span>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="playerMenuItem">
+                <button
+                  aria-expanded={openPlayerMenu === "subtitle"}
+                  aria-label="字幕"
+                  className={openPlayerMenu === "subtitle" ? "playerMenuTrigger active" : "playerMenuTrigger"}
+                  onClick={() => setOpenPlayerMenu((current) => (current === "subtitle" ? null : "subtitle"))}
+                  title={`字幕：${selectedSubtitleLabel}`}
+                  type="button"
                 >
-                  <option value="off">关闭</option>
-                  <option disabled={!!selectedEmbeddedSubtitle} value="web">外挂</option>
-                  <option value="burn">烧录</option>
-                </select>
-              </label>
-              <button aria-label="cleanup cache" onClick={() => void handleCleanupCache()} title="清理缓存" type="button">
-                <Trash2 size={16} />
-              </button>
-              <button aria-label="playback diagnostics" onClick={() => void handleLoadDiagnostics()} title="播放诊断" type="button">
-                <Bug size={16} />
-              </button>
+                  <Captions size={17} />
+                </button>
+                {openPlayerMenu === "subtitle" ? (
+                  <div className="playerMenuPopover subtitleMenu">
+                    <button
+                      className={!selectedSubtitleId ? "active" : ""}
+                      onClick={() => handleSelectSubtitle("")}
+                      type="button"
+                    >
+                      <span className="playerMenuCheck">{!selectedSubtitleId ? "✓" : ""}</span>
+                      <span>关闭字幕</span>
+                    </button>
+                    {file.subtitleStreams.map((stream, ordinal) => {
+                      const subtitleId = embeddedSubtitleId(stream, ordinal);
+                      const isSelected = isEmbeddedSubtitleIdForStream(selectedSubtitleId, stream, ordinal);
+                      return (
+                        <button
+                          className={isSelected ? "active" : ""}
+                          key={subtitleId}
+                          onClick={() => handleSelectSubtitle(subtitleId)}
+                          type="button"
+                        >
+                          <span className="playerMenuCheck">{isSelected ? "✓" : ""}</span>
+                          <span>{formatSubtitleStream(stream)}</span>
+                        </button>
+                      );
+                    })}
+                    {subtitles.map((subtitle) => (
+                      <button
+                        className={selectedSubtitleId === subtitle.id ? "active" : ""}
+                        key={subtitle.id}
+                        onClick={() => handleSelectSubtitle(subtitle.id)}
+                        type="button"
+                      >
+                        <span className="playerMenuCheck">{selectedSubtitleId === subtitle.id ? "✓" : ""}</span>
+                        <span>{formatExternalSubtitleTrack(subtitle)}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>
@@ -3341,41 +4610,6 @@ function PlayerView({
           </div>
         ) : null}
         {playerError ? <div className="playerOverlay error">{playerError}</div> : null}
-
-        {isDiagnosticsOpen ? (
-          <section className="playbackDiagnostics" aria-label="playback diagnostics" onClick={(event) => event.stopPropagation()}>
-            {diagnosticsError ? <p className="diagnosticsError">{diagnosticsError}</p> : null}
-            {diagnostics ? (
-              <>
-                <div className="diagnosticsSummary">
-                  <strong>{diagnostics.effectiveMode}</strong>
-                  <span>{diagnostics.reason}</span>
-                </div>
-                <div className="diagnosticsFlags">
-                  <span>{diagnostics.sourceKind}</span>
-                  <span>{diagnostics.usesWebDavRangeProxy ? "Range 代理" : diagnostics.usesHls ? "HLS" : "直出"}</span>
-                  <span>{diagnostics.requiresFullCache ? "完整缓存" : "无需完整缓存"}</span>
-                  {diagnostics.usesTranscode ? <span>转码</span> : null}
-                  {diagnostics.burnsSubtitle ? <span>字幕烧录</span> : null}
-                  {diagnostics.capabilities?.preferredHardwareEncoder ? <span>{diagnostics.capabilities.preferredHardwareEncoder}</span> : null}
-                </div>
-                <div className="diagnosticsSteps">
-                  {diagnostics.steps.map((step) => (
-                    <article className={`diagnosticStep ${step.status}`} key={step.key}>
-                      <span>{step.label}</span>
-                      <p>{step.detail}</p>
-                    </article>
-                  ))}
-                </div>
-                {diagnostics.ffmpegCommandPreview ? (
-                  <pre className="diagnosticsCommand">{diagnostics.ffmpegCommandPreview}</pre>
-                ) : null}
-              </>
-            ) : diagnosticsError ? null : (
-              <p className="diagnosticsLoading">正在生成诊断</p>
-            )}
-          </section>
-        ) : null}
       </section>
     </main>
   );
@@ -3393,6 +4627,90 @@ function playerSubTitle(file: VideoFileSummary): string {
   return [file.container, file.videoCodec, file.audioCodec].filter(Boolean).join(" · ");
 }
 
+function resolvePlaybackDuration(videoDuration: number, fileDuration: number): number {
+  const normalizedVideoDuration = Number.isFinite(videoDuration) && videoDuration > 0 ? videoDuration : 0;
+  const normalizedFileDuration = Number.isFinite(fileDuration) && fileDuration > 0 ? fileDuration : 0;
+  return Math.max(normalizedVideoDuration, normalizedFileDuration);
+}
+
+function parseWebVttCues(text: string): WebSubtitleCue[] {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const blocks = normalized.split(/\n{2,}/);
+  const cues: WebSubtitleCue[] = [];
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      continue;
+    }
+
+    const firstLine = lines[0].replace(/^\uFEFF/, "");
+    if (
+      firstLine === "WEBVTT" ||
+      firstLine.startsWith("NOTE") ||
+      firstLine.startsWith("STYLE") ||
+      firstLine.startsWith("REGION")
+    ) {
+      continue;
+    }
+
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0) {
+      continue;
+    }
+
+    const [startToken, endTokenWithSettings] = lines[timingIndex].split("-->").map((part) => part.trim());
+    const endToken = endTokenWithSettings?.split(/\s+/)[0] ?? "";
+    const start = parseWebVttTimestamp(startToken);
+    const end = parseWebVttTimestamp(endToken);
+    if (start === null || end === null || end <= start) {
+      continue;
+    }
+
+    const cueText = lines
+      .slice(timingIndex + 1)
+      .map(cleanWebVttCueLine)
+      .filter(Boolean)
+      .join("\n");
+    if (cueText) {
+      cues.push({ start, end, text: cueText });
+    }
+  }
+
+  return cues;
+}
+
+function parseWebVttTimestamp(value: string): number | null {
+  const normalized = value.replace(",", ".");
+  const parts = normalized.split(":");
+  if (parts.length < 2 || parts.length > 3) {
+    return null;
+  }
+
+  const seconds = Number(parts.pop());
+  const minutes = Number(parts.pop());
+  const hours = parts.length > 0 ? Number(parts.pop()) : 0;
+  if (![hours, minutes, seconds].every(Number.isFinite)) {
+    return null;
+  }
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function cleanWebVttCueLine(value: string): string {
+  return value
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\{\\[^}]+\}/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
 function formatPlaybackTime(seconds: number): string {
   const safeSeconds = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
   const hours = Math.floor(safeSeconds / 3600);
@@ -3403,4 +4721,26 @@ function formatPlaybackTime(seconds: number): string {
   }
 
   return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+function isPlaybackAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return true;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return /operation was aborted|play\(\) request was interrupted/i.test(message);
+}
+
+function isAutoplayIgnoredError(error: unknown): boolean {
+  if (isPlaybackAbortError(error)) {
+    return true;
+  }
+
+  if (error instanceof DOMException && error.name === "NotAllowedError") {
+    return true;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return /not allowed|user didn't interact|user gesture/i.test(message);
 }

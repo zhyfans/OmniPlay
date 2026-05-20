@@ -456,6 +456,64 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task ScanAllAsync_BdmvVolumesUnderSameMovieFolder_MergesIntoOneMovie()
+    {
+        CreateMediaFile(Path.Combine("movies", "SplitMovie", "VOL_1", "BDMV", "STREAM", "00000.m2ts"), 10_000);
+        CreateMediaFile(Path.Combine("movies", "SplitMovie", "VOL_2", "BDMV", "STREAM", "00000.m2ts"), 9_500);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM movie"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT movieId) FROM videoFile WHERE mediaType = 'movie'"));
+    }
+
+    [Fact]
+    public async Task ScanAllAsync_BdmvPartFoldersUnderSameMovieFolder_MergesIntoOneMovie()
+    {
+        CreateMediaFile(Path.Combine(
+            "movies",
+            "Das Boot 1981 Original Uncut Version Part I 1080i GER Blu-ray Remux DTS-HD MA 5.1-PTHome",
+            "BDMV",
+            "STREAM",
+            "00000.m2ts"), 10_000);
+        CreateMediaFile(Path.Combine(
+            "movies",
+            "Das Boot 1981 Original Uncut Version Part II 1080i GER Blu-ray Remux DTS-HD MA 5.1-PTHome",
+            "BDMV",
+            "STREAM",
+            "00000.m2ts"), 9_500);
+
+        await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        var summary = await scanner.ScanAllAsync();
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(2, summary.NewVideoFileCount);
+
+        using var connection = database.OpenConnection();
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM movie"));
+        Assert.Equal(1, await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT movieId) FROM videoFile WHERE mediaType = 'movie'"));
+    }
+
+    [Fact]
     public async Task ScanAllAsync_ImportsWebDavDirectoryIntoLibrary()
     {
         using var httpClient = new HttpClient(new FakeWebDavHttpMessageHandler())

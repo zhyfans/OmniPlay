@@ -92,6 +92,54 @@ public sealed class LibraryMetadataEnricherTests : IDisposable
     }
 
     [Fact]
+    public async Task EnrichMissingMetadataAsync_MergesMovieRowsWithSameTmdbId()
+    {
+        CreateMediaFile("movies/SplitMovie/VOL_1/BDMV/STREAM/00000.m2ts", 128);
+        CreateMediaFile("movies/SplitMovie/VOL_2/BDMV/STREAM/00000.m2ts", 128);
+
+        var sourceId = await mediaSourceRepository.AddAsync(new MediaSource
+        {
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = libraryRootPath
+        });
+
+        using (var connection = database.OpenConnection())
+        {
+            await connection.ExecuteAsync(
+                """
+                INSERT INTO movie (id, title, releaseDate, overview, posterPath, voteAverage, isLocked)
+                VALUES (-701, 'Inception', '2010', NULL, NULL, NULL, 0),
+                       (-702, 'Inception', '2010', NULL, NULL, NULL, 0);
+
+                INSERT INTO videoFile (id, sourceId, relativePath, fileName, mediaType, movieId, episodeId, playProgress, duration)
+                VALUES ('volume-1', @SourceId, 'movies/SplitMovie/VOL_1/BDMV/STREAM/00000.m2ts', '00000.m2ts', 'movie', -701, NULL, 0, 0),
+                       ('volume-2', @SourceId, 'movies/SplitMovie/VOL_2/BDMV/STREAM/00000.m2ts', '00000.m2ts', 'movie', -702, NULL, 0, 0);
+                """,
+                new { SourceId = sourceId });
+        }
+
+        using var httpClient = new HttpClient(new FakeTmdbHttpMessageHandler())
+        {
+            Timeout = TimeSpan.FromSeconds(5)
+        };
+        var settingsService = new JsonSettingsService(storagePaths);
+        var client = new TmdbMetadataClient(httpClient, storagePaths, settingsService);
+        var enricher = new LibraryMetadataEnricher(database, client);
+
+        await enricher.EnrichMissingMetadataAsync();
+
+        using var verification = database.OpenConnection();
+        Assert.Equal(1, await verification.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM movie WHERE tmdbId = 27205"));
+        Assert.Equal(1, await verification.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT movieId) FROM videoFile WHERE mediaType = 'movie'"));
+        Assert.Equal(2, await verification.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM videoFile WHERE mediaType = 'movie'"));
+
+        var homeMovie = Assert.Single(await new MovieRepository(database).GetAllAsync());
+        Assert.Equal("Inception", homeMovie.Title);
+    }
+
+    [Fact]
     public async Task EnrichMissingMetadataAsync_UpdatesTvShowMetadataAndDownloadsPoster()
     {
         CreateMediaFile("shows/Dark/Dark.S01E01.mkv", 128);

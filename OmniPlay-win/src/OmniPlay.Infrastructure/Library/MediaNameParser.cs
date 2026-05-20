@@ -454,12 +454,96 @@ public static partial class MediaNameParser
                Regex.IsMatch(fileName, @"(disc|disk|dvd|cd|vol|volume)[-_ ]?\d{0,2}");
     }
 
+    public static int? MoviePartSortIndex(string raw)
+    {
+        var tokens = Regex
+            .Split(raw, @"[\\/\s._\-\[\]\(\)\{\}【】（）,:：]+")
+            .Where(static token => !string.IsNullOrWhiteSpace(token))
+            .ToArray();
+        for (var index = 0; index < tokens.Length; index++)
+        {
+            var rawToken = tokens[index];
+            if (TryParseChineseMoviePartToken(rawToken, out var chinesePart))
+            {
+                return chinesePart;
+            }
+
+            var token = rawToken.ToLowerInvariant();
+            foreach (var prefix in MoviePartPrefixes)
+            {
+                if (string.Equals(token, prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (index + 1 < tokens.Length && TryParseMoviePartToken(tokens[index + 1], out var separatedPart))
+                    {
+                        return separatedPart;
+                    }
+                }
+                else if (token.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                         TryParseMoviePartToken(token[prefix.Length..], out var joinedPart))
+                {
+                    return joinedPart;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public static string? MultipartMovieGroupingTitle(string rawPath, string fallbackTitle)
+    {
+        if (MoviePartSortIndex(rawPath) is null)
+        {
+            return null;
+        }
+
+        var normalizedPath = rawPath.Replace('\\', '/');
+        var components = normalizedPath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+        var candidate = components
+            .AsEnumerable()
+            .Reverse()
+            .FirstOrDefault(component => MoviePartSortIndex(component) is not null);
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            candidate = Path.GetFileNameWithoutExtension(normalizedPath);
+        }
+
+        candidate = RemoveMoviePartMarker(Path.GetFileNameWithoutExtension(candidate));
+        var metadata = ExtractSearchMetadata(string.IsNullOrWhiteSpace(candidate) ? fallbackTitle : candidate);
+        var title = UsableDisplayTitle(metadata.ChineseTitle)
+                    ?? UsableDisplayTitle(metadata.ForeignTitle)
+                    ?? UsableDisplayTitle(metadata.FullCleanTitle)
+                    ?? UsableDisplayTitle(RemoveMoviePartMarker(fallbackTitle));
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return null;
+        }
+
+        var year = NonEmpty(metadata.Year) ?? ChooseReleaseYear(rawPath);
+        return string.IsNullOrWhiteSpace(year)
+            ? title
+            : $"{title} {year}";
+    }
+
     public static (int Season, int Episode, int Part, string FileName) EpisodeSortKey(string fileName, int fallbackIndex)
     {
         var parsed = ParseEpisodeInfo(fileName, fallbackIndex);
         var seasonOrder = parsed.Season == 0 ? int.MaxValue : parsed.Season;
         return (seasonOrder, parsed.Episode, parsed.PartNumber ?? 0, fileName);
     }
+
+    private static readonly string[] MoviePartPrefixes =
+    [
+        "volume",
+        "part",
+        "disc",
+        "disk",
+        "dvd",
+        "vol",
+        "pt",
+        "cd"
+    ];
 
     private static readonly string[] CleanupPatterns =
     [
@@ -491,6 +575,86 @@ public static partial class MediaNameParser
         @"\b(anniversary|edition)\b",
         @"(纪念版|花絮|特典|番外|幕后花絮|幕后特辑)"
     ];
+
+    private static string RemoveMoviePartMarker(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return string.Empty;
+        }
+
+        var normalized = Regex.Replace(input, @"[._]+", " ");
+        normalized = Regex.Replace(
+            normalized,
+            @"(?i)(?:^|[\s\-_()\[\]【】])(?:part|pt|volume|vol|disc|disk|dvd|cd)[\s._-]*(?:\d{1,2}|[ivxlcdm]{1,6}|上半?|上篇|前篇|下半?|下篇|后篇|後篇)(?=$|[\s\-_()\[\]【】])",
+            " ");
+        normalized = Regex.Replace(
+            normalized,
+            @"(?i)(?:^|[\s\-_()\[\]【】])(?:part|pt|volume|vol|disc|disk|dvd|cd)[\s._-]+(?=$|[\s\-_()\[\]【】])",
+            " ");
+        return Regex.Replace(normalized, @"\s+", " ").Trim();
+    }
+
+    private static bool TryParseMoviePartToken(string token, out int partIndex)
+    {
+        token = token.Trim();
+        if (int.TryParse(token, out partIndex) && partIndex > 0)
+        {
+            return true;
+        }
+
+        if (TryParseChineseMoviePartToken(token, out partIndex))
+        {
+            return true;
+        }
+
+        return TryParseRomanNumber(token, out partIndex);
+    }
+
+    private static bool TryParseChineseMoviePartToken(string token, out int partIndex)
+    {
+        partIndex = token switch
+        {
+            "上" or "上半" or "上篇" or "前篇" => 1,
+            "下" or "下半" or "下篇" or "后篇" or "後篇" => 2,
+            _ => 0
+        };
+        return partIndex > 0;
+    }
+
+    private static bool TryParseRomanNumber(string token, out int value)
+    {
+        value = 0;
+        token = token.Trim().ToUpperInvariant();
+        if (token.Length == 0 || token.Any(static ch => ch is not ('I' or 'V' or 'X' or 'L' or 'C' or 'D' or 'M')))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < token.Length; index++)
+        {
+            var current = RomanDigitValue(token[index]);
+            var next = index + 1 < token.Length ? RomanDigitValue(token[index + 1]) : 0;
+            value += current < next ? -current : current;
+        }
+
+        return value > 0;
+    }
+
+    private static int RomanDigitValue(char ch)
+    {
+        return ch switch
+        {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => 0
+        };
+    }
 
     private static string? ExtractChineseTitle(IReadOnlyList<string> tokens)
     {

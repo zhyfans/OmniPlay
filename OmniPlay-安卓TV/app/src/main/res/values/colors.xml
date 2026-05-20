@@ -1,0 +1,6 @@
+<resources>
+    <color name="omniplay_background">#0B1016</color>
+    <color name="omniplay_surface">#151E27</color>
+    <color name="omniplay_focus">#2DD4BF</color>
+    <color name="omniplay_text">#F7FAFC</color>
+</resources>

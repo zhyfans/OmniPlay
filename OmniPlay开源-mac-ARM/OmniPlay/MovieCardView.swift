@@ -116,24 +116,18 @@ struct MovieCardView: View {
                     .buttonStyle(.plain)
                 }
                 
-                if let progress = continueWatchingProgressSnapshot {
-                    VStack(alignment: .leading, spacing: 4) {
-                        GeometryReader { geo in
-                            ZStack(alignment: .leading) {
-                                Capsule()
-                                    .fill(theme.surface.opacity(0.75))
-                                    .frame(height: 4)
-                                Capsule()
-                                    .fill(theme.accent)
-                                    .frame(width: max(4, geo.size.width * progress.ratio), height: 4)
-                            }
+                if let progressRatio = continueWatchingProgressRatio {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(theme.surface.opacity(0.75))
+                                .frame(height: 4)
+                            Capsule()
+                                .fill(theme.accent)
+                                .frame(width: max(4, geo.size.width * progressRatio), height: 4)
                         }
-                        .frame(height: 4)
-                        
-                        Text("\(progress.current) / \(progress.total)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundColor(theme.textSecondary)
                     }
+                    .frame(height: 4)
                 }
             }
         }
@@ -198,7 +192,7 @@ struct MovieCardView: View {
         }
     }
 
-    private var continueWatchingProgressSnapshot: (ratio: Double, current: String, total: String)? {
+    private var continueWatchingProgressRatio: Double? {
         guard isContinueWatchingContext else { return nil }
         let sortedFiles = movieFiles.enumerated().sorted {
             MediaNameParser.episodeSortKey(for: $0.element.fileName, fallbackIndex: $0.offset) <
@@ -216,8 +210,7 @@ struct MovieCardView: View {
         }
         let duration = targetFile.duration
         let progress = min(max(targetFile.playProgress, 0), duration)
-        let ratio = min(max(progress / duration, 0), 1)
-        return (ratio, formatTime(progress), formatTime(duration))
+        return min(max(progress / duration, 0), 1)
     }
     
     private func refreshCardState() {
@@ -302,12 +295,4 @@ struct MovieCardView: View {
         }
     }
 
-    private func formatTime(_ time: Double) -> String {
-        guard time.isFinite, time >= 0 else { return "00:00" }
-        let t = Int(time.rounded(.down))
-        if t / 3600 > 0 {
-            return String(format: "%02d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
-        }
-        return String(format: "%02d:%02d", (t % 3600) / 60, t % 60)
-    }
 }

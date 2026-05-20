@@ -45,14 +45,14 @@ namespace OmniPlay.Infrastructure.Data;
                        videoFile.customEpisodeYear,
                        videoFile.customEpisodeSubtitle,
                        videoFile.customEpisodeThumbnailPath,
-                       ROW_NUMBER() OVER (ORDER BY videoFile.fileName COLLATE NOCASE ASC) - 1 AS SortIndex
+                       ROW_NUMBER() OVER (ORDER BY videoFile.relativePath COLLATE NOCASE ASC, videoFile.fileName COLLATE NOCASE ASC) - 1 AS SortIndex
                 FROM videoFile
                 JOIN mediaSource ON mediaSource.id = videoFile.sourceId
                                 AND mediaSource.isEnabled = 1
                                 AND mediaSource.removedAt IS NULL
                 LEFT JOIN movie ON movie.id = videoFile.movieId
                 WHERE videoFile.movieId = @MovieId
-                ORDER BY videoFile.fileName COLLATE NOCASE ASC
+                ORDER BY videoFile.relativePath COLLATE NOCASE ASC, videoFile.fileName COLLATE NOCASE ASC
                 """,
                 new { MovieId = movieId },
                 cancellationToken: cancellationToken));

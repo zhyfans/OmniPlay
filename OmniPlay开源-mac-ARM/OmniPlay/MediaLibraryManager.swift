@@ -511,6 +511,124 @@ enum MediaNameParser {
             String(format: "%02d|%@|%06d|%@", parsed.sortBucket, parsed.variantSortKey, segmentOrder, fileName.lowercased())
         )
     }
+
+    nonisolated static func playbackSortPrecedes(
+        lhsRelativePath: String,
+        lhsFileName: String,
+        lhsFallbackIndex: Int,
+        rhsRelativePath: String,
+        rhsFileName: String,
+        rhsFallbackIndex: Int
+    ) -> Bool {
+        let lhsParsed = parseEpisodeInfo(from: lhsFileName, fallbackIndex: lhsFallbackIndex)
+        let rhsParsed = parseEpisodeInfo(from: rhsFileName, fallbackIndex: rhsFallbackIndex)
+        if lhsParsed.isTVShow || rhsParsed.isTVShow {
+            let lhsEpisodeKey = episodeSortKey(for: lhsFileName, fallbackIndex: lhsFallbackIndex)
+            let rhsEpisodeKey = episodeSortKey(for: rhsFileName, fallbackIndex: rhsFallbackIndex)
+            if lhsEpisodeKey != rhsEpisodeKey {
+                return lhsEpisodeKey < rhsEpisodeKey
+            }
+        }
+
+        let lhsPartIndex = moviePartSortIndex(in: "\(lhsRelativePath)/\(lhsFileName)") ?? Int.max
+        let rhsPartIndex = moviePartSortIndex(in: "\(rhsRelativePath)/\(rhsFileName)") ?? Int.max
+        if lhsPartIndex != rhsPartIndex {
+            return lhsPartIndex < rhsPartIndex
+        }
+
+        let lhsPath = lhsRelativePath.isEmpty ? lhsFileName : lhsRelativePath
+        let rhsPath = rhsRelativePath.isEmpty ? rhsFileName : rhsRelativePath
+        let pathCompare = lhsPath.localizedStandardCompare(rhsPath)
+        if pathCompare != .orderedSame {
+            return pathCompare == .orderedAscending
+        }
+
+        let nameCompare = lhsFileName.localizedStandardCompare(rhsFileName)
+        if nameCompare != .orderedSame {
+            return nameCompare == .orderedAscending
+        }
+
+        return lhsFallbackIndex < rhsFallbackIndex
+    }
+
+    nonisolated private static func moviePartSortIndex(in raw: String) -> Int? {
+        let tokens = raw
+            .replacingOccurrences(of: #"[\\/\s._\-\[\]\(\)\{\}【】（）,:：]+"#, with: " ", options: .regularExpression)
+            .split(separator: " ")
+            .map(String.init)
+        let prefixes = ["volume", "part", "disc", "disk", "dvd", "vol", "pt", "cd"]
+
+        for (index, rawToken) in tokens.enumerated() {
+            if let chinesePart = chineseMoviePartIndex(rawToken) {
+                return chinesePart
+            }
+
+            let token = rawToken.lowercased()
+            for prefix in prefixes {
+                if token == prefix {
+                    if index + 1 < tokens.count,
+                       let separatedPart = parseMoviePartToken(tokens[index + 1]) {
+                        return separatedPart
+                    }
+                } else if token.hasPrefix(prefix),
+                          let joinedPart = parseMoviePartToken(String(token.dropFirst(prefix.count))) {
+                    return joinedPart
+                }
+            }
+        }
+
+        return nil
+    }
+
+    nonisolated private static func parseMoviePartToken(_ token: String?) -> Int? {
+        guard let token else { return nil }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let numeric = Int(trimmed), numeric > 0 {
+            return numeric
+        }
+        if let chinesePart = chineseMoviePartIndex(trimmed) {
+            return chinesePart
+        }
+        return romanNumberValue(trimmed)
+    }
+
+    nonisolated private static func chineseMoviePartIndex(_ token: String) -> Int? {
+        switch token {
+        case "上", "上半", "上篇", "前篇":
+            return 1
+        case "下", "下半", "下篇", "后篇", "後篇":
+            return 2
+        default:
+            return nil
+        }
+    }
+
+    nonisolated private static func romanNumberValue(_ token: String) -> Int? {
+        let characters = Array(token.trimmingCharacters(in: .whitespacesAndNewlines).uppercased())
+        guard !characters.isEmpty else { return nil }
+
+        func value(for character: Character) -> Int? {
+            switch character {
+            case "I": return 1
+            case "V": return 5
+            case "X": return 10
+            case "L": return 50
+            case "C": return 100
+            case "D": return 500
+            case "M": return 1000
+            default: return nil
+            }
+        }
+
+        var total = 0
+        for index in characters.indices {
+            guard let current = value(for: characters[index]) else { return nil }
+            let next = index + 1 < characters.count ? value(for: characters[index + 1]) ?? 0 : 0
+            total += current < next ? -current : current
+        }
+        return total > 0 ? total : nil
+    }
     
     nonisolated private static func extractChineseTitle(from tokens: [String]) -> String? {
         let genericChineseTokens: Set<String> = [

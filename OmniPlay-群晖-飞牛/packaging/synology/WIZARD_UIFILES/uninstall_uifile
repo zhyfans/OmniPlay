@@ -1,0 +1,23 @@
+[
+  {
+    "step_title": "卸载设置",
+    "items": [
+      {
+        "type": "singleselect",
+        "desc": "请选择卸载 OmniPlay 时如何处理本机数据。",
+        "subitems": [
+          {
+            "key": "keep_data",
+            "desc": "保留数据：保留设置、媒体库数据库、海报缓存和日志，重新安装后可继续使用。",
+            "defaultValue": true
+          },
+          {
+            "key": "clear_data",
+            "desc": "清除数据：删除设置、媒体库数据库、海报缓存和日志。",
+            "defaultValue": false
+          }
+        ]
+      }
+    ]
+  }
+]

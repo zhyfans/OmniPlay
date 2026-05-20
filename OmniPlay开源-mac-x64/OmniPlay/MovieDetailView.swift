@@ -49,6 +49,22 @@ struct MovieDetailView: View {
     var mainFile: VideoFile? {
         videoFiles.first(where: { $0.id == currentVideoFileId }) ?? videoFiles.first
     }
+
+    private var isMultipartMovie: Bool {
+        !isTVShow && videoFiles.count > 1
+    }
+
+    private var multipartMovieTimeline: (progress: Double, duration: Double) {
+        var progress = 0.0
+        var duration = 0.0
+        for file in videoFiles {
+            guard file.duration > 0 else { continue }
+            duration += file.duration
+            let watched = file.playProgress / file.duration >= 0.95
+            progress += watched ? file.duration : min(max(file.playProgress, 0), file.duration)
+        }
+        return (progress, duration)
+    }
     
     var allEpisodesForSelectedSeason: [EpisodeItem] {
         allEpisodes
@@ -116,8 +132,9 @@ struct MovieDetailView: View {
                             
                             // 3. 播放控制条
                             if let file = mainFile {
-                                let mainPlayProgress = file.playProgress
-                                let mainVideoDuration = file.duration
+                                let timeline = isMultipartMovie ? multipartMovieTimeline : (progress: file.playProgress, duration: file.duration)
+                                let mainPlayProgress = timeline.progress
+                                let mainVideoDuration = timeline.duration
                                 let isWatched = mainVideoDuration > 0 && (mainPlayProgress / mainVideoDuration) >= 0.95
                                 let currentBtnLabel = getPlayButtonLabel(fileId: file.id, progress: mainPlayProgress)
                                 
@@ -465,8 +482,14 @@ struct MovieDetailView: View {
                 if Task.isCancelled { return }
                 let files = sourcePairs.map(\.0)
                 let sortedFiles = files.enumerated().sorted {
-                    MediaNameParser.episodeSortKey(for: $0.element.fileName, fallbackIndex: $0.offset) <
-                        MediaNameParser.episodeSortKey(for: $1.element.fileName, fallbackIndex: $1.offset)
+                    MediaNameParser.playbackSortPrecedes(
+                        lhsRelativePath: $0.element.relativePath,
+                        lhsFileName: $0.element.fileName,
+                        lhsFallbackIndex: $0.offset,
+                        rhsRelativePath: $1.element.relativePath,
+                        rhsFileName: $1.element.fileName,
+                        rhsFallbackIndex: $1.offset
+                    )
                 }.map(\.element)
                 var episodes: [EpisodeItem] = []
                 var eligibleEpisodeIDs = Set<String>()

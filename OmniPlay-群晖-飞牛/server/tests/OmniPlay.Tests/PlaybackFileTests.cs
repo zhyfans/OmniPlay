@@ -294,6 +294,49 @@ public sealed class PlaybackFileTests : IDisposable
             handler.LastRequest?.Headers.Authorization?.Parameter);
     }
 
+    [Fact]
+    public async Task WebDavRangeStreamServicePassesThroughOpenEndedRange()
+    {
+        var paths = new StoragePaths(Path.Combine(root, "app-open-range"));
+        var database = new SqliteDatabase(paths);
+        database.EnsureInitialized();
+        var source = await new MediaSourceRepository(database).AddWebDavAsync(
+            "远程媒体",
+            "https://example.com/dav",
+            "user",
+            "secret");
+        InsertVideoFile(
+            database,
+            source.Id,
+            "Movies/Sample 2026.mp4",
+            "Sample 2026.mp4",
+            fileSizeBytes: 20,
+            id: "vf-webdav-open-range");
+        var handler = new StubHttpMessageHandler(request =>
+        {
+            Assert.Equal("bytes=0-", request.Headers.Range?.ToString());
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent([
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                    10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+                ])
+            };
+            response.Content.Headers.ContentRange = new ContentRangeHeaderValue(0, 19, 20);
+            return response;
+        });
+        var service = new WebDavRangeStreamService(database, paths, new HttpClient(handler));
+
+        var result = await service.OpenReadAsync("vf-webdav-open-range", "bytes=0-");
+
+        Assert.NotNull(result);
+        await using var streamResult = result!;
+        Assert.Equal(206, streamResult.StatusCode);
+        Assert.Equal("bytes 0-19/20", streamResult.ContentRange);
+        Assert.Equal(20, streamResult.ContentLength);
+        Assert.Equal(1, handler.RequestCount);
+    }
+
     private static async Task<PlaybackCacheStatus> WaitForCacheStatusAsync(
         WebDavPlaybackCacheService service,
         string videoFileId,

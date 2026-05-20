@@ -95,6 +95,7 @@ public sealed class SqliteDatabase
         EnsureColumn(connection, "movie", "productionCountryCodes", "TEXT NULL");
         EnsureColumn(connection, "movie", "originalLanguage", "TEXT NULL");
         EnsureColumn(connection, "movie", "metadataLanguage", "TEXT NULL");
+        EnsureColumn(connection, "movie", "tmdbId", "INTEGER NULL");
 
         EnsureColumn(connection, "tvShow", "posterPath", "TEXT NULL");
         EnsureColumn(connection, "tvShow", "firstAirDate", "TEXT NULL");

@@ -55,6 +55,37 @@ public sealed class NetworkShareDiscoveryServiceTests
     }
 
     [Fact]
+    public async Task DiscoverAsync_DetectsProtectedWebDavOnKnownPort()
+    {
+        var endpoints = new[] { new Uri("http://nas.local:5005") };
+        var service = new NetworkShareDiscoveryService(
+            new HttpClient(new DelegateHandler(request =>
+            {
+                Assert.Equal("PROPFIND", request.Method.Method);
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            })),
+            _ => Task.FromResult<IReadOnlyList<Uri>>(endpoints));
+
+        var sources = await service.DiscoverAsync();
+
+        Assert.Contains(sources, source =>
+            source.ProtocolKind == MediaSourceProtocol.WebDav &&
+            string.Equals(source.BaseUrl, "http://nas.local:5005", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ResolveSmbDisplayName_ReturnsShareNameForUncShareRoot()
+    {
+        var method = typeof(NetworkShareDiscoveryService).GetMethod(
+            "ResolveSmbDisplayName",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+
+        var name = Assert.IsType<string>(method?.Invoke(null, [@"\\192.168.0.102\Movies"]));
+
+        Assert.Equal("Movies", name);
+    }
+
+    [Fact]
     public async Task DiscoverAsync_DetectsMediaServersAndIgnoresGenericHttpPrinter()
     {
         var endpoints = new[]
@@ -117,6 +148,34 @@ public sealed class NetworkShareDiscoveryServiceTests
             string.Equals(source.BaseUrl, "http://jellyfin.local:8096", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(sources, source =>
             source.BaseUrl.Contains("printer.local", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task DiscoverAsync_DetectsEmbyCompatibleServerFromPublicInfoWithoutProductName()
+    {
+        var endpoints = new[] { new Uri("http://emby.local:8096") };
+        var service = new NetworkShareDiscoveryService(
+            new HttpClient(new DelegateHandler(request =>
+            {
+                if (request.RequestUri?.Host == "emby.local" &&
+                    request.RequestUri.AbsolutePath == "/System/Info/Public")
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("""{"ServerName":"Living Room","Id":"server-id","Version":"4.8.0.0"}""")
+                    };
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            })),
+            _ => Task.FromResult<IReadOnlyList<Uri>>(endpoints));
+
+        var sources = await service.DiscoverAsync();
+
+        Assert.Contains(sources, source =>
+            source.ProtocolKind == MediaSourceProtocol.Emby &&
+            string.Equals(source.Name, "Emby", StringComparison.Ordinal) &&
+            string.Equals(source.BaseUrl, "http://emby.local:8096", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -349,6 +408,305 @@ public sealed class NetworkShareDiscoveryServiceTests
         Assert.Contains("VideoBitRate=35000000", bdmv.RelativePath);
         Assert.Contains("MaxStreamingBitrate=45000000", bdmv.RelativePath);
         Assert.DoesNotContain("/Download", bdmv.RelativePath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_AuthenticatesEmbyByUsernameAndPasswordWhenListingLibraries()
+    {
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath is "/Users/Me" or "/Users")
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            if (request.Method == HttpMethod.Post &&
+                request.RequestUri?.AbsolutePath == "/Users/AuthenticateByName")
+            {
+                var body = request.Content?.ReadAsStringAsync().GetAwaiter().GetResult() ?? string.Empty;
+                Assert.Contains("\"Username\"", body, StringComparison.Ordinal);
+                Assert.Contains("\"Pw\"", body, StringComparison.Ordinal);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {
+                          "AccessToken": "session-token",
+                          "User": { "Id": "user-id", "Name": "alice" }
+                        }
+                        """)
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Users/user-id/Views")
+            {
+                Assert.Contains("api_key=session-token", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                Assert.True(request.Headers.TryGetValues("X-Emby-Token", out var values) &&
+                            Assert.Single(values) == "session-token");
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {
+                          "Items": [
+                            { "Id": "movies", "Name": "Movies", "CollectionType": "movies" }
+                          ]
+                        }
+                        """)
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        })));
+        var source = new MediaSource
+        {
+            Name = "Emby",
+            ProtocolType = "emby",
+            BaseUrl = "http://emby.local:8096",
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("password", "alice"))
+        };
+
+        var folders = await client.ListLibrariesAsync(source);
+
+        var folder = Assert.Single(folders);
+        Assert.Equal("Emby · Movies", folder.Name);
+        var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(folder.AuthConfig);
+        Assert.Equal("session-token", auth?.Token);
+        Assert.Equal("user-id", auth?.UserId);
+        Assert.Equal("movies", auth?.LibraryId);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_AuthenticatesEmbyWithPasswordEvenWhenUsersEndpointIsPublic()
+    {
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath == "/Users/Me")
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            if (request.Method == HttpMethod.Post &&
+                request.RequestUri?.AbsolutePath == "/Users/AuthenticateByName")
+            {
+                var body = request.Content?.ReadAsStringAsync().GetAwaiter().GetResult() ?? string.Empty;
+                Assert.Contains("\"Username\"", body, StringComparison.Ordinal);
+                Assert.Contains("\"Pw\"", body, StringComparison.Ordinal);
+                Assert.Contains("\"Password\"", body, StringComparison.Ordinal);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {
+                          "AccessToken": "session-token",
+                          "User": { "Id": "user-id", "Name": "alice" }
+                        }
+                        """)
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Users")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""[{ "Id": "user-id", "Name": "alice" }]""")
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Users/user-id/Views")
+            {
+                Assert.Contains("api_key=session-token", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                Assert.True(request.Headers.TryGetValues("X-Emby-Token", out var values) &&
+                            Assert.Single(values) == "session-token");
+                Assert.True(request.Headers.TryGetValues("X-MediaBrowser-Token", out var mediaBrowserValues) &&
+                            Assert.Single(mediaBrowserValues) == "session-token");
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {
+                          "Items": [
+                            { "Id": "movies", "Name": "Movies", "CollectionType": "movies" }
+                          ]
+                        }
+                        """)
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        })));
+        var source = new MediaSource
+        {
+            Name = "Emby",
+            ProtocolType = "emby",
+            BaseUrl = "http://emby.local:8096",
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("password", "alice"))
+        };
+
+        var folders = await client.ListLibrariesAsync(source);
+
+        var folder = Assert.Single(folders);
+        Assert.Equal("Emby · Movies", folder.Name);
+        var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(folder.AuthConfig);
+        Assert.Equal("session-token", auth?.Token);
+        Assert.Equal("user-id", auth?.UserId);
+        Assert.Equal("movies", auth?.LibraryId);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_FallsBackToWholeLibraryWhenViewsAreForbiddenButItemsWork()
+    {
+        var itemsProbeRequests = 0;
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath == "/Users/Me")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{ "Id": "user-id", "Name": "alice" }""")
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath is "/Users/user-id/Views" or "/Library/VirtualFolders")
+            {
+                return new HttpResponseMessage(HttpStatusCode.Forbidden);
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Items")
+            {
+                itemsProbeRequests++;
+                Assert.Contains("api_key=api-key", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("Limit=1", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{ "Items": [] }""")
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        })));
+        var source = new MediaSource
+        {
+            Name = "Emby",
+            ProtocolType = "emby",
+            BaseUrl = "http://emby.local:8096",
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("api-key", "alice"))
+        };
+
+        var folders = await client.ListLibrariesAsync(source);
+
+        Assert.True(itemsProbeRequests >= 1);
+        var folder = Assert.Single(folders);
+        Assert.Equal("Emby · 全部媒体库", folder.Name);
+        var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(folder.AuthConfig);
+        Assert.Equal("api-key", auth?.Token);
+        Assert.Equal("user-id", auth?.UserId);
+        Assert.Equal(string.Empty, auth?.LibraryId);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_FallsBackToWholeLibraryWhenApiKeyCannotResolveEmbyUsername()
+    {
+        var virtualFolderRequests = 0;
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath is "/Users/Me" or "/Users" or "/Users/AuthenticateByName")
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Library/VirtualFolders")
+            {
+                virtualFolderRequests++;
+                Assert.Contains("api_key=api-key", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        [
+                          { "ItemId": "movies", "Name": "Movies", "CollectionType": "movies" }
+                        ]
+                        """)
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        })));
+        var source = new MediaSource
+        {
+            Name = "Emby",
+            ProtocolType = "emby",
+            BaseUrl = "http://emby.local:8096",
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("api-key", "alice"))
+        };
+
+        var folders = await client.ListLibrariesAsync(source);
+
+        Assert.True(virtualFolderRequests >= 1);
+        var folder = Assert.Single(folders);
+        var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(folder.AuthConfig);
+        Assert.Equal("api-key", auth?.Token);
+        Assert.Equal(string.Empty, auth?.UserId);
+        Assert.Equal("movies", auth?.LibraryId);
+    }
+
+    [Fact]
+    public async Task MediaServerDiscoveryClient_ResolvesEmbyUsernameBeforeEnumeratingItems()
+    {
+        var client = new MediaServerDiscoveryClient(new HttpClient(new DelegateHandler(request =>
+        {
+            if (request.RequestUri?.AbsolutePath == "/Users/Me")
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Users")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""[{ "Id": "user-id", "Name": "alice" }]""")
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/Users/user-id/Items")
+            {
+                Assert.Contains("api_key=api-key", request.RequestUri.Query, StringComparison.OrdinalIgnoreCase);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {
+                          "Items": [
+                            {
+                              "Id": "movie1",
+                              "Name": "Movie",
+                              "Type": "Movie",
+                              "Path": "/movies/Movie.2020.mkv",
+                              "MediaSources": [
+                                { "Id": "movie1", "Path": "/movies/Movie.2020.mkv", "Container": "mkv", "Size": 123 }
+                              ]
+                            }
+                          ]
+                        }
+                        """)
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        })));
+        var source = new MediaSource
+        {
+            Name = "Emby",
+            ProtocolType = "emby",
+            BaseUrl = "http://emby.local:8096",
+            AuthConfig = MediaSourceAuthConfigSerializer.SerializeMediaServer(new MediaServerAuthConfig("api-key", "alice"))
+        };
+
+        var files = await client.EnumerateFilesAsync(source);
+
+        var file = Assert.Single(files);
+        Assert.Equal("Movie.2020.mkv", file.FileName);
+        Assert.Equal("Items/movie1/Download", file.RelativePath);
     }
 
     private sealed class EmptyHandler : HttpMessageHandler

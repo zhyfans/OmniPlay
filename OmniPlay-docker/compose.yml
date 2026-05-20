@@ -1,0 +1,61 @@
+services:
+  omniplay:
+    # 从当前 OmniPlay-docker 目录的 Dockerfile 构建镜像。
+    # 如果已经手动构建或拉取了镜像，可以删除 build 段，只保留 image。
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # 本地镜像名称，可按需要改成自己的仓库名，例如 registry.example.com/omniplay:latest。
+    image: omniplay-docker:latest
+
+    # 容器名称。若同一台机器要运行多个 OmniPlay 实例，需要改成不同名称。
+    container_name: omniplay
+
+    # Docker 服务启动后自动拉起容器；手动停止容器后不会立刻重启。
+    restart: unless-stopped
+
+    # 端口映射：宿主机端口:容器端口。
+    # 默认宿主机端口为 45721，和群晖套件版保持一致。
+    # 如需改宿主机端口，把左侧 45721 改成其他端口，例如 "18096:45721"。
+    ports:
+      - "45722:45721"
+
+    environment:
+      # 容器时区，默认中国时区。
+      TZ: Asia/Shanghai
+
+      # OmniPlay 数据根目录。数据库、设置、海报、缩略图、缓存等都会写到这里。
+      OMNIPLAY_APP_ROOT: /var/lib/omniplay
+
+      # 服务监听地址。容器内固定监听 45721，通常不需要修改。
+      OMNIPLAY_URLS: http://0.0.0.0:45721
+      ASPNETCORE_URLS: http://0.0.0.0:45721
+
+      # Web UI 里允许浏览的本地媒体根目录。这里对应下面挂载到容器内的 /media。
+      OMNIPLAY_LOCAL_SHARE_ROOTS: /media
+
+      # 容器内 FFmpeg/FFprobe 路径，用于媒体信息探测和 HLS 转码。
+      OMNIPLAY_FFMPEG_PATH: /usr/bin/ffmpeg
+      OMNIPLAY_FFPROBE_PATH: /usr/bin/ffprobe
+
+      # 默认启用 Intel VAAPI/QSV 硬解。宿主机必须存在 /dev/dri/renderD128。
+      # 如果设备路径不同，改成实际 renderD* 路径。
+      OMNIPLAY_VAAPI_DEVICE: /dev/dri/renderD128
+      OMNIPLAY_ENABLE_QSV: "1"
+
+    volumes:
+      # 持久化数据目录。建议保留，删除容器不会丢失数据库和缓存。
+      - /volume1/docker/OmniPlay-docker/OmniPlay-docker/data:/var/lib/omniplay
+
+      # 媒体目录挂载，默认把宿主机 /volume1 只读挂载到容器 /media/volume1。
+      # 根据实际媒体目录修改左侧路径，例如：
+      # - /volume1/video:/media/video:ro
+      # - /vol1/1000/影视:/media/video:ro
+      # - /mnt/media:/media/video:ro
+      - /volume4/电影:/media/volume1:ro
+
+    # 硬解设备挂载。没有 /dev/dri 的机器需要删除 devices 段，
+    # 并删除上面的 OMNIPLAY_VAAPI_DEVICE / OMNIPLAY_ENABLE_QSV。
+    devices:
+      - /dev/dri:/dev/dri

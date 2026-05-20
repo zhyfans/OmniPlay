@@ -18,7 +18,7 @@ public sealed class PlaybackSubtitleService : IPlaybackSubtitleService
     private static readonly HttpMethod PropFind = new("PROPFIND");
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".srt", ".vtt", ".ass", ".ssa"
+        ".srt", ".vtt", ".ass", ".ssa", ".sup"
     };
 
     private readonly SqliteDatabase database;
@@ -395,7 +395,10 @@ public sealed class PlaybackSubtitleService : IPlaybackSubtitleService
     {
         var extension = Path.GetExtension(path);
         return extension.Equals(".srt", StringComparison.OrdinalIgnoreCase)
-               || extension.Equals(".vtt", StringComparison.OrdinalIgnoreCase);
+               || extension.Equals(".vtt", StringComparison.OrdinalIgnoreCase)
+               || extension.Equals(".ass", StringComparison.OrdinalIgnoreCase)
+               || extension.Equals(".ssa", StringComparison.OrdinalIgnoreCase)
+               || extension.Equals(".sup", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string StableSubtitleId(string value)

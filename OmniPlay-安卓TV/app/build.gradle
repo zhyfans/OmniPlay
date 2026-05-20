@@ -1,0 +1,42 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.omniplay.tv"
+    compileSdk 35
+    ndkVersion "27.3.13750724"
+
+    defaultConfig {
+        applicationId "com.omniplay.tv"
+        minSdk 26
+        targetSdk 35
+        versionCode 15
+        versionName "1.5"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -Wall -Wextra"
+            }
+        }
+
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "dev.jdtech.mpv:libmpv:0.5.1"
+}

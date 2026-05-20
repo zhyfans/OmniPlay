@@ -294,7 +294,7 @@ public partial class PosterWallView : UserControl
         var itemWidth = Math.Max(
             minimumItemWidth,
             Math.Floor(availableWidth / targetColumns));
-        var itemHeight = Math.Round(cardHeight + Math.Max(108, cardWidth * 0.52));
+        var itemHeight = Math.Round(cardHeight + Math.Max(92, cardWidth * 0.44));
 
         LibraryPosterCardWidth = cardWidth;
         LibraryPosterCardHeight = cardHeight;
@@ -1335,7 +1335,7 @@ public partial class PosterWallView : UserControl
     {
         if (currentViewModel is not null)
         {
-            currentViewModel.Player.BeginSeekInteraction();
+            currentViewModel.BeginPlayerTimelineSeekInteraction();
             ShowOverlayControlsTemporarily();
         }
     }
@@ -1344,7 +1344,7 @@ public partial class PosterWallView : UserControl
     {
         if (sender is Slider slider && currentViewModel is not null)
         {
-            await currentViewModel.Player.CommitSeekAsync(slider.Value);
+            await currentViewModel.CommitPlayerTimelineSeekAsync(slider.Value);
             ShowOverlayControlsTemporarily();
         }
     }
@@ -1355,7 +1355,7 @@ public partial class PosterWallView : UserControl
             && e.Property == RangeBase.ValueProperty
             && currentViewModel is not null)
         {
-            currentViewModel.Player.UpdateSeekPreview(slider.Value);
+            currentViewModel.UpdatePlayerTimelineSeekPreview(slider.Value);
         }
     }
 

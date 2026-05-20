@@ -42,7 +42,7 @@ if (!selectedArch) {
 
 const spkArch = process.env.SPK_ARCH ?? selectedArch.spkArch;
 const createNoarchCompatSpk =
-  process.env.OMNIPLAY_COMPAT_NOARCH !== '0' && selectedArch.label === 'x64' && spkArch === 'x86_64';
+  process.env.OMNIPLAY_COMPAT_NOARCH === '1' && selectedArch.label === 'x64' && spkArch === 'x86_64';
 const buildDir = path.join(rootDir, 'build/synology', selectedArch.label);
 const publishDir = path.join(buildDir, 'publish');
 const dotnetPublishDir = path.relative(rootDir, publishDir);
@@ -359,6 +359,7 @@ function normalizePayloadPermissions(directory) {
 }
 
 console.log('==> Building Web UI');
+rmSync(path.join(rootDir, 'web/dist'), { recursive: true, force: true });
 run('npm', ['--prefix', 'web', 'run', 'build']);
 
 console.log(`==> Preparing server payload (${selectedArch.rid})`);
@@ -419,6 +420,10 @@ if (existsSync(mediaToolsSourceDir)) {
     }
   }
 }
+const fontconfigSourceDir = path.join(synologyDir, 'fontconfig');
+if (existsSync(fontconfigSourceDir)) {
+  cpSync(fontconfigSourceDir, path.join(packageDir, 'tools/fontconfig'), { recursive: true });
+}
 mkdirSync(path.join(packageDir, 'port_conf'), { recursive: true });
 cpSync(path.join(synologyDir, 'port_conf/OmniPlay.sc'), path.join(packageDir, 'port_conf/OmniPlay.sc'));
 cpSync(path.join(synologyDir, 'ui'), path.join(packageDir, 'ui'), { recursive: true });
@@ -442,9 +447,7 @@ normalizePayloadPermissions(packageDir);
 
 console.log('==> Creating package.tgz');
 const packageTgzPath = path.join(spkRoot, 'package.tgz');
-const payloadTgzPath = path.join(spkRoot, 'payload.tgz');
 rmSync(packageTgzPath, { force: true });
-rmSync(payloadTgzPath, { force: true });
 run('tar', [
   '--format',
   'ustar',
@@ -458,37 +461,15 @@ run('tar', [
   '--gname',
   'root',
   '-czf',
-  payloadTgzPath,
+  packageTgzPath,
   '-C',
   packageDir,
   '.',
 ]);
-writeFileSync(
-  packageTgzPath,
-  gzipSync(createTarBuffer([
-    {
-      name: 'package/',
-      type: 'directory',
-      mode: 0o755,
-      mtime: Math.floor(Date.now() / 1000),
-    },
-    {
-      name: 'package/PACKAGE_PLACEHOLDER',
-      type: 'file',
-      mode: 0o644,
-      mtime: Math.floor(Date.now() / 1000),
-      data: Buffer.from('OmniPlay payload is extracted by preinst from payload.tgz.\n', 'utf8'),
-    },
-  ]), {
-    level: 9,
-    mtime: 0,
-  }),
-);
 const packageChecksum = createHash('md5').update(readFileSync(packageTgzPath)).digest('hex');
 const packagePayloadSize = calculateDirectorySize(packageDir);
 const packageTgzSize = statSync(packageTgzPath).size;
-const payloadTgzSize = statSync(payloadTgzPath).size;
-const extractSizeKb = Math.ceil((packagePayloadSize + packageTgzSize + payloadTgzSize) / 1024) + 65536;
+const extractSizeKb = Math.ceil((packagePayloadSize + packageTgzSize) / 1024);
 
 console.log('==> Creating SPK metadata');
 const createInfo = (packageArch) => {
@@ -508,6 +489,11 @@ for (const scriptName of readdirSync(path.join(spkRoot, 'scripts'))) {
   chmodSync(path.join(spkRoot, 'scripts', scriptName), 0o755);
 }
 cpSync(path.join(synologyDir, 'conf/privilege'), path.join(spkRoot, 'conf/privilege'));
+cpSync(path.join(synologyDir, 'conf/resource'), path.join(spkRoot, 'conf/resource'));
+const wizardUiFilesDir = path.join(synologyDir, 'WIZARD_UIFILES');
+if (existsSync(wizardUiFilesDir)) {
+  cpSync(wizardUiFilesDir, path.join(spkRoot, 'WIZARD_UIFILES'), { recursive: true });
+}
 
 const iconPath = existsSync(packageIconPath) ? packageIconPath : path.join(synologyDir, 'icons/PACKAGE_ICON.PNG');
 const largeIconPath = existsSync(packageIconPath) ? packageIconPath : path.join(synologyDir, 'icons/PACKAGE_ICON_256.PNG');
@@ -517,12 +503,14 @@ copyOrCreateIcon(largeIconPath, path.join(spkRoot, 'PACKAGE_ICON_256.PNG'), 256)
 const spkEntries = [
   'INFO',
   'package.tgz',
-  'payload.tgz',
   'scripts',
   'conf',
   'PACKAGE_ICON.PNG',
   'PACKAGE_ICON_256.PNG',
 ];
+if (existsSync(path.join(spkRoot, 'WIZARD_UIFILES'))) {
+  spkEntries.push('WIZARD_UIFILES');
+}
 
 function writeSpk(packageArch) {
   const spkPath = spkPathForArch(packageArch);

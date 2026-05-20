@@ -265,7 +265,7 @@
             </Border>
           </Grid>
 
-          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSearchPopupOpen}" Placement="Bottom" PlacementTarget="{Binding #SearchButton}">
+          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSearchPopupOpen, Mode=TwoWay}" Placement="Bottom" PlacementTarget="{Binding #SearchButton}">
             <Border Classes="popupPanel" Width="340" Padding="16">
               <StackPanel Spacing="12">
                 <TextBlock FontSize="18" FontWeight="SemiBold" Foreground="#1A1A1A" Text="&#x641C;&#x7D22;" />
@@ -274,7 +274,7 @@
             </Border>
           </Popup>
 
-          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSortPopupOpen}" Placement="Bottom" PlacementTarget="{Binding #SortButton}">
+          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSortPopupOpen, Mode=TwoWay}" Placement="Bottom" PlacementTarget="{Binding #SortButton}">
             <Border Classes="popupPanel" Width="220" Padding="12">
               <StackPanel Spacing="6">
                 <TextBlock Margin="8,4,8,8" FontSize="18" FontWeight="SemiBold" Foreground="#1A1A1A" Text="&#x6392;&#x5E8F;" />
@@ -294,7 +294,7 @@
             </Border>
           </Popup>
 
-          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSourcePopupOpen}" Placement="Bottom" PlacementTarget="{Binding #SourceButton}">
+          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSourcePopupOpen, Mode=TwoWay}" Placement="Bottom" PlacementTarget="{Binding #SourceButton}">
             <Border Classes="popupPanel" Width="560" MaxHeight="760" Padding="20">
               <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel Spacing="16">
@@ -363,7 +363,7 @@
             </Border>
           </Popup>
 
-          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSettingsPopupOpen}" Placement="Bottom" PlacementTarget="{Binding #SettingsButton}">
+          <Popup IsLightDismissEnabled="True" IsOpen="{Binding IsSettingsPopupOpen, Mode=TwoWay}" Placement="Bottom" PlacementTarget="{Binding #SettingsButton}">
             <Border Classes="popupPanel" Width="460" MaxHeight="720" Padding="20">
               <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel Spacing="16">
@@ -379,7 +379,7 @@
                         <TextBlock Foreground="#323130" Text="当前版本" />
                         <TextBlock Opacity="0.72" Foreground="#605E5C" Text="{Binding Settings.AppVersionText}" TextTrimming="CharacterEllipsis" />
                       </StackPanel>
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoCheckUpdatesOnStartup}" Content="启动时自动检查更新" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoCheckUpdatesOnStartup, Mode=TwoWay}" Content="启动时自动检查更新" />
                       <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button Classes="sourceAction" Command="{Binding Settings.CheckForUpdatesCommand}" Content="检查更新" />
                         <Button Classes="sourceAction" Command="{Binding Settings.InstallLatestUpdateCommand}" Content="直接更新" />
@@ -392,8 +392,8 @@
                   <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
                     <StackPanel Spacing="14">
                       <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="&#x57FA;&#x7840;&#x8BBE;&#x7F6E;" />
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoScanOnStartup}" Content="&#x542F;&#x52A8;&#x65F6;&#x81EA;&#x52A8;&#x626B;&#x63CF;&#x5E76;&#x540C;&#x6B65;&#x5E93;" />
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.ShowMediaSourceRealPath}" Content="&#x5A92;&#x4F53;&#x6E90;&#x663E;&#x793A;&#x771F;&#x5B9E;&#x8DEF;&#x5F84;" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.AutoScanOnStartup, Mode=TwoWay}" Content="&#x542F;&#x52A8;&#x65F6;&#x81EA;&#x52A8;&#x626B;&#x63CF;&#x5E76;&#x540C;&#x6B65;&#x5E93;" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.ShowMediaSourceRealPath, Mode=TwoWay}" Content="&#x5A92;&#x4F53;&#x6E90;&#x663E;&#x793A;&#x771F;&#x5B9E;&#x8DEF;&#x5F84;" />
                     </StackPanel>
                   </Border>
 
@@ -408,18 +408,18 @@
                   <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
                     <StackPanel Spacing="14">
                       <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="本地刮削文件" />
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataImport}" Content="读取本地 NFO、海报和剧照" />
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataExport}" Content="刮削完成后保存 NFO、海报和剧照到本地" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataImport, Mode=TwoWay}" Content="读取本地 NFO、海报和剧照" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableLocalMetadataExport, Mode=TwoWay}" Content="刮削完成后保存 NFO、海报和剧照到本地" />
                       <TextBlock Opacity="0.68" Foreground="#605E5C" TextWrapping="Wrap" Text="默认关闭。开启后仅对本地文件夹源生效，支持 movie.nfo、tvshow.nfo、同名 .nfo、poster/fanart 与同名 -thumb 图片。" />
                     </StackPanel>
                   </Border>
 
                   <Border Background="#F9F9F9" BorderBrush="#E5E5E5" BorderThickness="1" CornerRadius="8" Padding="16">
                     <StackPanel Spacing="14">
-                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableBuiltInPublicTmdbSource}" Content="启用内置公共 TMDB 源（受限）" />
+                      <CheckBox Foreground="#323130" IsChecked="{Binding Settings.EnableBuiltInPublicTmdbSource, Mode=TwoWay}" Content="启用内置公共 TMDB 源（受限）" />
                       <StackPanel Spacing="8">
                         <TextBlock FontWeight="SemiBold" Foreground="#1A1A1A" Text="自定义 TMDB API" />
-                        <TextBox Classes="popupSearchBox" Watermark="API Key 或 Read Access Token" Text="{Binding Settings.CustomTmdbCredential}" />
+                        <TextBox Classes="popupSearchBox" Watermark="API Key 或 Read Access Token" Text="{Binding Settings.CustomTmdbCredential, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                         <Button Classes="linkAction" HorizontalAlignment="Left" Command="{Binding Settings.OpenTmdbWebsiteCommand}" Content="请往TMDB官网注册获取api：https://www.themoviedb.org" />
                       </StackPanel>
                       <StackPanel Spacing="10">
@@ -657,7 +657,7 @@
                 <ItemsControl.ItemTemplate>
                   <DataTemplate>
                     <Grid Width="{Binding $parent[UserControl].LibraryPosterCardWidth}">
-                      <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Margin="0,0,0,22" Spacing="0">
+                      <StackPanel Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Margin="0,0,0,14" Spacing="0">
                         <Grid Classes="posterInteractive" Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}" ClipToBounds="True">
                           <Button Classes="cardButton" Command="{Binding $parent[UserControl].DataContext.OpenDetailCommand}" CommandParameter="{Binding}" IsEnabled="{Binding !$parent[UserControl].DataContext.IsHomeOfflineCacheModeActive}">
                             <Grid Width="{Binding $parent[UserControl].LibraryPosterCardWidth}" Height="{Binding $parent[UserControl].LibraryPosterCardHeight}">
@@ -1241,7 +1241,7 @@
               <Grid Grid.Row="1" Margin="0,0,0,8" ColumnDefinitions="*,Auto,*">
                 <StackPanel Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Orientation="Horizontal" Spacing="24">
                   <!-- 后退按钮：双实心箭头 -->
-                  <Button Classes="overlayCtrl" Width="52" Height="52" CornerRadius="26" Command="{Binding Player.SeekBackwardCommand}" ToolTip.Tip="后退 10 秒">
+                  <Button Classes="overlayCtrl" Width="52" Height="52" CornerRadius="26" Command="{Binding PlayerTimelineSeekBackwardCommand}" ToolTip.Tip="后退 10 秒">
                     <Path Fill="#FFFFFF" Stretch="Uniform" Width="20" Height="20" Data="M11.99 12L21.5 18V6l-9.51 6zm-9.5 0L12 18V6L2.49 12z" />
                   </Button>
                   <!-- 播放/暂停按钮：纯净毛玻璃底座 -->
@@ -1249,7 +1249,7 @@
                     <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="30" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets, Arial" Text="{Binding Player.PlayPauseGlyph}" />
                   </Button>
                   <!-- 前进按钮：双实心箭头 -->
-                  <Button Classes="overlayCtrl" Width="52" Height="52" CornerRadius="26" Command="{Binding Player.SeekForwardCommand}" ToolTip.Tip="前进 10 秒">
+                  <Button Classes="overlayCtrl" Width="52" Height="52" CornerRadius="26" Command="{Binding PlayerTimelineSeekForwardCommand}" ToolTip.Tip="前进 10 秒">
                     <Path Fill="#FFFFFF" Stretch="Uniform" Width="20" Height="20" Data="M12.01 12L2.5 6v12l9.51-6zm9.5 0L12 6v12l9.51-6z" />
                   </Button>
                 </StackPanel>
@@ -1257,9 +1257,12 @@
               </Grid>
 
               <Grid Grid.Row="2" Margin="0,14,0,0" ColumnDefinitions="Auto,*,Auto">
-                <TextBlock MinWidth="54" VerticalAlignment="Center" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" Text="{Binding Player.CurrentPositionText}" />
-                <Slider x:Name="OverlayPositionSlider" Grid.Column="1" Margin="12,0" Minimum="0" Maximum="{Binding Player.DurationSeconds}" Value="{Binding Player.SeekPositionSeconds, Mode=TwoWay}" PropertyChanged="OverlaySlider_OnPropertyChanged" />
-                <TextBlock Grid.Column="2" MinWidth="58" VerticalAlignment="Center" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" Text="{Binding Player.RemainingTimeText}" />
+                <TextBlock MinWidth="54" VerticalAlignment="Center" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" Text="{Binding PlayerTimelineCurrentPositionText}" />
+                <Grid Grid.Column="1" Margin="12,0">
+                  <Slider x:Name="OverlayPositionSlider" Minimum="0" Maximum="{Binding PlayerTimelineDurationSeconds}" Value="{Binding PlayerTimelineSeekPositionSeconds, Mode=TwoWay}" PropertyChanged="OverlaySlider_OnPropertyChanged" />
+                  <player:SegmentedTimelineOverlay Boundaries="{Binding PlayerTimelineSegmentBoundaries}" Height="24" VerticalAlignment="Center" IsHitTestVisible="False" />
+                </Grid>
+                <TextBlock Grid.Column="2" MinWidth="58" VerticalAlignment="Center" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" Text="{Binding PlayerTimelineRemainingTimeText}" />
               </Grid>
 
               <Grid Grid.Row="3" Margin="0,12,0,0">

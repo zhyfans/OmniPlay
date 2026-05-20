@@ -6,25 +6,6 @@ LOG_FILE="/tmp/omniplay-preinst.log"
 {
   echo "preinst cwd=${BASE_DIR}"
   echo "preinst package.tgz=$([ -f "${BASE_DIR}/package.tgz" ] && echo yes || echo no)"
-  echo "preinst payload.tgz=$([ -f "${BASE_DIR}/payload.tgz" ] && echo yes || echo no)"
-  echo "preinst package_dir=$([ -d "${BASE_DIR}/package" ] && echo yes || echo no)"
 } >> "${LOG_FILE}" 2>/dev/null || true
-
-if [ -f "${BASE_DIR}/payload.tgz" ] && [ ! -x "${BASE_DIR}/package/OmniPlay.Api" ]; then
-  rm -rf "${BASE_DIR}/package" || exit 1
-  mkdir -p "${BASE_DIR}/package" || exit 1
-  tar -xzf "${BASE_DIR}/payload.tgz" -C "${BASE_DIR}/package" >> "${LOG_FILE}" 2>&1 || exit 1
-elif [ -f "${BASE_DIR}/package.tgz" ] && [ ! -x "${BASE_DIR}/package/OmniPlay.Api" ]; then
-  FIRST_ENTRY="$(tar -tzf "${BASE_DIR}/package.tgz" 2>/dev/null | sed -n '1p')"
-  case "${FIRST_ENTRY}" in
-    package|package/*)
-      tar -xzf "${BASE_DIR}/package.tgz" -C "${BASE_DIR}" >> "${LOG_FILE}" 2>&1 || exit 1
-      ;;
-    *)
-      mkdir -p "${BASE_DIR}/package" || exit 1
-      tar -xzf "${BASE_DIR}/package.tgz" -C "${BASE_DIR}/package" >> "${LOG_FILE}" 2>&1 || exit 1
-      ;;
-  esac
-fi
 
 exit 0

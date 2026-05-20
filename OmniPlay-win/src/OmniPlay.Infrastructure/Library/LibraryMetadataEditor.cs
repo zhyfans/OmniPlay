@@ -556,20 +556,19 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
         var newOriginalLanguage = PreferMetadataValue(match.OriginalLanguage, candidate.OriginalLanguage);
         var newMetadataLanguage = NormalizeMetadataLanguage(preferredLanguage);
 
-        if (string.Equals(newTitle, candidate.Title, StringComparison.Ordinal) &&
-            string.Equals(newReleaseDate, candidate.ReleaseDate, StringComparison.Ordinal) &&
-            string.Equals(newOverview, candidate.Overview, StringComparison.Ordinal) &&
-            string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) &&
-            Nullable.Equals(newVoteAverage, candidate.VoteAverage) &&
-            string.Equals(newProductionCountryCodes, candidate.ProductionCountryCodes, StringComparison.Ordinal) &&
-            string.Equals(newOriginalLanguage, candidate.OriginalLanguage, StringComparison.Ordinal) &&
-            string.Equals(newMetadataLanguage, candidate.MetadataLanguage, StringComparison.OrdinalIgnoreCase))
-        {
-            return new UpdateResult(false, false);
-        }
+        var updatedMetadata =
+            !string.Equals(newTitle, candidate.Title, StringComparison.Ordinal) ||
+            !string.Equals(newReleaseDate, candidate.ReleaseDate, StringComparison.Ordinal) ||
+            !string.Equals(newOverview, candidate.Overview, StringComparison.Ordinal) ||
+            !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) ||
+            !Nullable.Equals(newVoteAverage, candidate.VoteAverage) ||
+            !string.Equals(newProductionCountryCodes, candidate.ProductionCountryCodes, StringComparison.Ordinal) ||
+            !string.Equals(newOriginalLanguage, candidate.OriginalLanguage, StringComparison.Ordinal) ||
+            !string.Equals(newMetadataLanguage, candidate.MetadataLanguage, StringComparison.OrdinalIgnoreCase);
 
         using var connection = database.OpenConnection();
-        await connection.ExecuteAsync(
+        using var transaction = connection.BeginTransaction();
+        var affectedRows = await connection.ExecuteAsync(
             new CommandDefinition(
                 """
                 UPDATE movie
@@ -580,7 +579,8 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
                     voteAverage = @VoteAverage,
                     productionCountryCodes = @ProductionCountryCodes,
                     originalLanguage = @OriginalLanguage,
-                    metadataLanguage = @MetadataLanguage
+                    metadataLanguage = @MetadataLanguage,
+                    tmdbId = @TmdbId
                 WHERE id = @Id
                 """,
                 new
@@ -593,14 +593,94 @@ public sealed class LibraryMetadataEditor : ILibraryMetadataEditor
                     VoteAverage = newVoteAverage,
                     ProductionCountryCodes = newProductionCountryCodes,
                     OriginalLanguage = newOriginalLanguage,
-                    MetadataLanguage = newMetadataLanguage
+                    MetadataLanguage = newMetadataLanguage,
+                    TmdbId = match.Id
                 },
+                transaction,
                 cancellationToken: cancellationToken));
+        if (affectedRows == 0)
+        {
+            transaction.Rollback();
+            return new UpdateResult(false, false);
+        }
+
+        var mergedDuplicate = await MergeDuplicateMoviesByTmdbIdAsync(
+            connection,
+            transaction,
+            candidate.Id,
+            match.Id,
+            cancellationToken);
+        transaction.Commit();
 
         return new UpdateResult(
-            Updated: true,
+            Updated: updatedMetadata || mergedDuplicate,
             DownloadedPoster: !string.Equals(newPosterPath, candidate.PosterPath, StringComparison.Ordinal) &&
                               IsUsableLocalPoster(newPosterPath));
+    }
+
+    private static async Task<bool> MergeDuplicateMoviesByTmdbIdAsync(
+        System.Data.IDbConnection connection,
+        System.Data.IDbTransaction transaction,
+        long canonicalMovieId,
+        int tmdbId,
+        CancellationToken cancellationToken)
+    {
+        if (tmdbId <= 0)
+        {
+            return false;
+        }
+
+        var duplicateIds = (await connection.QueryAsync<long>(
+            new CommandDefinition(
+                """
+                SELECT id
+                FROM movie
+                WHERE tmdbId = @TmdbId
+                  AND id <> @CanonicalMovieId
+                  AND EXISTS (
+                      SELECT 1
+                      FROM videoFile
+                      WHERE videoFile.movieId = movie.id
+                        AND videoFile.mediaType = 'movie'
+                  )
+                """,
+                new { TmdbId = tmdbId, CanonicalMovieId = canonicalMovieId },
+                transaction,
+                cancellationToken: cancellationToken))).ToArray();
+        if (duplicateIds.Length == 0)
+        {
+            return false;
+        }
+
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                """
+                UPDATE videoFile
+                SET mediaType = 'movie',
+                    movieId = @CanonicalMovieId,
+                    episodeId = NULL
+                WHERE movieId IN @DuplicateIds
+                  AND mediaType = 'movie'
+                """,
+                new { CanonicalMovieId = canonicalMovieId, DuplicateIds = duplicateIds },
+                transaction,
+                cancellationToken: cancellationToken));
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                """
+                DELETE FROM movie
+                WHERE id IN @DuplicateIds
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM videoFile
+                      WHERE videoFile.movieId = movie.id
+                        AND videoFile.mediaType = 'movie'
+                  )
+                """,
+                new { DuplicateIds = duplicateIds },
+                transaction,
+                cancellationToken: cancellationToken));
+        return true;
     }
 
     private async Task<UpdateResult> UpdateTvShowAsync(

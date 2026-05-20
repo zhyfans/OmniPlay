@@ -1,7 +1,7 @@
 {
   "id": "com.omniplay.nas",
   "name": "OmniPlay",
-  "version": "0.1.0",
+  "version": "1.5",
   "description": "一款带TMDB刮削海报墙播放器。",
   "service": {
     "port": 8096,

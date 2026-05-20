@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="../OmniPlay.Core/OmniPlay.Core.csproj" />
+    <ProjectReference Include="../OmniPlay.Infrastructure/OmniPlay.Infrastructure.csproj" />
+    <ProjectReference Include="../OmniPlay.Media/OmniPlay.Media.csproj" />
+    <ProjectReference Include="../OmniPlay.Packaging/OmniPlay.Packaging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="../../../web/dist/**">
+      <Link>wwwroot/%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+</Project>

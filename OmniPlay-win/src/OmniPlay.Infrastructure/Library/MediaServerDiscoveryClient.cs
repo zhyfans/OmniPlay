@@ -1,4 +1,4 @@
-using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Xml.Linq;
@@ -153,6 +153,11 @@ public sealed record MediaServerFileEntry(
         CancellationToken cancellationToken)
     {
         var auth = MediaSourceAuthConfigSerializer.DeserializeMediaServer(source.AuthConfig);
+        if (!string.IsNullOrWhiteSpace(auth?.UserId))
+        {
+            auth = await ResolveEmbyCompatibleAuthAsync(source, auth, auth.UserId, cancellationToken);
+        }
+
         var queryFields = "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber";
         var queryPrefix = string.IsNullOrWhiteSpace(auth?.LibraryId)
             ? $"Recursive=true&IncludeItemTypes=Movie,Episode&Fields={queryFields}"
@@ -160,8 +165,8 @@ public sealed record MediaServerFileEntry(
         var relativePath = string.IsNullOrWhiteSpace(auth?.UserId)
             ? $"Items?{queryPrefix}"
             : $"Users/{Uri.EscapeDataString(auth.UserId!)}/Items?{queryPrefix}";
-        var uri = BuildUri(source.BaseUrl, relativePath, auth, source.ProtocolKind);
-        using var response = await httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var request = BuildEmbyCompatibleRequest(source.BaseUrl, relativePath, auth, source.ProtocolKind);
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -335,8 +340,8 @@ public sealed record MediaServerFileEntry(
         {
             try
             {
-                var viewsUri = BuildUri(source.BaseUrl, $"Users/{Uri.EscapeDataString(resolvedUserId)}/Views", resolvedAuth, source.ProtocolKind);
-                using var response = await httpClient.GetAsync(viewsUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                using var request = BuildEmbyCompatibleRequest(source.BaseUrl, $"Users/{Uri.EscapeDataString(resolvedUserId)}/Views", resolvedAuth, source.ProtocolKind);
+                using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
                 response.EnsureSuccessStatusCode();
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 var payload = await JsonSerializer.DeserializeAsync<EmbyViewsResponse>(stream, JsonOptions, cancellationToken);
@@ -355,14 +360,34 @@ public sealed record MediaServerFileEntry(
                       string.Equals(resolvedUserId, userInput, StringComparison.OrdinalIgnoreCase) &&
                       !LooksLikeEmbyCompatibleUserId(userInput))
             {
+                if (await TryCanUseEmbyCompatibleItemsAsync(source, resolvedAuth, cancellationToken))
+                {
+                    return
+                    [
+                        CreateMediaServerFolder(source, normalizedBaseUrl, "全部媒体库", null, null, resolvedAuth)
+                    ];
+                }
+
                 throw new InvalidOperationException($"无法解析 {source.ProtocolLabel} 用户“{userInput}”。请确认用户名，以及下方填写的是密码、访问令牌或 API Key。");
+            }
+            catch (HttpRequestException ex) when (IsAuthenticationFailureStatus(ex.StatusCode))
+            {
+                if (await TryCanUseEmbyCompatibleItemsAsync(source, resolvedAuth, cancellationToken))
+                {
+                    return
+                    [
+                        CreateMediaServerFolder(source, normalizedBaseUrl, "全部媒体库", null, null, resolvedAuth)
+                    ];
+                }
+
+                throw new InvalidOperationException($"{source.ProtocolLabel} 认证失败：请检查用户名，以及下方填写的是密码、访问令牌或 API Key。");
             }
         }
 
         try
         {
-            var foldersUri = BuildUri(source.BaseUrl, "Library/VirtualFolders", resolvedAuth, source.ProtocolKind);
-            using var response = await httpClient.GetAsync(foldersUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            using var request = BuildEmbyCompatibleRequest(source.BaseUrl, "Library/VirtualFolders", resolvedAuth, source.ProtocolKind);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             response.EnsureSuccessStatusCode();
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
             var virtualFolders = await JsonSerializer.DeserializeAsync<List<EmbyVirtualFolder>>(stream, JsonOptions, cancellationToken);
@@ -385,6 +410,18 @@ public sealed record MediaServerFileEntry(
         catch (HttpRequestException ex) when (string.IsNullOrWhiteSpace(resolvedUserId) && IsWholeLibraryFallbackStatus(ex.StatusCode))
         {
         }
+        catch (HttpRequestException ex) when (IsAuthenticationFailureStatus(ex.StatusCode))
+        {
+            if (await TryCanUseEmbyCompatibleItemsAsync(source, resolvedAuth, cancellationToken))
+            {
+                return
+                [
+                    CreateMediaServerFolder(source, normalizedBaseUrl, "全部媒体库", null, null, resolvedAuth)
+                ];
+            }
+
+            throw new InvalidOperationException($"{source.ProtocolLabel} 认证失败：请检查用户名，以及下方填写的是密码、访问令牌或 API Key。");
+        }
         catch (JsonException) when (string.IsNullOrWhiteSpace(resolvedUserId))
         {
         }
@@ -403,6 +440,11 @@ public sealed record MediaServerFileEntry(
     {
         var credential = auth?.Token?.Trim() ?? string.Empty;
         var trimmed = userInput?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(credential))
+        {
+            return auth;
+        }
+
         if (string.IsNullOrWhiteSpace(trimmed))
         {
             var currentUser = await TryFetchCurrentEmbyCompatibleUserAsync(source, auth, cancellationToken);
@@ -422,6 +464,12 @@ public sealed record MediaServerFileEntry(
             return auth is null ? null : auth with { UserId = trimmed };
         }
 
+        var passwordAuth = await TryAuthenticateEmbyCompatibleUserAsync(source, trimmed, credential, cancellationToken);
+        if (passwordAuth is not null)
+        {
+            return passwordAuth;
+        }
+
         var users = await TryFetchEmbyCompatibleUsersAsync(source, auth, cancellationToken);
         var matched = users.FirstOrDefault(user =>
             string.Equals(user.Id, trimmed, StringComparison.OrdinalIgnoreCase) ||
@@ -431,10 +479,10 @@ public sealed record MediaServerFileEntry(
             return auth is null ? null : auth with { UserId = matched.Id.Trim() };
         }
 
-        var passwordAuth = await TryAuthenticateEmbyCompatibleUserAsync(source, trimmed, credential, cancellationToken);
-        if (passwordAuth is not null)
+        if (await TryCanUseWholeEmbyCompatibleLibraryAsync(source, auth, cancellationToken) ||
+            await TryCanUseEmbyCompatibleItemsAsync(source, auth, cancellationToken))
         {
-            return passwordAuth;
+            return auth is null ? null : auth with { UserId = string.Empty };
         }
 
         throw new InvalidOperationException($"{source.ProtocolLabel} 认证失败：请检查用户名，以及下方填写的是密码、访问令牌或 API Key。");
@@ -447,8 +495,8 @@ public sealed record MediaServerFileEntry(
     {
         try
         {
-            var uri = BuildUri(source.BaseUrl, "Users/Me", auth, source.ProtocolKind);
-            using var response = await httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            using var request = BuildEmbyCompatibleRequest(source.BaseUrl, "Users/Me", auth, source.ProtocolKind);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 return null;
@@ -474,8 +522,8 @@ public sealed record MediaServerFileEntry(
     {
         try
         {
-            var uri = BuildUri(source.BaseUrl, "Users", auth, source.ProtocolKind);
-            using var response = await httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            using var request = BuildEmbyCompatibleRequest(source.BaseUrl, "Users", auth, source.ProtocolKind);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 return [];
@@ -493,6 +541,44 @@ public sealed record MediaServerFileEntry(
         }
     }
 
+    private async Task<bool> TryCanUseWholeEmbyCompatibleLibraryAsync(
+        MediaSource source,
+        MediaServerAuthConfig? auth,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = BuildEmbyCompatibleRequest(source.BaseUrl, "Library/VirtualFolders", auth, source.ProtocolKind);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            return response.IsSuccessStatusCode;
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<bool> TryCanUseEmbyCompatibleItemsAsync(
+        MediaSource source,
+        MediaServerAuthConfig? auth,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = BuildEmbyCompatibleRequest(
+                source.BaseUrl,
+                "Items?Recursive=true&IncludeItemTypes=Movie,Episode&Limit=1",
+                auth,
+                source.ProtocolKind);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            return response.IsSuccessStatusCode;
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
+    }
+
     private async Task<MediaServerAuthConfig?> TryAuthenticateEmbyCompatibleUserAsync(
         MediaSource source,
         string username,
@@ -504,11 +590,20 @@ public sealed record MediaServerFileEntry(
             return null;
         }
 
-        var request = new HttpRequestMessage(
+        using var request = new HttpRequestMessage(
             HttpMethod.Post,
             BuildUri(source.BaseUrl, "Users/AuthenticateByName", null, source.ProtocolKind));
+        request.Headers.Accept.ParseAdd("application/json");
         request.Headers.TryAddWithoutValidation("X-Emby-Authorization", CreateEmbyAuthorizationHeader(source.ProtocolLabel));
-        request.Content = JsonContent.Create(new EmbyAuthenticateByNameRequest(username, password));
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(new Dictionary<string, string>
+            {
+                ["Username"] = username,
+                ["Pw"] = password,
+                ["Password"] = password
+            }),
+            Encoding.UTF8,
+            "application/json");
 
         try
         {
@@ -545,6 +640,11 @@ public sealed record MediaServerFileEntry(
     private static bool IsWholeLibraryFallbackStatus(System.Net.HttpStatusCode? statusCode)
     {
         return statusCode is System.Net.HttpStatusCode.NotFound;
+    }
+
+    private static bool IsAuthenticationFailureStatus(System.Net.HttpStatusCode? statusCode)
+    {
+        return statusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden;
     }
 
     private static string CreateEmbyAuthorizationHeader(string protocolLabel)
@@ -616,6 +716,28 @@ public sealed record MediaServerFileEntry(
         if (protocol == MediaSourceProtocol.Plex)
         {
             ApplyPlexHeaders(request, auth?.Token);
+        }
+
+        return request;
+    }
+
+    private static HttpRequestMessage BuildEmbyCompatibleRequest(
+        string baseUrl,
+        string relativePath,
+        MediaServerAuthConfig? auth,
+        MediaSourceProtocol? protocol)
+    {
+        var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            BuildUri(baseUrl, relativePath, auth, protocol));
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.TryAddWithoutValidation(
+            "X-Emby-Authorization",
+            CreateEmbyAuthorizationHeader(protocol == MediaSourceProtocol.Jellyfin ? "Jellyfin" : "Emby"));
+        if (!string.IsNullOrWhiteSpace(auth?.Token))
+        {
+            request.Headers.TryAddWithoutValidation("X-Emby-Token", auth.Token.Trim());
+            request.Headers.TryAddWithoutValidation("X-MediaBrowser-Token", auth.Token.Trim());
         }
 
         return request;

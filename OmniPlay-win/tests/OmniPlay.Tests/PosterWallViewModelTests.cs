@@ -1682,6 +1682,175 @@ public sealed class PosterWallViewModelTests
     }
 
     [Fact]
+    public async Task AddFolderSourceCommand_KeepsSourceEntryCommandsAvailableDuringNewSourceScan()
+    {
+        var scanner = new FakeLibraryScanner
+        {
+            ScanStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            ContinueScan = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var folderPicker = new FakeFolderPickerService
+        {
+            NextPath = CreateFolder()
+        };
+        var viewModel = CreateViewModel(
+            new FakeVideoFileRepository(),
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()),
+            scanner: scanner,
+            folderPickerService: folderPicker);
+        var discoveredSource = new NetworkSourceDiscoveryItem
+        {
+            Name = "NAS",
+            ProtocolType = "smb",
+            BaseUrl = @"\\192.168.1.10"
+        };
+
+        var addTask = viewModel.AddFolderSourceCommand.ExecuteAsync(null);
+        await scanner.ScanStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(viewModel.IsLibraryScanInProgress);
+        Assert.False(viewModel.IsBusy);
+        Assert.True(viewModel.AddFolderSourceCommand.CanExecute(null));
+        Assert.True(viewModel.OpenManualNetworkLoginCommand.CanExecute(null));
+        Assert.True(viewModel.OpenMediaServerPanelCommand.CanExecute(null));
+        Assert.True(viewModel.OpenNetworkLoginCommand.CanExecute(discoveredSource));
+
+        scanner.ContinueScan.SetResult(true);
+        await addTask.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task OpenDetailCommand_DoesNotCancelRunningScanOrOverwriteProgressStatus()
+    {
+        var videoRepository = new FakeVideoFileRepository();
+        videoRepository.MovieFilesById[1] =
+        [
+            CreateVideoItem(CreateMediaFile(), id: "movie-file")
+        ];
+        var movieRepository = new FakeMovieRepository();
+        movieRepository.Movies.Add(CreateSettledMovie(1, "Alpha"));
+        var mediaSourceRepository = new FakeMediaSourceRepository();
+        mediaSourceRepository.Sources.Add(new MediaSource
+        {
+            Id = 1,
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = CreateFolder()
+        });
+        var scanner = new FakeLibraryScanner
+        {
+            ScanStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            ContinueScan = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            CancellationObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var viewModel = CreateViewModel(
+            videoRepository,
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()),
+            mediaSourceRepository,
+            scanner: scanner,
+            movieRepository: movieRepository);
+
+        await viewModel.LoadAsync();
+        var poster = Assert.Single(viewModel.LibraryItems);
+
+        var scanTask = viewModel.ScanAsync();
+        await scanner.ScanStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var progressStatus = viewModel.StatusMessage;
+
+        await viewModel.OpenDetailCommand.ExecuteAsync(poster);
+
+        Assert.True(viewModel.IsDetailOpen);
+        Assert.True(viewModel.IsLibraryScanInProgress);
+        Assert.Equal(progressStatus, viewModel.StatusMessage);
+        Assert.False(scanner.CancellationObserved.Task.IsCompleted);
+
+        viewModel.CloseDetailCommand.Execute(null);
+        Assert.False(viewModel.IsDetailOpen);
+        Assert.True(viewModel.IsLibraryScanInProgress);
+        Assert.Equal(progressStatus, viewModel.StatusMessage);
+
+        scanner.ContinueScan.SetResult(true);
+        await scanTask.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task ScanAsync_PinsNewPosterAtFrontUntilMetadataSettles()
+    {
+        var movieRepository = new FakeMovieRepository();
+        movieRepository.Movies.Add(CreateSettledMovie(1, "Alpha"));
+        movieRepository.Movies.Add(CreateSettledMovie(2, "Bravo"));
+        var mediaSourceRepository = new FakeMediaSourceRepository();
+        mediaSourceRepository.Sources.Add(new MediaSource
+        {
+            Id = 1,
+            Name = "Movies",
+            ProtocolType = "local",
+            BaseUrl = CreateFolder()
+        });
+        var metadataEnricher = new FakeLibraryMetadataEnricher
+        {
+            MovieMetadataStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            ContinueMovieMetadata = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            MovieMetadataResult = new LibraryMetadataEnrichmentSummary(UpdatedMovieCount: 1, DownloadedPosterCount: 1)
+        };
+        metadataEnricher.BeforeMovieMetadataReturns = movieId =>
+        {
+            var movie = movieRepository.Movies.Single(movie => movie.Id == movieId);
+            movie.Title = "Charlie";
+            movie.ReleaseDate = "2024-01-01";
+            movie.Overview = "Updated";
+            movie.PosterPath = CreateMediaFile();
+            movie.VoteAverage = 8.4;
+            movie.ProductionCountryCodes = "US";
+            movie.MetadataLanguage = TmdbSettings.DefaultLanguage;
+        };
+        var scanner = new FakeLibraryScanner
+        {
+            ScanSourceHandler = async (_, afterItemIndexed, cancellationToken) =>
+            {
+                movieRepository.Movies.Add(new Movie
+                {
+                    Id = 3,
+                    Title = "Zulu Placeholder"
+                });
+
+                if (afterItemIndexed is not null)
+                {
+                    await afterItemIndexed(new LibraryScanIndexedItem(3, "Zulu Placeholder", "movie", 1), cancellationToken);
+                }
+
+                return new LibraryScanSummary(1, 1, 1);
+            }
+        };
+        var viewModel = CreateViewModel(
+            new FakeVideoFileRepository(),
+            new FakePlaybackLauncher(),
+            new SettingsViewModel(new FakeSettingsService(), new FakeTmdbConnectionTester()),
+            new PlayerViewModel(new FakeMediaPlayer()),
+            mediaSourceRepository,
+            scanner: scanner,
+            movieRepository: movieRepository,
+            metadataEnricher: metadataEnricher);
+
+        await viewModel.LoadAsync();
+        Assert.Equal(["Alpha", "Bravo"], viewModel.LibraryItems.Select(item => item.Title).ToArray());
+
+        var scanTask = viewModel.ScanAsync();
+        await metadataEnricher.MovieMetadataStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(["Zulu Placeholder", "Alpha", "Bravo"], viewModel.LibraryItems.Select(item => item.Title).ToArray());
+
+        metadataEnricher.ContinueMovieMetadata.SetResult(true);
+        await scanTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(["Alpha", "Bravo", "Charlie"], viewModel.LibraryItems.Select(item => item.Title).ToArray());
+    }
+
+    [Fact]
     public async Task RemoveSourceCommand_CancelsRunningScanAsync()
     {
         var sourcePath = CreateFolder();
@@ -1911,6 +2080,21 @@ public sealed class PosterWallViewModelTests
             SeasonNumber = seasonNumber,
             EpisodeNumber = episodeNumber,
             EpisodeLabel = episodeLabel ?? string.Empty
+        };
+    }
+
+    private static Movie CreateSettledMovie(long id, string title)
+    {
+        return new Movie
+        {
+            Id = id,
+            Title = title,
+            ReleaseDate = "2024-01-01",
+            Overview = "Overview",
+            PosterPath = CreateMediaFile(),
+            VoteAverage = 8.0,
+            ProductionCountryCodes = "US",
+            MetadataLanguage = TmdbSettings.DefaultLanguage
         };
     }
 
@@ -2306,6 +2490,8 @@ public sealed class PosterWallViewModelTests
     {
         public LibraryScanSummary Summary { get; set; } = new(0, 0, 0);
 
+        public Func<long, Func<LibraryScanIndexedItem, CancellationToken, Task>?, CancellationToken, Task<LibraryScanSummary>>? ScanSourceHandler { get; set; }
+
         public int CallCount { get; private set; }
 
         public TaskCompletionSource<bool>? ScanStarted { get; set; }
@@ -2340,6 +2526,12 @@ public sealed class PosterWallViewModelTests
             Func<LibraryScanIndexedItem, CancellationToken, Task>? afterItemIndexed = null,
             bool deferUnidentifiedGroups = false)
         {
+            if (ScanSourceHandler is not null)
+            {
+                CallCount++;
+                return await ScanSourceHandler(sourceId, afterItemIndexed, cancellationToken);
+            }
+
             return await ScanAllAsync(cancellationToken);
         }
 
@@ -2395,6 +2587,10 @@ public sealed class PosterWallViewModelTests
 
     private sealed class FakeLibraryMetadataEnricher : ILibraryMetadataEnricher
     {
+        public LibraryMetadataEnrichmentSummary MovieMetadataResult { get; set; } = new();
+
+        public Action<long>? BeforeMovieMetadataReturns { get; set; }
+
         public TaskCompletionSource<bool>? MovieMetadataStarted { get; set; }
 
         public TaskCompletionSource<bool>? ContinueMovieMetadata { get; set; }
@@ -2425,7 +2621,8 @@ public sealed class PosterWallViewModelTests
                 }
             }
 
-            return new LibraryMetadataEnrichmentSummary();
+            BeforeMovieMetadataReturns?.Invoke(movieId);
+            return MovieMetadataResult;
         }
 
         public Task<LibraryMetadataEnrichmentSummary> EnrichMissingTvShowMetadataAsync(long tvShowId, TmdbSettings? settings = null, CancellationToken cancellationToken = default)

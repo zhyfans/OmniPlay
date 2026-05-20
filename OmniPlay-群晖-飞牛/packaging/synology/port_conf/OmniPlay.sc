@@ -1,5 +1,5 @@
 [OmniPlay]
-title="OmniPlay Web/API"
-desc="OmniPlay NAS media library and web player."
-port_forward="yes"
+title="OmniPlay"
+desc="OmniPlay"
+port_forward="no"
 dst.ports="45721/tcp"

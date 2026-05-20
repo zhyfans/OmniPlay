@@ -2,7 +2,55 @@
 
 PACKAGE="OmniPlay"
 APP_ROOT="/var/packages/${PACKAGE}/home"
+LOG_FILE="/tmp/omniplay-postuninst.log"
+
+log() {
+  printf '%s\n' "$*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+env_value() {
+  eval "printf '%s' \"\${$1:-}\""
+}
+
+truthy() {
+  case "$1" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+should_clear_data() {
+  for NAME in clear_data pkgwizard_clear_data delete_data pkgwizard_delete_data SYNOPKG_PKGVAR_clear_data SYNOPKG_PKGVAR_delete_data; do
+    VALUE="$(env_value "${NAME}")"
+    if truthy "${VALUE}"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
 
 rm -f "${APP_ROOT}/omniplay.pid"
+
+if should_clear_data; then
+  case "${APP_ROOT}" in
+    /var/packages/"${PACKAGE}"/home)
+      log "clearing data under ${APP_ROOT}"
+      rm -rf \
+        "${APP_ROOT}/cache" \
+        "${APP_ROOT}/data" \
+        "${APP_ROOT}/logs" \
+        "${APP_ROOT}/settings" \
+        "${APP_ROOT}/omniplay.pid" \
+        2>/dev/null || true
+      rmdir "${APP_ROOT}" 2>/dev/null || true
+      ;;
+    *)
+      log "refusing to clear unexpected APP_ROOT=${APP_ROOT}"
+      ;;
+  esac
+else
+  log "keeping data under ${APP_ROOT}"
+fi
 
 exit 0

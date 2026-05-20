@@ -1639,30 +1639,45 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
 
     private async Task DownloadBinaryAsync(Uri sourceUri, string destinationPath, CancellationToken cancellationToken)
     {
-        var tempPath = destinationPath + ".tmp";
-        if (File.Exists(tempPath))
+        var directory = Path.GetDirectoryName(destinationPath);
+        if (!string.IsNullOrWhiteSpace(directory))
         {
-            File.Delete(tempPath);
+            Directory.CreateDirectory(directory);
         }
 
-        using var response = await httpClient.GetAsync(
-            sourceUri,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken);
-        response.EnsureSuccessStatusCode();
+        var tempPath = Path.Combine(
+            string.IsNullOrWhiteSpace(directory) ? Path.GetTempPath() : directory,
+            $"{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
 
-        await using (var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken))
-        await using (var localFile = File.Create(tempPath))
+        try
         {
-            await responseStream.CopyToAsync(localFile, cancellationToken);
-        }
+            using var response = await httpClient.GetAsync(
+                sourceUri,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+            response.EnsureSuccessStatusCode();
 
-        if (File.Exists(destinationPath))
+            await using (var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken))
+            await using (var localFile = File.Create(tempPath))
+            {
+                await responseStream.CopyToAsync(localFile, cancellationToken);
+            }
+
+            File.Move(tempPath, destinationPath, overwrite: true);
+        }
+        finally
         {
-            File.Delete(destinationPath);
+            if (File.Exists(tempPath))
+            {
+                try
+                {
+                    File.Delete(tempPath);
+                }
+                catch
+                {
+                }
+            }
         }
-
-        File.Move(tempPath, destinationPath);
     }
 
     private sealed class TmdbSearchResponse

@@ -47,6 +47,7 @@ export interface AppSettingsSnapshot {
   cache: CacheSettings;
   playback: PlaybackSettings;
   proxy: ProxySettings;
+  automation: AutomationSettings;
 }
 
 export interface TmdbSettings {
@@ -93,6 +94,14 @@ export interface PlaybackSettings {
   hlsRemux: boolean;
   transcode: boolean;
   showEpisodeDetails: boolean;
+  playbackQualityPreference: "original-priority" | "auto" | "compatibility" | string;
+  defaultAudioLanguage: "smart" | "en" | "ja" | "zh" | string;
+  defaultSubtitleLanguage: "en" | "zh" | string;
+}
+
+export interface AutomationSettings {
+  scheduledLibraryRefreshEnabled: boolean;
+  scheduledLibraryRefreshIntervalHours: number;
 }
 
 export interface AppSettingsUpdateRequest {
@@ -100,6 +109,7 @@ export interface AppSettingsUpdateRequest {
   cache?: CacheSettings;
   playback?: PlaybackSettings;
   proxy?: ProxySettings;
+  automation?: AutomationSettings;
 }
 
 export interface LibraryRefreshRequest {
@@ -167,6 +177,8 @@ export interface LibraryItemCustomMetadataUpdateRequest {
   overview: string | null;
   voteAverage: number | null;
   posterFile?: File | null;
+  episodeId?: string | null;
+  episodeSubtitle?: string | null;
 }
 
 export interface LibraryItemDetail extends LibraryItemSummary {
@@ -283,6 +295,8 @@ export interface LibraryMetadataEnrichmentProgress {
   currentItemId: string | null;
   currentTitle: string | null;
   updatedAt: string;
+  phaseTargetCount?: number | null;
+  phaseProcessedCount?: number | null;
 }
 
 export interface LibraryMetadataEnrichmentStatus {
@@ -306,6 +320,7 @@ export interface PlaybackDecision {
   sessionId: string | null;
   isReady: boolean;
   reason: string | null;
+  durationSeconds: number | null;
 }
 
 export interface PlaybackCacheStatus {
@@ -335,6 +350,10 @@ export interface HlsPlaybackProfile {
   embeddedSubtitleStreamIndex: number | null;
   preferHardwareAcceleration: boolean;
   hardwareEncoder: string | null;
+  hardwareDecoder: string | null;
+  hardwareAcceleration: string | null;
+  toneMapToSdr: boolean;
+  toneMapMode: string;
   cacheKey: string;
 }
 
@@ -695,6 +714,10 @@ export async function updateLibraryItemCustomMetadata(
   body.set("releaseDate", request.releaseDate ?? "");
   body.set("overview", request.overview ?? "");
   body.set("voteAverage", request.voteAverage === null ? "" : String(request.voteAverage));
+  if (request.episodeId) {
+    body.set("episodeId", request.episodeId);
+    body.set("episodeSubtitle", request.episodeSubtitle ?? "");
+  }
   if (request.posterFile) {
     body.set("poster", request.posterFile);
   }
@@ -854,7 +877,10 @@ export async function getPlaybackSubtitles(videoFileId: string): Promise<Playbac
 }
 
 export async function stopHlsSession(sessionId: string): Promise<void> {
-  const response = await fetch(`/api/playback/hls/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
+  const response = await fetch(`/api/playback/hls/${encodeURIComponent(sessionId)}/stop`, {
+    method: "POST",
+    keepalive: true,
+  });
   await readEmptyResponse(response);
 }
 

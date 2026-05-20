@@ -19,4 +19,8 @@ if [ -n "${SYNOPKG_PKGVER:-}" ]; then
   printf '%s\n' "${SYNOPKG_PKGVER}" > "${APP_ROOT}/settings/package-version"
 fi
 
+if [ -x "/var/packages/${PACKAGE}/scripts/start-stop-status" ]; then
+  "/var/packages/${PACKAGE}/scripts/start-stop-status" start >/dev/null 2>&1 || true
+fi
+
 exit 0

@@ -22,6 +22,8 @@
 *.swp
 *.swo
 *~
+*.bak
+*.orig
 
 # Local environment, signing material, and secrets
 .env
@@ -34,6 +36,10 @@
 *.pem
 *.key
 *.crt
+*.keystore
+*.jks
+local.properties
+LICENSE(*.local)
 
 # Logs and local data
 *.log
@@ -44,6 +50,19 @@
 *.sqlite-wal
 TestResults/
 Logs/
+stdout
+**/stdout
+.bytro
+**/.bytro
+tmp_test.txt
+**/tmp_test.txt
+
+# Local screenshots and manual test captures
+屏幕截图*
+截图*
+截屏*
+Screenshot*
+Screen Shot*
 
 # Keep SQLite fixtures that are part of the vendored GRDB test suite.
 !OmniPlay开源-mac-ARM/GRDB.swift-master/Tests/**/*.sqlite
@@ -73,6 +92,9 @@ publish/
 *.exe
 *.app
 *.ipa
+*.apk
+*.aab
+*.ap_
 *.xcarchive/
 *.dSYM
 *.dSYM/
@@ -91,6 +113,8 @@ xcuserdata/
 *.hmap
 .build/
 **/.build/
+.swiftpm/
+**/.swiftpm/
 .swiftpm/xcode/xcuserdata/
 **/.swiftpm/xcode/xcuserdata/
 
@@ -136,6 +160,19 @@ fastlane/test_output/
 packages/
 .nuget/
 .dotnet/
+.dotnet-sdk/
+**/.dotnet-sdk/
+
+# Node / web frontend dependencies and generated caches
+node_modules/
+**/node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.vite/
+**/.vite/
 
 # Windows native runtime binaries are large local dependencies.
 # Keep them outside git, or use Git LFS / GitHub Releases if they
@@ -148,3 +185,15 @@ OmniPlay-win/src/OmniPlay.Desktop/Native/mpv/*.dll
 # ============================================================
 *.xcframework/
 *.framework/
+
+# ============================================================
+# Android / Gradle
+# ============================================================
+.gradle/
+**/.gradle/
+captures/
+**/captures/
+app/build/
+**/app/build/
+mapping/
+**/mapping/

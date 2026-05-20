@@ -1,0 +1,13 @@
+.git
+.DS_Store
+**/.DS_Store
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+build
+data
+logs
+cache
+tmp

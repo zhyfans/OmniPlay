@@ -1,14 +1,18 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.FileProviders;
+using OmniPlay.Api;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
 using OmniPlay.Core.Runtime;
 using OmniPlay.Infrastructure.Data;
 using OmniPlay.Infrastructure.FileSystem;
 using OmniPlay.Infrastructure.Library;
+using OmniPlay.Infrastructure.Maintenance;
 using OmniPlay.Infrastructure.Network;
 using OmniPlay.Infrastructure.SystemChecks;
 using OmniPlay.Infrastructure.Tmdb;
@@ -55,9 +59,12 @@ builder.Services.AddSingleton<IMediaSourceCleanupService, MediaSourceCleanupServ
 builder.Services.AddSingleton<ICacheUsageService, CacheUsageService>();
 builder.Services.AddSingleton<IWebDavCacheCleanupService, WebDavCacheCleanupService>();
 builder.Services.AddSingleton<IBackgroundTaskCenter, InMemoryBackgroundTaskCenter>();
+builder.Services.AddSingleton<CacheMaintenanceCoordinator>();
+builder.Services.AddHostedService<CacheMaintenanceHostedService>();
 builder.Services.AddSingleton<ILibraryMetadataEnricher, LibraryMetadataEnricher>();
 builder.Services.AddSingleton<IScanStatusStore, InMemoryScanStatusStore>();
 builder.Services.AddSingleton<ILibraryScanJobService, LibraryScanJobService>();
+builder.Services.AddHostedService<LibraryRefreshSchedulerHostedService>();
 builder.Services.AddSingleton<IMetadataEnrichmentStatusStore, InMemoryMetadataEnrichmentStatusStore>();
 builder.Services.AddSingleton<ILibraryMetadataEnrichmentJobService, LibraryMetadataEnrichmentJobService>();
 builder.Services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
@@ -84,6 +91,7 @@ builder.Services.AddSingleton<IRuntimeSelfCheckService>(serviceProvider => new R
 Console.WriteLine("[OmniPlay] Building app...");
 var app = builder.Build();
 Console.WriteLine("[OmniPlay] App built.");
+var playbackTickets = new ConcurrentDictionary<string, PlaybackAccessTicket>(StringComparer.Ordinal);
 
 Console.WriteLine("[OmniPlay] Preparing runtime directories...");
 var storagePaths = app.Services.GetRequiredService<IStoragePaths>();
@@ -106,6 +114,12 @@ if (Directory.Exists(webRoot))
 app.Use(async (context, next) =>
 {
     if (!RequiresAuthenticatedApi(context.Request.Path))
+    {
+        await next();
+        return;
+    }
+
+    if (TryAuthorizePlaybackTicket(context, playbackTickets))
     {
         await next();
         return;
@@ -674,6 +688,13 @@ app.MapPost("/api/library/items/{id}/metadata/apply", async (
         return Results.BadRequest(new { error = "请提供有效的 TMDB 匹配项。" });
     }
 
+    var item = await repository.GetItemDetailAsync(id, cancellationToken);
+    if (item is null)
+    {
+        return Results.NotFound();
+    }
+
+    var sourceMetadata = ResolveSourceSearchMetadata(item.VideoFiles);
     var settings = (await settingsRepository.GetAsync(cancellationToken)).Tmdb;
     var selectedMatch = await tmdbClient.GetDetailsAsync(
         match.MediaType,
@@ -695,7 +716,7 @@ app.MapPost("/api/library/items/{id}/metadata/apply", async (
             id,
             selectedMatch.Id,
             selectedMatch.MediaType,
-            selectedMatch.Title,
+            ResolveMetadataDisplayTitle(selectedMatch.Title, sourceMetadata),
             selectedMatch.Overview,
             selectedMatch.ReleaseDate,
             selectedMatch.PosterPath,
@@ -852,40 +873,50 @@ app.MapGet("/api/playback/decision/{fileId}", async (
     CancellationToken cancellationToken) =>
 {
     var playbackSettings = (await settingsRepository.GetAsync(cancellationToken)).Playback;
+    var effectiveQuality = ResolveEffectiveQuality(quality, playbackSettings.PlaybackQualityPreference);
     var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
     if (remoteFile is not null)
     {
         var remoteProbe = CreateProbeFromStoredMetadata(remoteFile);
+        var remoteSourceVideoCodec = ResolveSourceVideoCodec(remoteFile.FileName, remoteProbe);
+        var remoteDynamicRange = AnalyzeSourceDynamicRange(remoteFile.FileName, remoteProbe);
+        var remoteToneMapToSdr = remoteDynamicRange.ShouldToneMapToSdr;
         var remotePlan = ResolvePlaybackPlan(remoteFile.FileName, remoteProbe);
+        var remoteDurationSeconds = ResolvePlaybackDurationSeconds(remoteProbe, remoteFile.DurationSeconds);
         var remoteEmbeddedSubtitleStreamIndex = ResolveEmbeddedSubtitleStreamIndex(subtitleId);
+        var remoteEmbeddedSubtitleCodec = ResolveEmbeddedSubtitleCodec(remoteProbe, remoteEmbeddedSubtitleStreamIndex);
         var remoteSubtitlePath = remoteEmbeddedSubtitleStreamIndex.HasValue
             ? null
             : await playbackSubtitleService.ResolveSubtitlePathAsync(remoteFile.Id, subtitleId, cancellationToken);
         var remoteRequestedSubtitleMode = NormalizeSubtitleMode(subtitleMode, remoteSubtitlePath, remoteEmbeddedSubtitleStreamIndex);
         var remoteProfile = await ResolveRequestedProfileAsync(
             remotePlan.Profile,
-            quality,
+            effectiveQuality,
             audioTrackIndex,
             remoteRequestedSubtitleMode,
             remoteSubtitlePath,
             remoteEmbeddedSubtitleStreamIndex,
-            remoteProbe?.VideoCodec,
+            remoteEmbeddedSubtitleCodec,
+            remoteSourceVideoCodec,
             hardware,
+            remoteToneMapToSdr,
+            remoteDynamicRange.ToneMapMode,
             hlsSessionService,
             cancellationToken);
-        var remoteMode = ResolveRequestedMode(remotePlan.Mode, remoteProfile, quality, audioTrackIndex, remoteRequestedSubtitleMode);
+        var remoteMode = ResolveRequestedMode(remotePlan.Mode, remoteProfile, effectiveQuality, audioTrackIndex, remoteRequestedSubtitleMode);
         var remotePolicy = await ApplyPlaybackSettingsAsync(
             remoteFile.Id,
             remotePlan,
             remoteProfile,
             remoteMode,
             playbackSettings,
-            quality,
+            effectiveQuality,
             audioTrackIndex,
             remoteRequestedSubtitleMode,
             remoteSubtitlePath,
             remoteEmbeddedSubtitleStreamIndex,
-            remoteProbe?.VideoCodec,
+            remoteEmbeddedSubtitleCodec,
+            remoteSourceVideoCodec,
             hardware,
             hlsSessionService,
             cancellationToken);
@@ -903,7 +934,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
                 null,
                 null,
                 true,
-                $"{remotePolicy.Reason} WebDAV 使用 Range 分段代理。"));
+                $"{remotePolicy.Reason} WebDAV 使用 Range 分段代理。",
+                remoteDurationSeconds));
         }
 
         var cachedPath = await cacheService.EnsureCachedAsync(remoteFile.Id, cancellationToken);
@@ -916,7 +948,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
                 null,
                 null,
                 false,
-                "WebDAV 文件需要完整缓存后才能进入 HLS 播放，请等待缓存完成后重试。"));
+                "WebDAV 文件需要完整缓存后才能进入 HLS 播放，请等待缓存完成后重试。",
+                remoteDurationSeconds));
         }
 
         var remoteCachedFile = remoteFile with { AbsolutePath = cachedPath };
@@ -930,7 +963,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
                 null,
                 remoteSession.SessionId,
                 false,
-                remoteSession.ErrorMessage));
+                remoteSession.ErrorMessage,
+                remoteDurationSeconds));
         }
 
         return Results.Ok(new PlaybackDecision(
@@ -940,7 +974,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
             $"/api/playback/hls/{Uri.EscapeDataString(remoteSession.SessionId)}/index.m3u8",
             remoteSession.SessionId,
             remoteSession.IsReady,
-            remoteSession.IsReady ? ResolveProfileReason(remotePolicy.Reason, remotePolicy.Profile) : "HLS 正在准备。"));
+            remoteSession.IsReady ? ResolveProfileReason(remotePolicy.Reason, remotePolicy.Profile) : "HLS 正在准备。",
+            remoteDurationSeconds));
     }
 
     var file = await playableFileResolver.ResolveAsync(fileId, cancellationToken);
@@ -968,36 +1003,45 @@ app.MapGet("/api/playback/decision/{fileId}", async (
         probe = CreateProbeFromStoredMetadata(file);
     }
 
+    var sourceVideoCodec = ResolveSourceVideoCodec(file.FileName, probe);
+    var dynamicRange = AnalyzeSourceDynamicRange(file.FileName, probe);
+    var toneMapToSdr = dynamicRange.ShouldToneMapToSdr;
     var plan = ResolvePlaybackPlan(file.FileName, probe);
+    var durationSeconds = ResolvePlaybackDurationSeconds(probe, file.DurationSeconds);
     var embeddedSubtitleStreamIndex = ResolveEmbeddedSubtitleStreamIndex(subtitleId);
+    var embeddedSubtitleCodec = ResolveEmbeddedSubtitleCodec(probe, embeddedSubtitleStreamIndex);
     var subtitlePath = embeddedSubtitleStreamIndex.HasValue
         ? null
         : await playbackSubtitleService.ResolveSubtitlePathAsync(file.Id, subtitleId, cancellationToken);
     var requestedSubtitleMode = NormalizeSubtitleMode(subtitleMode, subtitlePath, embeddedSubtitleStreamIndex);
     var profile = await ResolveRequestedProfileAsync(
         plan.Profile,
-        quality,
+        effectiveQuality,
         audioTrackIndex,
         requestedSubtitleMode,
         subtitlePath,
         embeddedSubtitleStreamIndex,
-        probe?.VideoCodec,
+        embeddedSubtitleCodec,
+        sourceVideoCodec,
         hardware,
+        toneMapToSdr,
+        dynamicRange.ToneMapMode,
         hlsSessionService,
         cancellationToken);
-    var mode = ResolveRequestedMode(plan.Mode, profile, quality, audioTrackIndex, requestedSubtitleMode);
+    var mode = ResolveRequestedMode(plan.Mode, profile, effectiveQuality, audioTrackIndex, requestedSubtitleMode);
     var policy = await ApplyPlaybackSettingsAsync(
         file.Id,
         plan,
         profile,
         mode,
         playbackSettings,
-        quality,
+        effectiveQuality,
         audioTrackIndex,
         requestedSubtitleMode,
         subtitlePath,
         embeddedSubtitleStreamIndex,
-        probe?.VideoCodec,
+        embeddedSubtitleCodec,
+        sourceVideoCodec,
         hardware,
         hlsSessionService,
         cancellationToken);
@@ -1017,7 +1061,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
             null,
             null,
             true,
-            policy.Reason));
+            policy.Reason,
+            durationSeconds));
     }
 
     var session = await hlsSessionService.EnsureSessionAsync(file, profile, cancellationToken);
@@ -1030,7 +1075,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
             null,
             session.SessionId,
             false,
-            session.ErrorMessage));
+            session.ErrorMessage,
+            durationSeconds));
     }
 
     return Results.Ok(new PlaybackDecision(
@@ -1040,7 +1086,8 @@ app.MapGet("/api/playback/decision/{fileId}", async (
         $"/api/playback/hls/{Uri.EscapeDataString(session.SessionId)}/index.m3u8",
         session.SessionId,
         session.IsReady,
-        session.IsReady ? ResolveProfileReason(policy.Reason, profile) : "HLS 正在准备。"));
+        session.IsReady ? ResolveProfileReason(policy.Reason, profile) : "HLS 正在准备。",
+        durationSeconds));
 });
 
 app.MapGet("/api/playback/diagnostics/{fileId}", async (
@@ -1118,6 +1165,21 @@ app.MapPost("/api/playback/files/{fileId}/cache/cancel", async (
     return status is null ? Results.NotFound() : Results.Ok(status);
 });
 
+app.MapPost("/api/playback/files/{fileId}/ticket", (string fileId) =>
+{
+    CleanupExpiredPlaybackTickets(playbackTickets);
+    var token = RandomNumberGenerator.GetHexString(32);
+    var expiresAt = DateTimeOffset.UtcNow.AddMinutes(30);
+    playbackTickets[token] = new PlaybackAccessTicket(fileId, expiresAt);
+
+    return Results.Ok(new
+    {
+        token,
+        expiresAt,
+        streamUrl = $"/api/playback/files/{Uri.EscapeDataString(fileId)}/stream?ticket={Uri.EscapeDataString(token)}"
+    });
+});
+
 app.MapGet("/api/playback/files/{fileId}/stream", async (
     string fileId,
     HttpContext httpContext,
@@ -1152,9 +1214,17 @@ app.MapGet("/api/playback/files/{fileId}/stream", async (
 app.MapGet("/api/playback/hls/{sessionId}/{assetName}", (
     string sessionId,
     string assetName,
+    HttpContext httpContext,
     IHlsSessionService hlsSessionService) =>
 {
     var asset = hlsSessionService.GetAsset(sessionId, assetName);
+    if (asset is not null)
+    {
+        httpContext.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+        httpContext.Response.Headers.Pragma = "no-cache";
+        httpContext.Response.Headers.Expires = "0";
+    }
+
     return asset is null
         ? Results.NotFound()
         : Results.File(asset.FullPath, asset.ContentType, enableRangeProcessing: asset.EnableRangeProcessing);
@@ -1256,6 +1326,7 @@ app.MapGet("/api/playback/files/{fileId}/subtitles/{subtitleId}.vtt", async (
     string fileId,
     string subtitleId,
     IPlaybackSubtitleService playbackSubtitleService,
+    IStoragePaths storagePaths,
     CancellationToken cancellationToken) =>
 {
     var subtitlePath = await playbackSubtitleService.ResolveSubtitlePathAsync(fileId, subtitleId, cancellationToken);
@@ -1264,7 +1335,42 @@ app.MapGet("/api/playback/files/{fileId}/subtitles/{subtitleId}.vtt", async (
         return Results.NotFound();
     }
 
-    var webVtt = await ReadSubtitleAsWebVttAsync(subtitlePath, cancellationToken);
+    var webVtt = await ReadSubtitleAsWebVttAsync(subtitlePath, storagePaths, cancellationToken);
+    return webVtt is null
+        ? Results.NotFound()
+        : Results.Text(webVtt, "text/vtt; charset=utf-8");
+});
+
+app.MapGet("/api/playback/files/{fileId}/embedded-subtitles/{subtitleOrdinal:int}.vtt", async (
+    string fileId,
+    int subtitleOrdinal,
+    IPlayableFileResolver playableFileResolver,
+    IWebDavRangeStreamService webDavRangeStreamService,
+    IPlaybackCacheService cacheService,
+    IStoragePaths storagePaths,
+    CancellationToken cancellationToken) =>
+{
+    if (subtitleOrdinal < 0)
+    {
+        return Results.NotFound();
+    }
+
+    var file = await playableFileResolver.ResolveAsync(fileId, cancellationToken);
+    var inputPath = file?.AbsolutePath;
+    if (string.IsNullOrWhiteSpace(inputPath))
+    {
+        var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
+        inputPath = remoteFile is null
+            ? null
+            : await cacheService.EnsureCachedAsync(fileId, cancellationToken);
+    }
+
+    if (string.IsNullOrWhiteSpace(inputPath) || !System.IO.File.Exists(inputPath))
+    {
+        return Results.NotFound();
+    }
+
+    var webVtt = await ReadEmbeddedSubtitleAsWebVttAsync(inputPath, subtitleOrdinal, storagePaths, cancellationToken);
     return webVtt is null
         ? Results.NotFound()
         : Results.Text(webVtt, "text/vtt; charset=utf-8");
@@ -1330,6 +1436,73 @@ static bool RequiresAuthenticatedApi(PathString path)
     }
 
     return !path.StartsWithSegments("/api/auth");
+}
+
+static bool TryAuthorizePlaybackTicket(
+    HttpContext context,
+    ConcurrentDictionary<string, PlaybackAccessTicket> playbackTickets)
+{
+    if (!TryResolvePlaybackTicketFileId(context.Request.Path, out var fileId))
+    {
+        return false;
+    }
+
+    var token = context.Request.Query["ticket"].ToString();
+    if (string.IsNullOrWhiteSpace(token)
+        || !playbackTickets.TryGetValue(token, out var ticket))
+    {
+        return false;
+    }
+
+    if (ticket.ExpiresAt <= DateTimeOffset.UtcNow)
+    {
+        playbackTickets.TryRemove(token, out _);
+        return false;
+    }
+
+    return string.Equals(ticket.FileId, fileId, StringComparison.Ordinal);
+}
+
+static bool TryResolvePlaybackTicketFileId(PathString path, out string fileId)
+{
+    fileId = "";
+    var value = path.Value;
+    const string prefix = "/api/playback/files/";
+    if (string.IsNullOrWhiteSpace(value)
+        || !value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    var remaining = value[prefix.Length..];
+    var separator = remaining.IndexOf('/');
+    if (separator <= 0)
+    {
+        return false;
+    }
+
+    var suffix = remaining[separator..];
+    if (!string.Equals(suffix, "/stream", StringComparison.OrdinalIgnoreCase)
+        && !suffix.StartsWith("/subtitles/", StringComparison.OrdinalIgnoreCase)
+        && !suffix.StartsWith("/embedded-subtitles/", StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    fileId = Uri.UnescapeDataString(remaining[..separator]);
+    return !string.IsNullOrWhiteSpace(fileId);
+}
+
+static void CleanupExpiredPlaybackTickets(ConcurrentDictionary<string, PlaybackAccessTicket> playbackTickets)
+{
+    var now = DateTimeOffset.UtcNow;
+    foreach (var entry in playbackTickets)
+    {
+        if (entry.Value.ExpiresAt <= now)
+        {
+            playbackTickets.TryRemove(entry.Key, out _);
+        }
+    }
 }
 
 static void SetSessionCookie(HttpContext context, AuthSession session)
@@ -1442,7 +1615,9 @@ static async Task<LibraryItemCustomMetadataUpdateRequest?> ReadCustomMetadataReq
         ReadFormDouble(form, "voteAverage"),
         posterLocalPath,
         posterFile is { Length: > 0 } ? posterFile.FileName : null,
-        LockMetadata: true);
+        LockMetadata: true,
+        EpisodeId: ReadFormString(form, "episodeId"),
+        EpisodeSubtitle: ReadFormString(form, "episodeSubtitle"));
 }
 
 static async Task<string> SaveCustomPosterAsync(
@@ -1697,6 +1872,7 @@ static async Task<PlaybackDiagnostics?> BuildPlaybackDiagnosticsAsync(
     CancellationToken cancellationToken)
 {
     var settings = await settingsRepository.GetAsync(cancellationToken);
+    var effectiveQuality = ResolveEffectiveQuality(quality, settings.Playback.PlaybackQualityPreference);
     var cacheStatus = await cacheService.GetStatusAsync(fileId, cancellationToken);
     var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
     var isRemote = remoteFile is not null;
@@ -1714,36 +1890,44 @@ static async Task<PlaybackDiagnostics?> BuildPlaybackDiagnosticsAsync(
     }
 
     probe ??= CreateProbeFromStoredMetadata(file);
+    var sourceVideoCodec = ResolveSourceVideoCodec(file.FileName, probe);
+    var dynamicRange = AnalyzeSourceDynamicRange(file.FileName, probe);
+    var toneMapToSdr = dynamicRange.ShouldToneMapToSdr;
     var plan = ResolvePlaybackPlan(file.FileName, probe);
     var embeddedSubtitleStreamIndex = ResolveEmbeddedSubtitleStreamIndex(subtitleId);
+    var embeddedSubtitleCodec = ResolveEmbeddedSubtitleCodec(probe, embeddedSubtitleStreamIndex);
     var subtitlePath = embeddedSubtitleStreamIndex.HasValue
         ? null
         : await playbackSubtitleService.ResolveSubtitlePathAsync(file.Id, subtitleId, cancellationToken);
     var requestedSubtitleMode = NormalizeSubtitleMode(subtitleMode, subtitlePath, embeddedSubtitleStreamIndex);
     var profile = await ResolveRequestedProfileAsync(
         plan.Profile,
-        quality,
+        effectiveQuality,
         audioTrackIndex,
         requestedSubtitleMode,
         subtitlePath,
         embeddedSubtitleStreamIndex,
-        probe?.VideoCodec,
+        embeddedSubtitleCodec,
+        sourceVideoCodec,
         hardware,
+        toneMapToSdr,
+        dynamicRange.ToneMapMode,
         hlsSessionService,
         cancellationToken);
-    var requestedMode = ResolveRequestedMode(plan.Mode, profile, quality, audioTrackIndex, requestedSubtitleMode);
+    var requestedMode = ResolveRequestedMode(plan.Mode, profile, effectiveQuality, audioTrackIndex, requestedSubtitleMode);
     var policy = await ApplyPlaybackSettingsAsync(
         file.Id,
         plan,
         profile,
         requestedMode,
         settings.Playback,
-        quality,
+        effectiveQuality,
         audioTrackIndex,
         requestedSubtitleMode,
         subtitlePath,
         embeddedSubtitleStreamIndex,
-        probe?.VideoCodec,
+        embeddedSubtitleCodec,
+        sourceVideoCodec,
         hardware,
         hlsSessionService,
         cancellationToken);
@@ -1754,7 +1938,7 @@ static async Task<PlaybackDiagnostics?> BuildPlaybackDiagnosticsAsync(
     var usesHls = effectiveMode.StartsWith("hls", StringComparison.OrdinalIgnoreCase);
     var usesTranscode = string.Equals(effectiveMode, "hls-transcode", StringComparison.OrdinalIgnoreCase)
                         || profile.TranscodeVideo;
-    var burnsSubtitle = string.Equals(requestedSubtitleMode, "burn", StringComparison.OrdinalIgnoreCase)
+    var burnsSubtitle = IsSubtitleBurnMode(requestedSubtitleMode)
                         && (subtitlePath is not null || embeddedSubtitleStreamIndex.HasValue);
     var usesRangeProxy = isRemote && usesDirect;
     var requiresFullCache = isRemote && !usesRangeProxy;
@@ -1775,7 +1959,7 @@ static async Task<PlaybackDiagnostics?> BuildPlaybackDiagnosticsAsync(
         file.FileName,
         isRemote,
         isRemote ? "webdav" : "local",
-        NormalizeQuality(quality),
+        NormalizeQuality(effectiveQuality),
         audioTrackIndex,
         requestedSubtitleMode,
         subtitleId,
@@ -1900,18 +2084,28 @@ static IReadOnlyList<PlaybackDiagnosticStep> BuildDiagnosticSteps(
     if (usesTranscode && string.IsNullOrWhiteSpace(policy.Profile.HardwareEncoder))
     {
         steps.Add(new PlaybackDiagnosticStep(
-            "hardware-transcode",
-            "硬件转码",
+            "hardware-encoder",
+            "硬件编码器",
             "error",
-            "当前请求需要视频转码，但没有检测到可用硬件编码器。已禁止软件转码。"));
+            "FFmpeg 没有检测到可用硬件编码器，转码不会使用软件编码兜底。请检查 /dev/dri 权限、VAAPI 驱动和 FFmpeg 硬件编码能力。"));
     }
-    else if (usesTranscode && !HasRequiredHardwareDecoder(policy.Profile, probe?.VideoCodec))
+
+    if (usesTranscode && policy.Profile.ToneMapToSdr)
     {
+        var toneMapDetail = policy.Profile.ToneMapMode switch
+        {
+            var mode when string.Equals(mode, "hardware", StringComparison.OrdinalIgnoreCase) =>
+                "已启用 VAAPI SDR 色彩转换，并交给硬件编码器输出。",
+            var mode when string.Equals(mode, "dolby-vision", StringComparison.OrdinalIgnoreCase) =>
+                "已启用 Dolby Vision-only 兼容色彩转换，并交给硬件编码器输出。",
+            _ =>
+                "已启用 SDR 色彩转换，并交给硬件编码器输出；当前片源缺少安全硬件 tone map 所需的元数据时会使用兼容滤镜。"
+        };
         steps.Add(new PlaybackDiagnosticStep(
-            "hardware-decode",
-            "硬件解码",
-            "error",
-            "当前请求需要视频转码，但没有检测到源视频对应的硬件解码路径。已禁止软解。"));
+            "tone-map",
+            "HDR/DV 转 SDR",
+            "ok",
+            toneMapDetail));
     }
 
     if (!usesHls && usesRangeProxy)
@@ -1938,15 +2132,40 @@ static IReadOnlyList<PlaybackDiagnosticStep> BuildDiagnosticSteps(
 static PlaybackPlan ResolvePlaybackPlan(string fileName, MediaProbeSnapshot? probe)
 {
     var extension = Path.GetExtension(fileName).ToLowerInvariant();
+    var videoCodec = ResolveSourceVideoCodec(fileName, probe);
+    var dynamicRange = AnalyzeSourceDynamicRange(fileName, probe);
+    var toneMapToSdr = dynamicRange.ShouldToneMapToSdr;
+    if (dynamicRange.IsDolbyVisionOnly)
+    {
+        return new PlaybackPlan(
+            "hls-transcode",
+            HlsPlaybackProfile.Transcode,
+            "该文件是 Dolby Vision-only，按兼容 SDR 路径转为 H.264/AAC HLS 播放。");
+    }
+
     if (probe is null)
     {
+        if (toneMapToSdr)
+        {
+            return new PlaybackPlan("hls-transcode", HlsPlaybackProfile.Transcode, "文件名显示 HDR/DV 视频，转为 H.264 SDR HLS 播放。");
+        }
+
+        if (!string.IsNullOrWhiteSpace(videoCodec) && !IsH264(videoCodec))
+        {
+            return new PlaybackPlan("hls-transcode", HlsPlaybackProfile.Transcode, $"文件名显示视频编码 {videoCodec}，转为 H.264/AAC HLS 播放。");
+        }
+
         return extension is ".mp4" or ".m4v" or ".mov" or ".webm"
             ? new PlaybackPlan("direct", HlsPlaybackProfile.Remux, "媒体探测不可用，兼容容器先使用 Range 直出。")
             : new PlaybackPlan("hls-remux", HlsPlaybackProfile.Remux, "媒体探测不可用，先使用 FFmpeg HLS 转封装。");
     }
 
-    var videoCodec = NormalizeCodec(probe.VideoCodec);
     var audioCodec = NormalizeCodec(probe.AudioCodec);
+
+    if (toneMapToSdr)
+    {
+        return new PlaybackPlan("hls-transcode", HlsPlaybackProfile.Transcode, "HDR/DV 视频转为 H.264 SDR HLS 播放，避免浏览器色彩异常。");
+    }
 
     if (extension is ".webm"
         && videoCodec is "vp8" or "vp9" or "av1"
@@ -1967,7 +2186,7 @@ static PlaybackPlan ResolvePlaybackPlan(string fileName, MediaProbeSnapshot? pro
         return new PlaybackPlan("hls-remux", HlsPlaybackProfile.Remux, "视频编码兼容，使用 FFmpeg HLS 转封装并转 AAC 音频。");
     }
 
-    return new PlaybackPlan("hls-transcode", HlsPlaybackProfile.Transcode, $"当前 HLS 播放需要将视频编码 {videoCodec} 转为硬件输出流/AAC。");
+    return new PlaybackPlan("hls-transcode", HlsPlaybackProfile.Transcode, $"当前 HLS 播放需要将视频编码 {videoCodec} 转为 H.264/AAC。");
 }
 
 static MediaProbeSnapshot? CreateProbeFromStoredMetadata(PlayableVideoFile file)
@@ -1992,6 +2211,16 @@ static MediaProbeSnapshot? CreateProbeFromStoredMetadata(PlayableVideoFile file)
         []);
 }
 
+static double ResolvePlaybackDurationSeconds(MediaProbeSnapshot? probe, double storedDurationSeconds)
+{
+    if (probe?.DurationSeconds > 0)
+    {
+        return probe.DurationSeconds;
+    }
+
+    return storedDurationSeconds > 0 ? storedDurationSeconds : 0;
+}
+
 static async Task<HlsPlaybackProfile> ResolveRequestedProfileAsync(
     HlsPlaybackProfile baseProfile,
     string? quality,
@@ -1999,17 +2228,22 @@ static async Task<HlsPlaybackProfile> ResolveRequestedProfileAsync(
     string subtitleMode,
     string? externalSubtitlePath,
     int? embeddedSubtitleStreamIndex,
+    string? embeddedSubtitleCodec,
     string? sourceVideoCodec,
     bool? hardware,
+    bool toneMapToSdr,
+    string toneMapMode,
     IHlsSessionService hlsSessionService,
     CancellationToken cancellationToken)
 {
     var normalizedQuality = NormalizeQuality(quality);
-    var shouldBurnSubtitle = string.Equals(subtitleMode, "burn", StringComparison.OrdinalIgnoreCase)
+    var shouldBurnSubtitle = IsSubtitleBurnMode(subtitleMode)
                              && (externalSubtitlePath is not null || embeddedSubtitleStreamIndex.HasValue);
+    var requiresQualityTranscode = normalizedQuality is not "original" and not "auto";
     var requiresTranscode = baseProfile.TranscodeVideo
-                            || normalizedQuality != "original"
-                            || shouldBurnSubtitle;
+                            || requiresQualityTranscode
+                            || shouldBurnSubtitle
+                            || toneMapToSdr;
 
     if (!requiresTranscode)
     {
@@ -2017,19 +2251,42 @@ static async Task<HlsPlaybackProfile> ResolveRequestedProfileAsync(
     }
 
     var capabilities = await hlsSessionService.GetCapabilitiesAsync(cancellationToken);
-    var hardwareEncoder = hardware == false ? null : capabilities.PreferredHardwareEncoder;
-    var hardwareDecoder = hardware == false ? null : SelectHardwareDecoder(capabilities, sourceVideoCodec);
-    var hardwareAcceleration = SelectHardwareAcceleration(capabilities, hardwareDecoder);
+    var canUseHardware = hardware != false;
+    var hardwareEncoder = canUseHardware ? capabilities.PreferredHardwareEncoder : null;
+    var hardwareDecoder = canUseHardware ? SelectHardwareDecoder(capabilities, sourceVideoCodec) : null;
+    var hardwareAcceleration = canUseHardware ? SelectHardwareAcceleration(capabilities, hardwareDecoder) : null;
+    var effectiveToneMapMode =
+        !toneMapToSdr
+            ? "off"
+            : string.Equals(toneMapMode, "dolby-vision", StringComparison.OrdinalIgnoreCase)
+                ? "dolby-vision"
+                : string.Equals(toneMapMode, "hardware", StringComparison.OrdinalIgnoreCase)
+                  && string.Equals(ResolveHardwareKind(hardwareEncoder), "vaapi", StringComparison.OrdinalIgnoreCase)
+                  && string.Equals(ResolveHardwareKind(hardwareDecoder), "vaapi", StringComparison.OrdinalIgnoreCase)
+                  && string.Equals(hardwareAcceleration, "vaapi", StringComparison.OrdinalIgnoreCase)
+                    ? "hardware"
+                    : "software";
+
+    var effectiveQuality = normalizedQuality switch
+    {
+        "original" => "auto",
+        "auto" when toneMapToSdr => "1080p",
+        "auto" => "auto",
+        _ => normalizedQuality
+    };
 
     return HlsPlaybackProfile.CreateTranscode(
-        normalizedQuality == "original" ? "auto" : normalizedQuality,
-        audioTrackIndex,
-        shouldBurnSubtitle ? subtitleMode : "off",
-        shouldBurnSubtitle ? externalSubtitlePath : null,
-        shouldBurnSubtitle ? embeddedSubtitleStreamIndex : null,
-        hardwareEncoder,
-        hardwareDecoder,
-        hardwareAcceleration);
+        effectiveQuality,
+        audioTrackIndex: audioTrackIndex,
+        subtitleMode: shouldBurnSubtitle ? subtitleMode : "off",
+        externalSubtitlePath: shouldBurnSubtitle ? externalSubtitlePath : null,
+        embeddedSubtitleStreamIndex: shouldBurnSubtitle ? embeddedSubtitleStreamIndex : null,
+        embeddedSubtitleCodec: shouldBurnSubtitle ? embeddedSubtitleCodec : null,
+        hardwareEncoder: hardwareEncoder,
+        hardwareDecoder: hardwareDecoder,
+        hardwareAcceleration: hardwareAcceleration,
+        toneMapToSdr: toneMapToSdr,
+        toneMapMode: effectiveToneMapMode);
 }
 
 static string ResolveRequestedMode(
@@ -2040,11 +2297,17 @@ static string ResolveRequestedMode(
     string subtitleMode)
 {
     if (baseMode == "direct"
-        && NormalizeQuality(quality) == "original"
+        && !profile.TranscodeVideo
+        && NormalizeQuality(quality) is "original" or "auto"
         && !audioTrackIndex.HasValue
-        && !string.Equals(subtitleMode, "burn", StringComparison.OrdinalIgnoreCase))
+        && !IsSubtitleBurnMode(subtitleMode))
     {
         return "direct";
+    }
+
+    if (baseMode == "unavailable")
+    {
+        return "unavailable";
     }
 
     return profile.TranscodeVideo ? "hls-transcode" : "hls-remux";
@@ -2061,12 +2324,18 @@ static async Task<PlaybackPolicyResult> ApplyPlaybackSettingsAsync(
     string subtitleMode,
     string? externalSubtitlePath,
     int? embeddedSubtitleStreamIndex,
+    string? embeddedSubtitleCodec,
     string? sourceVideoCodec,
     bool? hardware,
     IHlsSessionService hlsSessionService,
     CancellationToken cancellationToken)
 {
-    if (RejectSoftwareTranscode(fileId, profile, sourceVideoCodec) is { } rejection)
+    if (mode == "unavailable")
+    {
+        return Unavailable(fileId, plan.Reason);
+    }
+
+    if (RejectMissingHardwareEncoder(fileId, profile) is { } rejection)
     {
         return rejection;
     }
@@ -2096,11 +2365,14 @@ static async Task<PlaybackPolicyResult> ApplyPlaybackSettingsAsync(
                 subtitleMode,
                 externalSubtitlePath,
                 embeddedSubtitleStreamIndex,
+                embeddedSubtitleCodec,
                 sourceVideoCodec,
                 hardware,
+                profile.ToneMapToSdr,
+                profile.ToneMapMode,
                 hlsSessionService,
                 cancellationToken);
-            if (RejectSoftwareTranscode(fileId, transcodeProfile, sourceVideoCodec) is { } transcodeRejection)
+            if (RejectMissingHardwareEncoder(fileId, transcodeProfile) is { } transcodeRejection)
             {
                 return transcodeRejection;
             }
@@ -2131,11 +2403,14 @@ static async Task<PlaybackPolicyResult> ApplyPlaybackSettingsAsync(
                 subtitleMode,
                 externalSubtitlePath,
                 embeddedSubtitleStreamIndex,
+                embeddedSubtitleCodec,
                 sourceVideoCodec,
                 hardware,
+                profile.ToneMapToSdr,
+                profile.ToneMapMode,
                 hlsSessionService,
                 cancellationToken);
-            if (RejectSoftwareTranscode(fileId, transcodeProfile, sourceVideoCodec) is { } transcodeRejection)
+            if (RejectMissingHardwareEncoder(fileId, transcodeProfile) is { } transcodeRejection)
             {
                 return transcodeRejection;
             }
@@ -2161,7 +2436,7 @@ static async Task<PlaybackPolicyResult> ApplyPlaybackSettingsAsync(
 
     if (mode == "hls-transcode")
     {
-        if (RejectSoftwareTranscode(fileId, profile, sourceVideoCodec) is { } transcodeRejection)
+        if (RejectMissingHardwareEncoder(fileId, profile) is { } transcodeRejection)
         {
             return transcodeRejection;
         }
@@ -2186,30 +2461,16 @@ static async Task<PlaybackPolicyResult> ApplyPlaybackSettingsAsync(
     return new PlaybackPolicyResult(mode, profile, plan.Reason, null);
 }
 
-static PlaybackPolicyResult? RejectSoftwareTranscode(string fileId, HlsPlaybackProfile profile, string? sourceVideoCodec)
+static PlaybackPolicyResult? RejectMissingHardwareEncoder(string fileId, HlsPlaybackProfile profile)
 {
-    if (!profile.TranscodeVideo)
+    if (!profile.TranscodeVideo || !string.IsNullOrWhiteSpace(profile.HardwareEncoder))
     {
         return null;
     }
 
-    if (string.IsNullOrWhiteSpace(profile.HardwareEncoder))
-    {
-        return Unavailable(
-            fileId,
-            "当前请求需要视频转码，但未检测到可用硬件编码器。已禁止软件转码，请开启 NAS 硬件转码能力，或改用可直出/转封装的媒体。");
-    }
-
-    if (!HasRequiredHardwareDecoder(profile, sourceVideoCodec))
-    {
-        var codec = NormalizeHardwareDecodeCodec(sourceVideoCodec);
-        var reason = string.IsNullOrWhiteSpace(codec)
-            ? "当前请求需要视频转码，但缺少媒体探测结果，无法选择硬件解码路径。已禁止软解。"
-            : $"当前请求需要视频转码，但未检测到 {codec} 对应的硬件解码路径。已禁止软解。";
-        return Unavailable(fileId, reason);
-    }
-
-    return null;
+    return Unavailable(
+        fileId,
+        "当前请求需要视频转码，但 FFmpeg 没有检测到可用硬件编码器。请检查 /dev/dri 权限、VAAPI 驱动和 FFmpeg 硬件编码能力。");
 }
 
 static PlaybackPolicyResult Unavailable(string fileId, string reason)
@@ -2242,6 +2503,22 @@ static string ResolveProfileReason(string baseReason, HlsPlaybackProfile profile
         return baseReason;
     }
 
+    if (profile.ToneMapToSdr)
+    {
+        var toneMapMode = profile.ToneMapMode switch
+        {
+            var mode when string.Equals(mode, "hardware", StringComparison.OrdinalIgnoreCase) => "VAAPI 硬件色彩转换",
+            var mode when string.Equals(mode, "dolby-vision", StringComparison.OrdinalIgnoreCase) => "Dolby Vision-only 兼容色彩转换",
+            _ => "兼容色彩转换"
+        };
+        return $"{baseReason} 使用硬件编码 {profile.HardwareEncoder}，并将 HDR/DV 转为 SDR（{toneMapMode}），档位 {profile.QualityId}。";
+    }
+
+    if (string.IsNullOrWhiteSpace(profile.HardwareEncoder))
+    {
+        return $"{baseReason} 未检测到可用硬件编码器，无法转码。";
+    }
+
     var decoder = string.IsNullOrWhiteSpace(profile.HardwareDecoder)
         ? "自动"
         : profile.HardwareDecoder;
@@ -2251,7 +2528,201 @@ static string ResolveProfileReason(string baseReason, HlsPlaybackProfile profile
 static string NormalizeQuality(string? quality)
 {
     var normalized = quality?.Trim().ToLowerInvariant();
-    return string.IsNullOrWhiteSpace(normalized) || normalized == "auto" ? "original" : normalized;
+    return string.IsNullOrWhiteSpace(normalized) ? "original" : normalized;
+}
+
+static string ResolveEffectiveQuality(string? quality, string? preference)
+{
+    if (!string.IsNullOrWhiteSpace(quality))
+    {
+        return NormalizeQuality(quality);
+    }
+
+    return preference?.Trim().ToLowerInvariant() switch
+    {
+        "original-priority" => "original",
+        "compatibility" => "1080p",
+        _ => "auto"
+    };
+}
+
+static string ResolveSourceVideoCodec(string fileName, MediaProbeSnapshot? probe)
+{
+    var probedCodec = NormalizeCodec(probe?.VideoCodec);
+    return string.IsNullOrWhiteSpace(probedCodec)
+        ? DetectVideoCodecFromFileName(fileName)
+        : NormalizeHardwareDecodeCodec(probedCodec);
+}
+
+static string DetectVideoCodecFromFileName(string fileName)
+{
+    var name = Path.GetFileName(fileName).ToLowerInvariant();
+    var compact = CompactMediaTokenText(name);
+    if (compact.Contains("h265", StringComparison.Ordinal)
+        || compact.Contains("x265", StringComparison.Ordinal)
+        || name.Contains("hevc", StringComparison.Ordinal))
+    {
+        return "hevc";
+    }
+
+    if (compact.Contains("h264", StringComparison.Ordinal)
+        || compact.Contains("x264", StringComparison.Ordinal)
+        || TokenizeMediaName(name).Contains("avc", StringComparer.Ordinal))
+    {
+        return "h264";
+    }
+
+    if (TokenizeMediaName(name).Contains("av1", StringComparer.Ordinal))
+    {
+        return "av1";
+    }
+
+    if (TokenizeMediaName(name).Contains("vp9", StringComparer.Ordinal))
+    {
+        return "vp9";
+    }
+
+    return string.Empty;
+}
+
+static SourceDynamicRange AnalyzeSourceDynamicRange(string fileName, MediaProbeSnapshot? probe)
+{
+    var name = Path.GetFileName(fileName).ToLowerInvariant();
+    var tokens = TokenizeMediaName(name);
+    var compact = CompactMediaTokenText(name);
+    var rawJson = probe?.RawJson?.ToLowerInvariant();
+    var hasDolbyVisionSignal =
+        tokens.Any(static token => token is "dv" or "dovi")
+        || compact.Contains("dolbyvision", StringComparison.Ordinal)
+        || rawJson is not null
+           && (rawJson.Contains("dv_profile", StringComparison.Ordinal)
+               || rawJson.Contains("dolby vision", StringComparison.Ordinal)
+               || rawJson.Contains("dovi", StringComparison.Ordinal));
+    var hasHdrSignal =
+        tokens.Any(static token => token is "hdr" or "hdr10" or "hdr10plus" or "hlg" or "edr")
+        || rawJson is not null
+           && (rawJson.Contains("smpte2084", StringComparison.Ordinal)
+               || rawJson.Contains("arib-std-b67", StringComparison.Ordinal)
+               || rawJson.Contains("bt2020", StringComparison.Ordinal));
+
+    var compatibilityId = ResolveDolbyVisionCompatibilityId(probe?.RawJson);
+    var dolbyVisionProfile = ResolveDolbyVisionProfile(probe?.RawJson);
+    var hasExplicitDolbyVisionOnlySignal = compatibilityId == 0 || dolbyVisionProfile == 5;
+    var hasDolbyVisionFallback =
+        !hasDolbyVisionSignal
+        || (!hasExplicitDolbyVisionOnlySignal
+            && (hasHdrSignal
+                || compatibilityId is > 0
+                || dolbyVisionProfile is 7));
+    if (hasDolbyVisionSignal && !hasDolbyVisionFallback)
+    {
+        return new SourceDynamicRange(true, true, "dolby-vision");
+    }
+
+    if (hasHdrSignal || hasDolbyVisionSignal)
+    {
+        return new SourceDynamicRange(true, false, ResolveToneMapMode(probe));
+    }
+
+    return new SourceDynamicRange(false, false, "off");
+}
+
+static string ResolveToneMapMode(MediaProbeSnapshot? probe)
+{
+    return HasMasteringDisplayData(probe) ? "hardware" : "software";
+}
+
+static bool HasMasteringDisplayData(MediaProbeSnapshot? probe)
+{
+    var rawJson = probe?.RawJson;
+    return rawJson is not null
+           && rawJson.Contains("Mastering display metadata", StringComparison.OrdinalIgnoreCase);
+}
+
+static int? ResolveDolbyVisionCompatibilityId(string? rawJson)
+{
+    return FindIntPropertyInJson(rawJson, "dv_bl_signal_compatibility_id");
+}
+
+static int? ResolveDolbyVisionProfile(string? rawJson)
+{
+    return FindIntPropertyInJson(rawJson, "dv_profile");
+}
+
+static int? FindIntPropertyInJson(string? rawJson, string propertyName)
+{
+    if (string.IsNullOrWhiteSpace(rawJson))
+    {
+        return null;
+    }
+
+    try
+    {
+        using var document = JsonDocument.Parse(rawJson);
+        return FindIntPropertyInElement(document.RootElement, propertyName);
+    }
+    catch (JsonException)
+    {
+        return null;
+    }
+}
+
+static int? FindIntPropertyInElement(JsonElement element, string propertyName)
+{
+    switch (element.ValueKind)
+    {
+        case JsonValueKind.Object:
+            foreach (var property in element.EnumerateObject())
+            {
+                if (property.NameEquals(propertyName) && property.Value.TryGetInt32(out var value))
+                {
+                    return value;
+                }
+
+                var nested = FindIntPropertyInElement(property.Value, propertyName);
+                if (nested.HasValue)
+                {
+                    return nested;
+                }
+            }
+
+            return null;
+        case JsonValueKind.Array:
+            foreach (var item in element.EnumerateArray())
+            {
+                var nested = FindIntPropertyInElement(item, propertyName);
+                if (nested.HasValue)
+                {
+                    return nested;
+                }
+            }
+
+            return null;
+        default:
+            return null;
+    }
+}
+
+static string CompactMediaTokenText(string value)
+{
+    var builder = new StringBuilder(value.Length);
+    foreach (var character in value)
+    {
+        if (char.IsLetterOrDigit(character))
+        {
+            builder.Append(character);
+        }
+    }
+
+    return builder.ToString();
+}
+
+static string[] TokenizeMediaName(string value)
+{
+    return value
+        .Split(['.', '_', '-', ' ', '[', ']', '(', ')', '+'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(static token => token.ToLowerInvariant())
+        .ToArray();
 }
 
 static string NormalizeSubtitleMode(string? subtitleMode, string? externalSubtitlePath, int? embeddedSubtitleStreamIndex)
@@ -2264,10 +2735,16 @@ static string NormalizeSubtitleMode(string? subtitleMode, string? externalSubtit
 
     return subtitleMode?.Trim().ToLowerInvariant() switch
     {
-        "web" when externalSubtitlePath is not null => "web",
+        "web" => "web",
         "burn" => "burn",
+        "burn-bitmap" => "burn-bitmap",
         _ => "off"
     };
+}
+
+static bool IsSubtitleBurnMode(string? subtitleMode)
+{
+    return subtitleMode?.Trim().StartsWith("burn", StringComparison.OrdinalIgnoreCase) == true;
 }
 
 static string NormalizeCodec(string? codec)
@@ -2392,22 +2869,6 @@ static IEnumerable<string> PrioritizeHardwareKinds(IEnumerable<string> hardwareK
         .OrderBy(kind => string.Equals(kind, preferredHardwareKind, StringComparison.OrdinalIgnoreCase) ? 0 : 1);
 }
 
-static bool HasRequiredHardwareDecoder(HlsPlaybackProfile profile, string? sourceVideoCodec)
-{
-    if (!profile.TranscodeVideo)
-    {
-        return true;
-    }
-
-    var normalizedCodec = NormalizeHardwareDecodeCodec(sourceVideoCodec);
-    if (string.IsNullOrWhiteSpace(normalizedCodec))
-    {
-        return false;
-    }
-
-    return !string.IsNullOrWhiteSpace(profile.HardwareDecoder);
-}
-
 static string? SelectHardwareAcceleration(
     FfmpegTranscodeCapabilities capabilities,
     string? hardwareDecoder)
@@ -2500,12 +2961,46 @@ static int? ResolveEmbeddedSubtitleStreamIndex(string? subtitleId)
         return null;
     }
 
-    return int.TryParse(subtitleId[prefix.Length..], out var streamIndex) && streamIndex >= 0
+    var value = subtitleId[prefix.Length..];
+    var subtitleOrdinalMarker = value.LastIndexOf("_si_", StringComparison.OrdinalIgnoreCase);
+    if (subtitleOrdinalMarker >= 0)
+    {
+        value = value[(subtitleOrdinalMarker + 4)..];
+    }
+
+    return int.TryParse(value, out var streamIndex) && streamIndex >= 0
         ? streamIndex
         : null;
 }
 
-static async Task<string?> ReadSubtitleAsWebVttAsync(string subtitlePath, CancellationToken cancellationToken)
+static string? ResolveEmbeddedSubtitleCodec(MediaProbeSnapshot? probe, int? embeddedSubtitleStreamIndex)
+{
+    if (!embeddedSubtitleStreamIndex.HasValue)
+    {
+        return null;
+    }
+
+    return probe?.Streams
+        .Where(static stream => string.Equals(stream.Kind, "subtitle", StringComparison.OrdinalIgnoreCase))
+        .Skip(embeddedSubtitleStreamIndex.Value)
+        .FirstOrDefault()
+        ?.Codec;
+}
+
+static Task<string?> ReadSubtitleAsWebVttAsync(
+    string subtitlePath,
+    IStoragePaths storagePaths,
+    CancellationToken cancellationToken)
+{
+    var cacheKey = BuildSubtitleWebVttCacheKey("external", subtitlePath, null);
+    return ReadCachedWebVttAsync(
+        storagePaths,
+        cacheKey,
+        token => ReadSubtitleAsWebVttUncachedAsync(subtitlePath, token),
+        cancellationToken);
+}
+
+static async Task<string?> ReadSubtitleAsWebVttUncachedAsync(string subtitlePath, CancellationToken cancellationToken)
 {
     var extension = Path.GetExtension(subtitlePath).ToLowerInvariant();
     if (extension == ".vtt")
@@ -2516,12 +3011,12 @@ static async Task<string?> ReadSubtitleAsWebVttAsync(string subtitlePath, Cancel
             : $"WEBVTT\n\n{text}";
     }
 
-    if (extension != ".srt")
+    if (extension is not ".srt")
     {
-        return null;
+        return await ConvertSubtitleFileAsWebVttAsync(subtitlePath, cancellationToken);
     }
 
-    var srt = await File.ReadAllTextAsync(subtitlePath, cancellationToken);
+    var srt = await System.IO.File.ReadAllTextAsync(subtitlePath, cancellationToken);
     var builder = new StringBuilder("WEBVTT\n\n");
     foreach (var line in srt.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
     {
@@ -2531,6 +3026,260 @@ static async Task<string?> ReadSubtitleAsWebVttAsync(string subtitlePath, Cancel
     }
 
     return builder.ToString();
+}
+
+static async Task<string?> ConvertSubtitleFileAsWebVttAsync(string subtitlePath, CancellationToken cancellationToken)
+{
+    using var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = ResolveFfmpegExecutablePath(),
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }
+    };
+
+    ConfigureFfmpegFontEnvironment(process.StartInfo);
+    foreach (var argument in new[]
+             {
+                 "-hide_banner",
+                 "-nostdin",
+                 "-loglevel", "error",
+                 "-i", subtitlePath,
+                 "-vn",
+                 "-an",
+                 "-f", "webvtt",
+                 "-"
+             })
+    {
+        process.StartInfo.ArgumentList.Add(argument);
+    }
+
+    try
+    {
+        process.Start();
+    }
+    catch (Exception)
+    {
+        return null;
+    }
+
+    using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    timeoutSource.CancelAfter(TimeSpan.FromMinutes(2));
+    try
+    {
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutSource.Token);
+        _ = process.StandardError.ReadToEndAsync(timeoutSource.Token);
+        await process.WaitForExitAsync(timeoutSource.Token);
+        var stdout = await stdoutTask;
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
+        {
+            return null;
+        }
+
+        var text = stdout.TrimStart('\uFEFF');
+        return text.StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase)
+            ? text
+            : $"WEBVTT\n\n{text}";
+    }
+    catch (OperationCanceledException)
+    {
+        TryKillProcess(process);
+        return null;
+    }
+}
+
+static async Task<string?> ReadEmbeddedSubtitleAsWebVttAsync(
+    string inputPath,
+    int subtitleOrdinal,
+    IStoragePaths storagePaths,
+    CancellationToken cancellationToken)
+{
+    if (subtitleOrdinal < 0)
+    {
+        return null;
+    }
+
+    var cacheKey = BuildSubtitleWebVttCacheKey("embedded", inputPath, subtitleOrdinal);
+    return await ReadCachedWebVttAsync(
+        storagePaths,
+        cacheKey,
+        token => ReadEmbeddedSubtitleAsWebVttUncachedAsync(inputPath, subtitleOrdinal, token),
+        cancellationToken);
+}
+
+static async Task<string?> ReadEmbeddedSubtitleAsWebVttUncachedAsync(
+    string inputPath,
+    int subtitleOrdinal,
+    CancellationToken cancellationToken)
+{
+    using var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = ResolveFfmpegExecutablePath(),
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }
+    };
+
+    ConfigureFfmpegFontEnvironment(process.StartInfo);
+    foreach (var argument in new[]
+             {
+                 "-hide_banner",
+                 "-nostdin",
+                 "-loglevel", "error",
+                 "-i", inputPath,
+                 "-map", $"0:s:{subtitleOrdinal}",
+                 "-vn",
+                 "-an",
+                 "-f", "webvtt",
+                 "-"
+             })
+    {
+        process.StartInfo.ArgumentList.Add(argument);
+    }
+
+    try
+    {
+        process.Start();
+    }
+    catch (Exception)
+    {
+        return null;
+    }
+
+    using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    timeoutSource.CancelAfter(TimeSpan.FromMinutes(2));
+    try
+    {
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutSource.Token);
+        var stderrTask = process.StandardError.ReadToEndAsync(timeoutSource.Token);
+        await process.WaitForExitAsync(timeoutSource.Token);
+        var stdout = await stdoutTask;
+        _ = await stderrTask;
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
+        {
+            return null;
+        }
+
+        var text = stdout.TrimStart('\uFEFF');
+        return text.StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase)
+            ? text
+            : $"WEBVTT\n\n{text}";
+    }
+    catch (OperationCanceledException)
+    {
+        TryKillProcess(process);
+        return null;
+    }
+}
+
+static async Task<string?> ReadCachedWebVttAsync(
+    IStoragePaths storagePaths,
+    string cacheKey,
+    Func<CancellationToken, Task<string?>> factory,
+    CancellationToken cancellationToken)
+{
+    var cachePath = ResolveSubtitleWebVttCachePath(storagePaths, cacheKey);
+    if (System.IO.File.Exists(cachePath))
+    {
+        try
+        {
+            return await System.IO.File.ReadAllTextAsync(cachePath, cancellationToken);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    var webVtt = await factory(cancellationToken);
+    if (string.IsNullOrWhiteSpace(webVtt))
+    {
+        return webVtt;
+    }
+
+    try
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
+        var tempPath = $"{cachePath}.{Guid.NewGuid():N}.tmp";
+        await System.IO.File.WriteAllTextAsync(tempPath, webVtt, Encoding.UTF8, cancellationToken);
+        System.IO.File.Move(tempPath, cachePath, overwrite: true);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        // Subtitle conversion can still be served for this request even if cache write fails.
+    }
+
+    return webVtt;
+}
+
+static string ResolveSubtitleWebVttCachePath(IStoragePaths storagePaths, string cacheKey)
+{
+    var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cacheKey))).ToLowerInvariant();
+    return Path.Combine(storagePaths.CacheDirectory, "subtitles", "webvtt", $"{hash}.vtt");
+}
+
+static string BuildSubtitleWebVttCacheKey(string scope, string subtitlePath, int? subtitleOrdinal)
+{
+    var info = new FileInfo(subtitlePath);
+    var length = info.Exists ? info.Length : 0;
+    var lastWriteTicks = info.Exists ? info.LastWriteTimeUtc.Ticks : 0;
+    return string.Join(
+        "|",
+        scope,
+        Path.GetFullPath(subtitlePath),
+        length.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        lastWriteTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        subtitleOrdinal?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "file");
+}
+
+static string ResolveFfmpegExecutablePath()
+{
+    var configured = Environment.GetEnvironmentVariable("OMNIPLAY_FFMPEG_PATH");
+    return string.IsNullOrWhiteSpace(configured) ? "ffmpeg" : configured;
+}
+
+static void ConfigureFfmpegFontEnvironment(ProcessStartInfo startInfo)
+{
+    var packagedFontconfigPath = Path.Combine(AppContext.BaseDirectory, "tools", "fontconfig");
+    var packagedFontconfigFile = Path.Combine(packagedFontconfigPath, "fonts.conf");
+    if (File.Exists(packagedFontconfigFile))
+    {
+        startInfo.Environment.TryAdd("FONTCONFIG_FILE", packagedFontconfigFile);
+        startInfo.Environment.TryAdd("FONTCONFIG_PATH", packagedFontconfigPath);
+    }
+
+    var appRoot = Environment.GetEnvironmentVariable("OMNIPLAY_APP_ROOT");
+    if (!string.IsNullOrWhiteSpace(appRoot))
+    {
+        var fontconfigCache = Path.Combine(appRoot, "cache", "fontconfig");
+        Directory.CreateDirectory(fontconfigCache);
+        startInfo.Environment.TryAdd("FONTCONFIG_CACHE", fontconfigCache);
+    }
+}
+
+static void TryKillProcess(Process process)
+{
+    try
+    {
+        if (!process.HasExited)
+        {
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit(2000);
+        }
+    }
+    catch
+    {
+    }
 }
 
 static MediaNameParser.CombinedSearchMetadataResult? ResolveSourceSearchMetadata(
@@ -2562,6 +3311,27 @@ static string ResolveMetadataSearchQuery(
            ?? sourceMetadata?.ForeignTitle
            ?? sourceMetadata?.FullCleanTitle
            ?? item.Title;
+}
+
+static string ResolveMetadataDisplayTitle(
+    string title,
+    MediaNameParser.CombinedSearchMetadataResult? sourceMetadata)
+{
+    var normalizedTitle = ChineseTextNormalizer.NormalizeTitle(title);
+    if (ContainsHan(normalizedTitle))
+    {
+        return normalizedTitle;
+    }
+
+    var sourceChineseTitle = sourceMetadata?.ChineseTitle ?? sourceMetadata?.ParentChineseTitle;
+    return string.IsNullOrWhiteSpace(sourceChineseTitle)
+        ? normalizedTitle
+        : ChineseTextNormalizer.NormalizeTitle(sourceChineseTitle);
+}
+
+static bool ContainsHan(string? input)
+{
+    return !string.IsNullOrWhiteSpace(input) && input.Any(static character => character is >= '\u4e00' and <= '\u9fff');
 }
 
 static string? BuildMetadataSecondarySearchQuery(string primaryQuery, params string?[] candidates)
@@ -2627,6 +3397,10 @@ static IReadOnlyList<string> ResolveMetadataSearchTypes(string? requestedMediaTy
 }
 
 sealed record PlaybackPlan(string Mode, HlsPlaybackProfile Profile, string Reason);
+
+sealed record PlaybackAccessTicket(string FileId, DateTimeOffset ExpiresAt);
+
+sealed record SourceDynamicRange(bool ShouldToneMapToSdr, bool IsDolbyVisionOnly, string ToneMapMode);
 
 sealed record PlaybackPolicyResult(
     string Mode,

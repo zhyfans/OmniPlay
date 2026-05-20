@@ -1505,19 +1505,51 @@ public sealed class LibraryScanner : ILibraryScanner
 
     private static string GetMovieGroupingKey(string relativePath, string fallbackTitle)
     {
-        var normalized = relativePath.Replace('\\', '/');
-        if (normalized.StartsWith("BDMV/", StringComparison.OrdinalIgnoreCase))
+        var normalized = NormalizeRelativePath(relativePath);
+        if (TryGetBdmvGroupKey(normalized, out var bdmvGroupKey))
         {
-            return fallbackTitle;
+            return NormalizeExplicitMultipartMovieGroupingKey(
+                NormalizeBluRayMovieGroupingKey(bdmvGroupKey, fallbackTitle),
+                fallbackTitle);
         }
 
-        if (normalized.Contains("/BDMV/", StringComparison.OrdinalIgnoreCase))
+        if (MediaNameParser.MultipartMovieGroupingTitle(normalized, fallbackTitle) is { } multipartTitle)
         {
-            var bdmvIndex = normalized.IndexOf("/BDMV/", StringComparison.OrdinalIgnoreCase);
-            return bdmvIndex > 0 ? normalized[..bdmvIndex] : fallbackTitle;
+            return $"multipart:{multipartTitle}";
         }
 
         return normalized;
+    }
+
+    private static string NormalizeExplicitMultipartMovieGroupingKey(string groupingKey, string fallbackTitle)
+    {
+        if (MediaNameParser.MultipartMovieGroupingTitle(groupingKey, fallbackTitle) is { } multipartTitle)
+        {
+            return $"multipart:{multipartTitle}";
+        }
+
+        return groupingKey;
+    }
+
+    private static string NormalizeBluRayMovieGroupingKey(string bdmvGroupKey, string fallbackTitle)
+    {
+        var parts = NormalizeRelativePath(bdmvGroupKey)
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+        while (parts.Count > 0 && IsGenericDiscOrVolumeFolder(parts[^1]))
+        {
+            parts.RemoveAt(parts.Count - 1);
+        }
+
+        return parts.Count == 0 ? fallbackTitle : string.Join('/', parts);
+    }
+
+    private static bool IsGenericDiscOrVolumeFolder(string input)
+    {
+        var token = Regex.Replace(input.Trim(), @"[._\-\s]+", string.Empty).ToLowerInvariant();
+        return Regex.IsMatch(
+            token,
+            @"^(vol(ume)?\d{0,2}|disc\d{0,2}|disk\d{0,2}|dvd\d{0,2}|cd\d{0,2}|bdrom|bdmv)$");
     }
 
     private static long CreateSyntheticEntityId(string category, long sourceId, string key)

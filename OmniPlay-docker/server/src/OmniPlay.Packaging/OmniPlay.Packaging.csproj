@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../OmniPlay.Core/OmniPlay.Core.csproj" />
+  </ItemGroup>
+</Project>
+

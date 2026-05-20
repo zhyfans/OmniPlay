@@ -1030,6 +1030,13 @@ extension View {
 // ==========================================
 // 🌟 核心播放器视图
 // ==========================================
+private struct PlayerTimelineSegment: Identifiable {
+    let id: String
+    let startRatio: Double
+    let widthRatio: Double
+    let isCurrent: Bool
+}
+
 struct PlayerScreen: View {
     let movie: Movie
     var initialFileId: String? = nil
@@ -1164,6 +1171,164 @@ struct PlayerScreen: View {
     private var shouldShowNextEpisodeButton: Bool {
         isTVPlayback && showControls && !isCursorHidden && hasNextEpisode && playbackProgressRatio >= 0.95
     }
+
+    private var isMultipartMoviePlayback: Bool {
+        !isTVPlayback && allPlaylistFiles.count > 1
+    }
+
+    private var currentPlaylistFileIndex: Int? {
+        if let id = currentVideoFileId,
+           let index = allPlaylistFiles.firstIndex(where: { $0.id == id }) {
+            return index
+        }
+        let index = playerManager.currentPlaylistIndex
+        return allPlaylistFiles.indices.contains(index) ? index : nil
+    }
+
+    private var playerTimeline: (position: Double, duration: Double) {
+        guard isMultipartMoviePlayback, let currentIndex = currentPlaylistFileIndex else {
+            return (max(playerManager.currentTimePos, 0), max(playerManager.duration, 0))
+        }
+
+        var position = 0.0
+        var duration = 0.0
+        for index in allPlaylistFiles.indices {
+            let partDuration = index == currentIndex
+                ? max(allPlaylistFiles[index].duration, max(playerManager.duration, playerManager.currentTimePos))
+                : max(allPlaylistFiles[index].duration, 0)
+            if index < currentIndex {
+                position += partDuration
+            }
+            duration += partDuration
+        }
+        position += max(playerManager.currentTimePos, 0)
+        return (min(position, max(duration, position)), duration)
+    }
+
+    private var playerTimelinePosition: Float {
+        let timeline = playerTimeline
+        guard timeline.duration > 0 else { return 0 }
+        return Float(min(max(timeline.position / timeline.duration, 0), 1))
+    }
+
+    private var playerTimelineCurrentText: String {
+        formatPlaybackTime(playerTimeline.position)
+    }
+
+    private var playerTimelineRemainingText: String {
+        let timeline = playerTimeline
+        guard timeline.duration > 0 else { return "-00:00" }
+        return "-\(formatPlaybackTime(max(0, timeline.duration - timeline.position)))"
+    }
+
+    private var playerTimelineDurationText: String {
+        let timeline = playerTimeline
+        guard timeline.duration > 0 else { return "--:--" }
+        return formatPlaybackTime(timeline.duration)
+    }
+
+    private var playerTimelineSegments: [PlayerTimelineSegment] {
+        guard isMultipartMoviePlayback,
+              let currentIndex = currentPlaylistFileIndex else { return [] }
+
+        let durations = allPlaylistFiles.indices.map { index in
+            index == currentIndex
+                ? max(allPlaylistFiles[index].duration, max(playerManager.duration, playerManager.currentTimePos))
+                : max(allPlaylistFiles[index].duration, 0)
+        }
+        let totalDuration = durations.reduce(0, +)
+        guard allPlaylistFiles.count > 1, totalDuration > 0 else { return [] }
+
+        var cursor = 0.0
+        return allPlaylistFiles.indices.map { index in
+            let duration = durations[index]
+            let segment = PlayerTimelineSegment(
+                id: allPlaylistFiles[index].id,
+                startRatio: cursor / totalDuration,
+                widthRatio: duration / totalDuration,
+                isCurrent: index == currentIndex
+            )
+            cursor += duration
+            return segment
+        }
+    }
+
+    private var playbackTimelineSlider: some View {
+        ZStack {
+            Slider(
+                value: Binding(
+                    get: { isMultipartMoviePlayback ? playerTimelinePosition : playerManager.position },
+                    set: { newValue in
+                        seekPlayerTimeline(to: newValue)
+                        resetHideTimer()
+                    }
+                )
+            )
+            .tint(.red)
+
+            if isMultipartMoviePlayback && playerTimelineSegments.count > 1 {
+                GeometryReader { proxy in
+                    ForEach(playerTimelineSegments) { segment in
+                        let segmentWidth = max(1, proxy.size.width * CGFloat(segment.widthRatio))
+                        let segmentCenter = proxy.size.width * CGFloat(segment.startRatio + segment.widthRatio / 2)
+                        Rectangle()
+                            .fill(segment.isCurrent ? Color.red.opacity(0.16) : Color.white.opacity(0.06))
+                            .frame(width: segmentWidth, height: 8)
+                            .position(x: segmentCenter, y: proxy.size.height / 2)
+
+                        if segment.startRatio > 0 {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.85))
+                                .frame(width: 1, height: 10)
+                                .position(x: proxy.size.width * CGFloat(segment.startRatio), y: proxy.size.height / 2)
+                        }
+                    }
+                }
+                .allowsHitTesting(false)
+            }
+        }
+        .frame(height: 24)
+    }
+
+    private func formatPlaybackTime(_ seconds: Double) -> String {
+        let safeSeconds = max(0, Int(seconds.isFinite ? seconds.rounded(.down) : 0))
+        let hours = safeSeconds / 3600
+        let minutes = (safeSeconds % 3600) / 60
+        let remainingSeconds = safeSeconds % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+            : String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+
+    private func seekPlayerTimeline(to newPosition: Float) {
+        guard isMultipartMoviePlayback,
+              let currentIndex = currentPlaylistFileIndex else {
+            playerManager.setPosition(newPosition)
+            return
+        }
+
+        let timeline = playerTimeline
+        guard timeline.duration > 0 else { return }
+        let targetPosition = min(max(Double(newPosition), 0), 1) * timeline.duration
+        var cursor = 0.0
+        for index in allPlaylistFiles.indices {
+            let partDuration = index == currentIndex
+                ? max(allPlaylistFiles[index].duration, max(playerManager.duration, playerManager.currentTimePos))
+                : max(allPlaylistFiles[index].duration, 0)
+            guard partDuration > 0 else { continue }
+            if targetPosition <= cursor + partDuration || index == (allPlaylistFiles.indices.last ?? index) {
+                let localPosition = min(max(targetPosition - cursor, 0), partDuration)
+                if index == currentIndex {
+                    playerManager.seekAbsolute(seconds: localPosition)
+                } else {
+                    currentVideoFileId = allPlaylistFiles[index].id
+                    playerManager.playPlaylistIndex(index, startPosition: localPosition)
+                }
+                return
+            }
+            cursor += partDuration
+        }
+    }
     
     var body: some View {
         ZStack {
@@ -1261,9 +1426,9 @@ struct PlayerScreen: View {
                         .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
                         
                         HStack {
-                            Text(playerManager.currentTime).font(.caption.monospacedDigit())
-                            Slider(value: Binding(get: { playerManager.position }, set: { newValue in playerManager.setPosition(newValue); resetHideTimer() })).tint(.red)
-                            Text(playerManager.remainingTime).font(.caption.monospacedDigit())
+                            Text(isMultipartMoviePlayback ? playerTimelineCurrentText : playerManager.currentTime).font(.caption.monospacedDigit())
+                            playbackTimelineSlider
+                            Text(isMultipartMoviePlayback ? playerTimelineDurationText : playerManager.remainingTime).font(.caption.monospacedDigit())
                         }
                         
                         HStack(spacing: 16) {
@@ -1573,14 +1738,24 @@ struct PlayerScreen: View {
         if let seedSourceBasePath = initialSourceBasePath,
            let seedFiles = initialPlaylistFiles,
            !seedFiles.isEmpty {
+            let orderedSeedFiles = seedFiles.enumerated().sorted {
+                MediaNameParser.playbackSortPrecedes(
+                    lhsRelativePath: $0.element.relativePath,
+                    lhsFileName: $0.element.fileName,
+                    lhsFallbackIndex: $0.offset,
+                    rhsRelativePath: $1.element.relativePath,
+                    rhsFileName: $1.element.fileName,
+                    rhsFallbackIndex: $1.offset
+                )
+            }.map(\.element)
             let startIndex = initialFileId.flatMap { targetId in
-                seedFiles.firstIndex(where: { $0.id == targetId })
+                orderedSeedFiles.firstIndex(where: { $0.id == targetId })
             } ?? 0
             let seedProtocolType = initialSourceProtocolType ?? MediaSourceProtocol.local.rawValue
-            log("prepare try seed data files=\(seedFiles.count) startIndex=\(startIndex) source=\(seedSourceBasePath) protocol=\(seedProtocolType)")
+            log("prepare try seed data files=\(orderedSeedFiles.count) startIndex=\(startIndex) source=\(seedSourceBasePath) protocol=\(seedProtocolType)")
             Task { @MainActor in
                 if await applyPreparedPlayback(
-                    files: seedFiles,
+                    files: orderedSeedFiles,
                     sourceBasePath: seedSourceBasePath,
                     sourceProtocolType: seedProtocolType,
                     sourceAuthConfig: initialSourceAuthConfig,
@@ -1613,8 +1788,14 @@ struct PlayerScreen: View {
                 let snapshot: (files: [VideoFile], sourceBasePath: String, sourceProtocolType: String, sourceAuthConfig: String?, startIndex: Int)? = try await dbQueue.read { db in
                     let fetchedFiles = try VideoFile.fetchVisibleFiles(movieId: movieValue.id, in: db)
                     let files = fetchedFiles.enumerated().sorted {
-                        MediaNameParser.episodeSortKey(for: $0.element.fileName, fallbackIndex: $0.offset) <
-                        MediaNameParser.episodeSortKey(for: $1.element.fileName, fallbackIndex: $1.offset)
+                        MediaNameParser.playbackSortPrecedes(
+                            lhsRelativePath: $0.element.relativePath,
+                            lhsFileName: $0.element.fileName,
+                            lhsFallbackIndex: $0.offset,
+                            rhsRelativePath: $1.element.relativePath,
+                            rhsFileName: $1.element.fileName,
+                            rhsFallbackIndex: $1.offset
+                        )
                     }.map(\.element)
                     guard !files.isEmpty,
                           let source = try files[0].request(for: VideoFile.mediaSource).fetchOne(db) else { return nil }

@@ -15,12 +15,21 @@ Package notes:
 - This is a GPL FFmpeg build. Keep LICENSE.txt with redistributed packages.
 
 Additional VAAPI runtime packages already bundled under lib/:
-- libva-drm2_2.17.0-1_amd64.deb
-- libva2_2.17.0-1_amd64.deb
+- libva-drm2_2.22.0-3_amd64.deb
+  SHA-256: 5dce5007ddc0ce87a61db4d71476ce1a5a135737b5185ce2e8b7067342fcafc6
+  Bundled file: lib/libva-drm.so.2
+- libva2_2.22.0-3_amd64.deb
+  SHA-256: b76bdd330de47a826698aaed10f53435b703e9a7d4415dd68269c97709f46a9b
+  Bundled file: lib/libva.so.2
 - libdrm2_2.4.114-1+b1_amd64.deb
 
 Source:
 https://deb.debian.org/debian/pool/main/
+
+libva.so.2 is patched from Debian 2.22.0-3 to resolve __isoc99_sscanf
+with the correct GLIBC_2.7 version hash instead of __isoc23_sscanf at
+GLIBC_2.38, while preserving the vaMapBuffer2 export required by the
+bundled FFmpeg.
 
 Intel GPU user-space runtime packages already bundled under lib/ and lib/dri/:
 - intel-media-va-driver_23.1.1+dfsg1-1_amd64.deb
@@ -39,11 +48,15 @@ Intel GPU user-space runtime packages already bundled under lib/ and lib/dri/:
 The Intel runtime is used by Synology startup scripts through:
 - LD_LIBRARY_PATH=$PACKAGE_TARGET/tools/ffmpeg/lib
 - LIBVA_DRIVERS_PATH=$PACKAGE_TARGET/tools/ffmpeg/lib/dri
-- LIBVA_DRIVER_NAME=iHD when iHD_drv_video.so is present
-- ONEVPL_SEARCH_PATH=$PACKAGE_TARGET/tools/ffmpeg/lib
+- LIBVA_DRIVER_NAME is left unset by default so libva can choose the matching
+  driver for the render device; set it in media-tools.env only when overriding
+  driver selection is needed.
+- ONEVPL_SEARCH_PATH=$PACKAGE_TARGET/tools/ffmpeg/lib only when
+  OMNIPLAY_ENABLE_QSV=1 is set in media-tools.env
 
 Copyright notices from the Debian packages are stored in:
 share/doc/intel-runtime/
+share/doc/vaapi-runtime/
 
 Additional X11/libva-x11 runtime packages bundled under lib/:
 - libx11-6_1.8.4-2+deb12u2_amd64.deb
@@ -52,8 +65,8 @@ Additional X11/libva-x11 runtime packages bundled under lib/:
 - libx11-xcb1_1.8.4-2+deb12u2_amd64.deb
   SHA-256: f5da45e1d881a793250a96613f28c471a248877f1a0f18a5c90e2a620a76c898
   Bundled file: lib/libX11-xcb.so.1
-- libva-x11-2_2.17.0-1_amd64.deb
-  SHA-256: 95db1ecd8c2d1c3f99a750f1b2d9ba1959b7cd9cbd7eabfc1b8a86a095b379a6
+- libva-x11-2_2.22.0-3_amd64.deb
+  SHA-256: 97baabc9ae8dfbe718ca80543dc7337d330dd17e2a59138bf42a66a35d59309b
   Bundled file: lib/libva-x11.so.2
 - libxcb1_1.15-1_amd64.deb
   SHA-256: fdc61332a3892168f3cc9cfa1fe9cf11a91dc3e0acacbc47cbc50ebaa234cc71

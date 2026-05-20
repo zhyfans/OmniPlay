@@ -12,6 +12,7 @@ public sealed class ImagePathToBitmapConverter : IValueConverter
     private static readonly object CacheGate = new();
     private static readonly Dictionary<ImageCacheKey, Bitmap> Cache = [];
     private static readonly Queue<ImageCacheKey> CacheOrder = [];
+    private static readonly Dictionary<string, Bitmap> LastGoodByPath = new(StringComparer.OrdinalIgnoreCase);
 
     public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
@@ -26,12 +27,17 @@ public sealed class ImagePathToBitmapConverter : IValueConverter
         }
 
         var normalizedPath = ResolveLocalPath(path.Trim());
-        if (string.IsNullOrWhiteSpace(normalizedPath) || !File.Exists(normalizedPath))
+        if (string.IsNullOrWhiteSpace(normalizedPath))
         {
             return null;
         }
 
         var fileInfo = new FileInfo(normalizedPath);
+        if (!fileInfo.Exists)
+        {
+            return TryGetLastGood(fileInfo.FullName);
+        }
+
         var decodePixelWidth = ResolveDecodePixelWidth(parameter);
         var cacheKey = new ImageCacheKey(
             fileInfo.FullName,
@@ -43,23 +49,34 @@ public sealed class ImagePathToBitmapConverter : IValueConverter
         {
             if (Cache.TryGetValue(cacheKey, out var cached))
             {
+                LastGoodByPath[fileInfo.FullName] = cached;
                 return cached;
             }
         }
 
-        using var stream = fileInfo.OpenRead();
-        var bitmap = Bitmap.DecodeToWidth(stream, decodePixelWidth, BitmapInterpolationMode.MediumQuality);
+        Bitmap bitmap;
+        try
+        {
+            using var stream = fileInfo.OpenRead();
+            bitmap = Bitmap.DecodeToWidth(stream, decodePixelWidth, BitmapInterpolationMode.MediumQuality);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidDataException or NotSupportedException)
+        {
+            return TryGetLastGood(fileInfo.FullName);
+        }
 
         lock (CacheGate)
         {
             if (Cache.TryGetValue(cacheKey, out var cached))
             {
                 bitmap.Dispose();
+                LastGoodByPath[fileInfo.FullName] = cached;
                 return cached;
             }
 
             Cache[cacheKey] = bitmap;
             CacheOrder.Enqueue(cacheKey);
+            LastGoodByPath[fileInfo.FullName] = bitmap;
             TrimCache();
             return bitmap;
         }
@@ -98,8 +115,19 @@ public sealed class ImagePathToBitmapConverter : IValueConverter
         {
             if (Cache.Remove(oldestKey, out var bitmap))
             {
-                bitmap.Dispose();
+                if (!LastGoodByPath.Values.Any(value => ReferenceEquals(value, bitmap)))
+                {
+                    bitmap.Dispose();
+                }
             }
+        }
+    }
+
+    private static Bitmap? TryGetLastGood(string path)
+    {
+        lock (CacheGate)
+        {
+            return LastGoodByPath.TryGetValue(path, out var bitmap) ? bitmap : null;
         }
     }
 
