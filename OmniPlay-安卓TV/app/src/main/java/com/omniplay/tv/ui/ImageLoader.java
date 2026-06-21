@@ -24,8 +24,11 @@ import java.util.concurrent.Executors;
 public final class ImageLoader {
     private static final int DEFAULT_TARGET_WIDTH = 360;
     private static final int DEFAULT_TARGET_HEIGHT = 540;
+    private static final float DECODE_QUALITY_MULTIPLIER = 1.75f;
+    private static final int MAX_DECODE_WIDTH = 900;
+    private static final int MAX_DECODE_HEIGHT = 1350;
 
-    private final ExecutorService executor = Executors.newFixedThreadPool(2);
+    private final ExecutorService executor = Executors.newFixedThreadPool(4);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final File diskDirectory;
     private final LruCache<String, Bitmap> cache = new LruCache<String, Bitmap>(memoryCacheSizeKb()) {
@@ -55,8 +58,8 @@ public final class ImageLoader {
             return;
         }
 
-        int decodeWidth = targetWidth > 0 ? targetWidth : DEFAULT_TARGET_WIDTH;
-        int decodeHeight = targetHeight > 0 ? targetHeight : DEFAULT_TARGET_HEIGHT;
+        int decodeWidth = qualityTarget(targetWidth, DEFAULT_TARGET_WIDTH);
+        int decodeHeight = qualityTarget(targetHeight, DEFAULT_TARGET_HEIGHT);
         String cacheKey = cacheKey(url, decodeWidth, decodeHeight);
         Bitmap cached = cache.get(cacheKey);
         if (cached != null) {
@@ -178,8 +181,8 @@ public final class ImageLoader {
 
     private static int memoryCacheSizeKb() {
         long maxKb = Runtime.getRuntime().maxMemory() / 1024L;
-        long targetKb = Math.max(16L * 1024L, Math.min(maxKb / 8L, 64L * 1024L));
-        return (int) Math.max(16L * 1024L, targetKb);
+        long targetKb = Math.max(32L * 1024L, Math.min(maxKb / 5L, 128L * 1024L));
+        return (int) Math.max(24L * 1024L, targetKb);
     }
 
     private static Bitmap decodeFile(File file, int targetWidth, int targetHeight) {
@@ -191,9 +194,14 @@ public final class ImageLoader {
                 return null;
             }
 
+            int decodeWidth = qualityTarget(targetWidth, DEFAULT_TARGET_WIDTH);
+            int decodeHeight = qualityTarget(targetHeight, DEFAULT_TARGET_HEIGHT);
+
             BitmapFactory.Options options = new BitmapFactory.Options();
-            options.inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, targetWidth, targetHeight);
-            options.inPreferredConfig = Bitmap.Config.RGB_565;
+            options.inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, decodeWidth, decodeHeight);
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            options.inDither = true;
+            options.inScaled = false;
             return BitmapFactory.decodeFile(file.getAbsolutePath(), options);
         } catch (RuntimeException ignored) {
             return null;
@@ -201,13 +209,19 @@ public final class ImageLoader {
     }
 
     private static int sampleSize(int sourceWidth, int sourceHeight, int targetWidth, int targetHeight) {
-        int width = targetWidth > 0 ? targetWidth : DEFAULT_TARGET_WIDTH;
-        int height = targetHeight > 0 ? targetHeight : DEFAULT_TARGET_HEIGHT;
+        int width = targetWidth > 0 ? targetWidth : qualityTarget(0, DEFAULT_TARGET_WIDTH);
+        int height = targetHeight > 0 ? targetHeight : qualityTarget(0, DEFAULT_TARGET_HEIGHT);
         int sample = 1;
         while (sourceHeight / (sample * 2) >= height && sourceWidth / (sample * 2) >= width) {
             sample *= 2;
         }
         return Math.max(1, sample);
+    }
+
+    private static int qualityTarget(int value, int fallback) {
+        int base = value > 0 ? value : fallback;
+        int cap = fallback == DEFAULT_TARGET_WIDTH ? MAX_DECODE_WIDTH : MAX_DECODE_HEIGHT;
+        return Math.max(1, Math.min(cap, Math.round(base * DECODE_QUALITY_MULTIPLIER)));
     }
 
     private static int layoutSize(int value) {

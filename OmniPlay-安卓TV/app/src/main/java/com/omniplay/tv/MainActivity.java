@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -98,6 +99,7 @@ public final class MainActivity extends Activity {
     private static final int COLOR_SUBTLE = Color.rgb(107, 114, 128);
     private static final int COLOR_FOCUS = Color.rgb(37, 99, 235);
     private static final int COLOR_ACCENT = Color.rgb(20, 184, 166);
+    private static final int COLOR_FOCUS_SOFT = Color.rgb(232, 240, 255);
     private static final int COLOR_DANGER = Color.rgb(185, 28, 28);
     private static final int COLOR_PLAYER_TEXT = Color.WHITE;
     private static final int COLOR_PLAYER_MUTED = Color.rgb(229, 231, 235);
@@ -108,8 +110,10 @@ public final class MainActivity extends Activity {
     private static final float FOCUS_SCALE = 1.04f;
     private static final int FOCUS_ANIMATION_MS = 120;
     private static final int HOME_PAGE_HORIZONTAL_PADDING_DP = 44;
-    private static final int HOME_POSTER_COLUMNS = 8;
+    private static final int HOME_POSTER_COLUMNS = 6;
     private static final int HOME_POSTER_CARD_MARGIN_DP = 4;
+    private static final int HOME_POSTER_CARD_PADDING_DP = 8;
+    private static final int HOME_POSTER_ROW_BOTTOM_DP = 18;
     private static final int DETAIL_POSTER_WIDTH_DP = 230;
     private static final int DETAIL_POSTER_HEIGHT_DP = 342;
     private static final int EPISODE_CARD_WIDTH_DP = 286;
@@ -507,6 +511,7 @@ public final class MainActivity extends Activity {
 
     private void showHome() {
         screen = Screen.HOME;
+        boolean returningFromDetail = currentDetail != null;
         currentDetail = null;
         selectedSeasonId = "";
         homeScrollY = 0;
@@ -527,7 +532,9 @@ public final class MainActivity extends Activity {
             showLoading("正在加载媒体库");
         }
 
-        refreshHomeLibrary(!hasVisibleLibrary);
+        if (!returningFromDetail || !hasVisibleLibrary) {
+            refreshHomeLibrary(!hasVisibleLibrary);
+        }
     }
 
     private void refreshHomeLibrary(boolean showErrorScreen) {
@@ -557,37 +564,43 @@ public final class MainActivity extends Activity {
         scroll.setFillViewport(false);
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
-        root.addView(scroll, match());
+        FrameLayout.LayoutParams scrollParams = match();
+        scrollParams.setMargins(0, homeTopPaddingPx(), 0, 0);
+        root.addView(scroll, scrollParams);
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), sdp(30), sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), sdp(42));
+        page.setPadding(sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), 0, sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), sdp(42));
         page.setClipChildren(false);
         page.setClipToPadding(false);
         scroll.addView(page, matchWidth());
 
         View firstFocusable = null;
+        List<Models.LibraryItem> continueItems = continueItems(libraryItems);
+        int headerInset = homePosterVisualLeftInsetPx();
 
         LinearLayout continueHeader = new LinearLayout(this);
         continueHeader.setGravity(Gravity.CENTER_VERTICAL);
         continueHeader.setClipChildren(false);
         continueHeader.setClipToPadding(false);
-        page.addView(continueHeader, margin(matchWidth(), 0, 0, 0, sdp(16)));
+        continueHeader.setPadding(headerInset, 0, headerInset, 0);
+        page.addView(continueHeader, margin(matchWidth(), 0, continueItems.isEmpty() ? sdp(12) : 0, 0, sdp(12)));
         TextView continueTitle = sectionTitle("继续播放");
         continueTitle.setPadding(0, 0, 0, 0);
         continueHeader.addView(continueTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         Button settings = compactButton("设置");
-        continueHeader.addView(settings, new LinearLayout.LayoutParams(sdp(106), sdp(48)));
+        continueHeader.addView(settings, new LinearLayout.LayoutParams(sdp(82), sdp(42)));
         settings.setOnClickListener(view -> {
             openSettingsOverlay();
         });
 
-        List<Models.LibraryItem> continueItems = continueItems(libraryItems);
         if (continueItems.isEmpty()) {
-            page.addView(emptyText("暂无继续播放"));
+            TextView emptyContinue = emptyText("暂无继续播放");
+            emptyContinue.setPadding(headerInset, 0, 0, sdp(20));
+            page.addView(emptyContinue);
         } else {
             GridLayout continueGrid = posterGrid();
-            page.addView(continueGrid, margin(matchWidth(), 0, 0, 0, sdp(34)));
+            page.addView(continueGrid, margin(matchWidth(), 0, 0, 0, sdp(14)));
             for (Models.LibraryItem item : continueItems) {
                 View card = posterCard(item, true);
                 if (firstFocusable == null) {
@@ -601,28 +614,29 @@ public final class MainActivity extends Activity {
         libraryHeader.setGravity(Gravity.CENTER_VERTICAL);
         libraryHeader.setClipChildren(false);
         libraryHeader.setClipToPadding(false);
-        page.addView(libraryHeader, margin(matchWidth(), 0, sdp(8), 0, sdp(16)));
+        libraryHeader.setPadding(headerInset, 0, headerInset, 0);
+        page.addView(libraryHeader, margin(matchWidth(), 0, continueItems.isEmpty() ? sdp(12) : 0, 0, sdp(10)));
 
         TextView libraryTitle = sectionTitle("所有影视");
         libraryTitle.setPadding(0, 0, 0, 0);
         libraryHeader.addView(libraryTitle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         Button search = compactButton("搜索");
-        libraryHeader.addView(search, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(20), 0, 0, 0));
+        libraryHeader.addView(search, margin(new LinearLayout.LayoutParams(sdp(78), sdp(42)), sdp(18), 0, 0, 0));
         search.setOnClickListener(view -> {
             isSearchOpen = !isSearchOpen;
             renderHomeContentKeepingPosition();
         });
 
         Button sort = compactButton("排序");
-        libraryHeader.addView(sort, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(12), 0, 0, 0));
+        libraryHeader.addView(sort, margin(new LinearLayout.LayoutParams(sdp(78), sdp(42)), sdp(9), 0, 0, 0));
         sort.setOnClickListener(view -> {
             isSortOpen = !isSortOpen;
             renderHomeContentKeepingPosition();
         });
 
         Button direction = compactButton(sortDescending ? "降序" : "升序");
-        libraryHeader.addView(direction, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(12), 0, 0, 0));
+        libraryHeader.addView(direction, margin(new LinearLayout.LayoutParams(sdp(78), sdp(42)), sdp(9), 0, 0, 0));
         direction.setOnClickListener(view -> {
             sortDescending = !sortDescending;
             renderHomeContentKeepingPosition();
@@ -1048,15 +1062,15 @@ public final class MainActivity extends Activity {
         GridLayout.LayoutParams params = new GridLayout.LayoutParams();
         params.width = cardWidth;
         params.height = ViewGroup.LayoutParams.WRAP_CONTENT;
-        params.setMargins(sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(7), sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(26));
+        params.setMargins(sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(5), sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(HOME_POSTER_ROW_BOTTOM_DP));
         card.setLayoutParams(params);
-        applyCardFocus(card, () -> scheduleDetailPrefetch(item.id, card));
 
         FrameLayout posterFrame = new FrameLayout(this);
         posterFrame.setPadding(dp(1), dp(1), dp(1), dp(1));
         posterFrame.setClipToOutline(true);
         posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), sdp(12)));
         card.addView(posterFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, posterHeight));
+        applyPosterCardFocus(card, posterFrame, () -> scheduleDetailPrefetch(item.id, card));
 
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -1215,11 +1229,16 @@ public final class MainActivity extends Activity {
         content.setClipToPadding(false);
         scroll.addView(content, matchWidth());
 
+        FrameLayout heroFrame = new FrameLayout(this);
+        heroFrame.setClipChildren(false);
+        heroFrame.setClipToPadding(false);
+        content.addView(heroFrame, margin(matchWidth(), 0, 0, 0, sdp(40)));
+
         LinearLayout hero = new LinearLayout(this);
         hero.setGravity(Gravity.TOP);
         hero.setClipChildren(false);
         hero.setClipToPadding(false);
-        content.addView(hero, margin(matchWidth(), 0, 0, 0, sdp(40)));
+        heroFrame.addView(hero, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         FrameLayout posterFrame = new FrameLayout(this);
         posterFrame.setPadding(0, 0, 0, 0);
@@ -1298,12 +1317,6 @@ public final class MainActivity extends Activity {
             });
             play.requestFocus();
 
-            TextView subtitleStatus = subtitleCacheStatusView(mainFile);
-            if (subtitleStatus != null) {
-                subtitleStatus.setGravity(Gravity.CENTER);
-                playColumn.addView(subtitleStatus, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(34)), 0, sdp(10), 0, 0));
-            }
-
             Button watchStatus = button(watchedStatusLabel(mainFile), isEffectivelyWatched(mainFile));
             actions.addView(watchStatus, margin(new LinearLayout.LayoutParams(sdp(116), sdp(48)), sdp(16), 0, 0, 0));
             watchStatus.setOnClickListener(view -> toggleVideoWatched(mainFile));
@@ -1318,6 +1331,17 @@ public final class MainActivity extends Activity {
             timelineColumn.addView(timeline, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(48)));
 
             refreshSubtitleCacheStatus(detail, mainFile);
+
+            TextView subtitleStatus = subtitleCacheStatusView(mainFile);
+            if (subtitleStatus != null) {
+                subtitleStatus.setGravity(Gravity.CENTER);
+                FrameLayout.LayoutParams subtitleParams = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        sdp(34),
+                        Gravity.TOP | Gravity.RIGHT);
+                subtitleParams.setMargins(0, sdp(2), sdp(4), 0);
+                heroFrame.addView(subtitleStatus, subtitleParams);
+            }
         }
 
         if ("tv".equals(detail.itemKind) && !detail.seasons.isEmpty()) {
@@ -1475,8 +1499,8 @@ public final class MainActivity extends Activity {
 
         LinearLayout overlay = new LinearLayout(this);
         overlay.setOrientation(LinearLayout.VERTICAL);
-        overlay.setPadding(sdp(42), sdp(32), sdp(42), sdp(32));
-        overlay.setBackgroundColor(Color.argb(128, 0, 0, 0));
+        overlay.setPadding(sdp(46), sdp(34), sdp(46), sdp(30));
+        overlay.setBackgroundColor(Color.argb(108, 0, 0, 0));
         overlay.addView(text(file.label(), ssp(22), Typeface.BOLD, COLOR_PLAYER_TEXT));
         String summary = file.mediaSummary();
         if (!summary.isEmpty()) {
@@ -1492,9 +1516,9 @@ public final class MainActivity extends Activity {
         overlay.bringToFront();
         playerTopOverlay = overlay;
 
-        TextView subtitles = text("", ssp(28), Typeface.BOLD, Color.WHITE);
+        TextView subtitles = text("", ssp(29), Typeface.BOLD, Color.WHITE);
         subtitles.setGravity(Gravity.CENTER);
-        subtitles.setShadowLayer(sdp(3), 0, sdp(1), Color.BLACK);
+        subtitles.setShadowLayer(sdp(4), 0, sdp(1), Color.BLACK);
         subtitles.setMaxLines(3);
         subtitles.setIncludeFontPadding(true);
         subtitles.setVisibility(View.GONE);
@@ -1717,21 +1741,21 @@ public final class MainActivity extends Activity {
     private LinearLayout playerControls(Models.VideoFile file) {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(sdp(22), sdp(16), sdp(22), sdp(18));
+        panel.setPadding(sdp(24), sdp(14), sdp(24), sdp(16));
         panel.setClipChildren(false);
         panel.setClipToPadding(false);
-        panel.setBackground(rounded(Color.argb(184, 10, 14, 22), Color.argb(96, 255, 255, 255), dp(1), sdp(20)));
+        panel.setBackground(rounded(Color.argb(176, 9, 13, 21), Color.argb(82, 255, 255, 255), dp(1), sdp(18)));
 
         FrameLayout buttonRow = new FrameLayout(this);
         buttonRow.setClipChildren(false);
         buttonRow.setClipToPadding(false);
-        panel.addView(buttonRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(56)));
+        panel.addView(buttonRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(54)));
 
         ImageButton pause = playerIconButton(R.drawable.ic_player_pause);
         pause.setId(View.generateViewId());
         pause.setContentDescription("播放/暂停");
         playerPlayPauseButton = pause;
-        FrameLayout.LayoutParams pauseParams = new FrameLayout.LayoutParams(sdp(70), sdp(52), Gravity.CENTER);
+        FrameLayout.LayoutParams pauseParams = new FrameLayout.LayoutParams(sdp(66), sdp(50), Gravity.CENTER);
         buttonRow.addView(pause, pauseParams);
         pause.setOnClickListener(view -> {
             togglePlayerPaused();
@@ -1749,14 +1773,14 @@ public final class MainActivity extends Activity {
         audio.setId(View.generateViewId());
         audio.setContentDescription("音轨");
         playerAudioButton = audio;
-        tools.addView(audio, new LinearLayout.LayoutParams(sdp(70), sdp(52)));
+        tools.addView(audio, new LinearLayout.LayoutParams(sdp(66), sdp(50)));
         audio.setOnClickListener(view -> showAudioMenu(activePlaybackFile == null ? file : activePlaybackFile, audio));
 
         ImageButton subtitle = playerIconButton(R.drawable.ic_player_subtitle);
         subtitle.setId(View.generateViewId());
         subtitle.setContentDescription("字幕");
         playerSubtitleButton = subtitle;
-        tools.addView(subtitle, margin(new LinearLayout.LayoutParams(sdp(70), sdp(52)), sdp(10), 0, 0, 0));
+        tools.addView(subtitle, margin(new LinearLayout.LayoutParams(sdp(66), sdp(50)), sdp(9), 0, 0, 0));
         subtitle.setOnClickListener(view -> showSubtitleMenu(activePlaybackFile == null ? file : activePlaybackFile, subtitle));
 
         pause.setNextFocusRightId(audio.getId());
@@ -1777,7 +1801,7 @@ public final class MainActivity extends Activity {
         playerProgressFill = new View(this);
         playerProgressFill.setBackground(rounded(COLOR_ACCENT, Color.TRANSPARENT, 0, sdp(4)));
         playerProgressTrack.addView(playerProgressFill, new FrameLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT));
-        progressRow.addView(playerProgressTrack, margin(new LinearLayout.LayoutParams(0, sdp(8), 1f), sdp(14), 0, sdp(14), 0));
+        progressRow.addView(playerProgressTrack, margin(new LinearLayout.LayoutParams(0, sdp(7), 1f), sdp(14), 0, sdp(14), 0));
 
         playerTotalTime = text("--:--", ssp(13), Typeface.BOLD, COLOR_PLAYER_MUTED);
         playerTotalTime.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
@@ -5190,6 +5214,15 @@ public final class MainActivity extends Activity {
         return Math.max(0, (contentWidth - rowWidth) / 2);
     }
 
+    private int homePosterVisualLeftInsetPx() {
+        return homePosterGridSideInsetPx() + sdp(HOME_POSTER_CARD_MARGIN_DP + HOME_POSTER_CARD_PADDING_DP);
+    }
+
+    private int homeTopPaddingPx() {
+        int height = getResources().getDisplayMetrics().heightPixels;
+        return Math.max(sdp(38), Math.round(height * 0.032f));
+    }
+
     private int detailEpisodeColumnCount() {
         int availableWidth = Math.max(1, getResources().getDisplayMetrics().widthPixels - sdp(104));
         int itemWidth = sdp(EPISODE_CARD_WIDTH_DP) + sdp(22);
@@ -5250,7 +5283,7 @@ public final class MainActivity extends Activity {
         button.setAllCaps(false);
         button.setTextColor(Color.WHITE);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(sdp(10), 0, sdp(10), 0);
+        button.setPadding(sdp(12), 0, sdp(12), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -5259,13 +5292,13 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.argb(96, 255, 255, 255), Color.argb(90, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
+        button.setBackground(rounded(Color.argb(70, 255, 255, 255), Color.argb(86, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
             animateFocusScale(focusedView, hasFocus);
             button.setTextColor(hasFocus ? COLOR_FOCUS : Color.WHITE);
-            focusedView.setBackground(rounded(Color.argb(hasFocus ? 126 : 96, 255, 255, 255), Color.argb(90, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
+            focusedView.setBackground(rounded(Color.argb(hasFocus ? 224 : 70, 255, 255, 255), Color.argb(hasFocus ? 224 : 86, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
             focusedView.setElevation(0);
         });
         return button;
@@ -5276,17 +5309,17 @@ public final class MainActivity extends Activity {
         button.setImageResource(iconResId);
         button.setColorFilter(Color.WHITE);
         button.setScaleType(ImageView.ScaleType.CENTER);
-        button.setPadding(sdp(12), sdp(10), sdp(12), sdp(10));
+        button.setPadding(sdp(13), sdp(11), sdp(13), sdp(11));
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
+        button.setBackground(rounded(Color.argb(26, 255, 255, 255), Color.argb(136, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
             animateFocusScale(focusedView, hasFocus);
             button.setColorFilter(hasFocus ? COLOR_FOCUS : Color.WHITE);
-            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
+            focusedView.setBackground(rounded(hasFocus ? Color.argb(222, 255, 255, 255) : Color.argb(26, 255, 255, 255), Color.argb(hasFocus ? 232 : 136, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
             focusedView.setElevation(0);
         });
         return button;
@@ -5299,7 +5332,7 @@ public final class MainActivity extends Activity {
         button.setAllCaps(false);
         button.setTextColor(selected ? COLOR_ACCENT : Color.WHITE);
         button.setGravity(Gravity.CENTER_VERTICAL);
-        button.setPadding(sdp(14), 0, sdp(14), 0);
+        button.setPadding(sdp(16), 0, sdp(16), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -5310,13 +5343,13 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
+        button.setBackground(rounded(Color.argb(selected ? 44 : 18, 255, 255, 255), Color.argb(112, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
             animateFocusScale(focusedView, hasFocus);
             button.setTextColor(hasFocus ? COLOR_FOCUS : (selected ? COLOR_ACCENT : Color.WHITE));
-            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
+            focusedView.setBackground(rounded(hasFocus ? Color.argb(226, 255, 255, 255) : Color.argb(selected ? 44 : 18, 255, 255, 255), Color.argb(hasFocus ? 226 : 112, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
             focusedView.setElevation(0);
         });
         return button;
@@ -5333,7 +5366,7 @@ public final class MainActivity extends Activity {
         button.setAllCaps(false);
         button.setTextColor(active ? COLOR_FOCUS : COLOR_TEXT);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(sdp(12), 0, sdp(12), 0);
+        button.setPadding(sdp(14), 0, sdp(14), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -5342,7 +5375,7 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
+        button.setBackground(rounded(active ? COLOR_FOCUS_SOFT : Color.argb(238, 255, 255, 255), active ? COLOR_FOCUS : COLOR_BORDER, FOCUS_STROKE_PX, sdp(9)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         applyButtonFocus(button, active);
@@ -5358,17 +5391,21 @@ public final class MainActivity extends Activity {
     }
 
     private TextView title(String value) {
-        return text(value, ssp(32), Typeface.BOLD, COLOR_TEXT);
+        TextView title = text(value, ssp(32), Typeface.BOLD, COLOR_TEXT);
+        title.setLineSpacing(sdp(3), 1f);
+        return title;
     }
 
     private TextView sectionTitle(String value) {
         TextView title = text(value, ssp(24), Typeface.BOLD, COLOR_TEXT);
-        title.setPadding(0, sdp(10), 0, sdp(16));
+        title.setPadding(0, sdp(12), 0, sdp(14));
+        title.setLineSpacing(sdp(2), 1f);
         return title;
     }
 
     private TextView body(String value) {
         TextView text = text(value, ssp(16), Typeface.NORMAL, COLOR_MUTED);
+        text.setLineSpacing(sdp(3), 1f);
         text.setPadding(0, sdp(8), 0, sdp(18));
         return text;
     }
@@ -5411,7 +5448,9 @@ public final class MainActivity extends Activity {
         textView.setTextSize(sp);
         textView.setTypeface(Typeface.DEFAULT, style);
         textView.setTextColor(color);
-        textView.setIncludeFontPadding(true);
+        textView.setIncludeFontPadding(false);
+        textView.setFontFeatureSettings("kern");
+        textView.setPaintFlags(textView.getPaintFlags() | Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG | Paint.LINEAR_TEXT_FLAG);
         return textView;
     }
 
@@ -5419,7 +5458,7 @@ public final class MainActivity extends Activity {
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
             animateFocusScale(focusedView, hasFocus);
             button.setTextColor(hasFocus || active ? COLOR_FOCUS : COLOR_TEXT);
-            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
+            focusedView.setBackground(rounded(hasFocus || active ? Color.argb(248, 255, 255, 255) : Color.argb(238, 255, 255, 255), COLOR_BORDER, FOCUS_STROKE_PX, sdp(9)));
             focusedView.setElevation(0);
         });
     }
@@ -5428,7 +5467,7 @@ public final class MainActivity extends Activity {
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
             animateFocusScale(focusedView, hasFocus);
             button.setTextColor(COLOR_TEXT);
-            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
+            focusedView.setBackground(rounded(hasFocus ? Color.argb(248, 255, 255, 255) : Color.argb(238, 255, 255, 255), COLOR_BORDER, FOCUS_STROKE_PX, sdp(9)));
             focusedView.setElevation(0);
         });
     }
@@ -5455,13 +5494,26 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void applyPosterCardFocus(View card, FrameLayout posterFrame, Runnable onFocused) {
+        card.setOnFocusChangeListener((focusedView, hasFocus) -> {
+            animateFocusScale(focusedView, hasFocus);
+            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, sdp(8)));
+            focusedView.setElevation(hasFocus ? sdp(12) : 0);
+            posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), sdp(12)));
+            posterFrame.setElevation(hasFocus ? sdp(8) : 0);
+            if (hasFocus && onFocused != null) {
+                onFocused.run();
+            }
+        });
+    }
+
     private void applyEpisodeStillFocus(View card, FrameLayout stillFrame, boolean showDetails, Button playButton, Models.VideoFile playbackFile) {
         card.setOnFocusChangeListener((focusedView, hasFocus) -> {
             focusedView.animate().scaleX(1f).scaleY(1f).setDuration(0).start();
             animateFocusScale(stillFrame, hasFocus);
             focusedView.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, sdp(8)));
             focusedView.setElevation(hasFocus ? sdp(10) : 0);
-            stillFrame.setBackground(rounded(COLOR_SURFACE_ALT, hasFocus ? COLOR_FOCUS : COLOR_BORDER, FOCUS_STROKE_PX, sdp(12)));
+            stillFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, FOCUS_STROKE_PX, sdp(12)));
             stillFrame.setElevation(hasFocus ? sdp(10) : 0);
             if (hasFocus && playButton != null && playbackFile != null) {
                 playButton.setText(playButtonText(playbackFile));
@@ -5499,9 +5551,9 @@ public final class MainActivity extends Activity {
         GradientDrawable background = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
                 new int[]{
-                        Color.rgb(248, 250, 252),
-                        Color.rgb(239, 246, 255),
-                        blend(COLOR_ACCENT, Color.WHITE, 0.90f)
+                        Color.rgb(229, 236, 246),
+                        Color.rgb(216, 230, 243),
+                        blend(COLOR_ACCENT, Color.rgb(210, 224, 232), 0.78f)
                 });
         root.setBackground(background);
     }
