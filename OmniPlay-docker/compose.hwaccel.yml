@@ -11,9 +11,6 @@ services:
 
     devices:
       - /dev/dri:/dev/dri
-    group_add:
-      - video
-      - render
 
     environment:
       TZ: Asia/Shanghai

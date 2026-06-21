@@ -97,6 +97,8 @@ environment:
 
 如果设备路径不同，把 `compose.hwaccel.yml` 里的 `OMNIPLAY_VAAPI_DEVICE` 改成实际的 `renderD*` 路径。
 
+容器默认以 root 运行，通常不需要额外配置 `group_add`。部分系统或镜像里不存在 `render` 组名，强行添加会导致容器启动时报 `Unable to find group render`。
+
 ## 常用环境变量
 
 - `OMNIPLAY_APP_ROOT`：容器内数据根目录，默认 `/var/lib/omniplay`。
