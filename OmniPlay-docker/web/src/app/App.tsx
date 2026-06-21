@@ -55,6 +55,7 @@ import {
   getMetadataEnrichmentStatus,
   getPlaybackDecision,
   getPlaybackCacheStatus,
+  getSubtitleCacheStatus,
   getPlaybackSubtitles,
   getPlaybackStreams,
   getRuntimeSelfCheck,
@@ -77,6 +78,7 @@ import {
   ProxyConnectionTestResult,
   ProxySettings,
   RuntimeSelfCheckSnapshot,
+  SubtitleCacheStatus,
   posterUrl,
   preparePlaybackCache,
   prewarmHlsCache,
@@ -3591,12 +3593,48 @@ function DetailView({
   const selectedSeason = detail.seasons.find((season) => season.id === resolvedSelectedSeasonId) ?? null;
   const selectedHlsCount = selectedHlsItemIds.length + selectedHlsVideoFileIds.length;
   const detailPosterSelected = selectedHlsItemIds.includes(detail.id);
+  const [subtitleCacheStatus, setSubtitleCacheStatus] = useState<SubtitleCacheStatus | null>(null);
+  const [isSubtitleCacheLoading, setIsSubtitleCacheLoading] = useState(false);
+  const subtitleCacheBadge = subtitleCacheStatusBadge(subtitleCacheStatus, isSubtitleCacheLoading, mainFile);
 
   useEffect(() => {
     if (resolvedSelectedSeasonId !== selectedSeasonId) {
       onSeasonChange(resolvedSelectedSeasonId);
     }
   }, [detail.id, onSeasonChange, resolvedSelectedSeasonId, selectedSeasonId]);
+
+  useEffect(() => {
+    const fileId = mainFile?.id ?? "";
+    if (!fileId) {
+      setSubtitleCacheStatus(null);
+      setIsSubtitleCacheLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setSubtitleCacheStatus(null);
+    setIsSubtitleCacheLoading(hasPrewarmableSubtitle(mainFile));
+    getSubtitleCacheStatus(fileId)
+      .then((status) => {
+        if (!cancelled) {
+          setSubtitleCacheStatus(status);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSubtitleCacheStatus(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsSubtitleCacheLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mainFile?.id]);
 
   return (
     <main className="detailShell">
@@ -3639,6 +3677,12 @@ function DetailView({
       </header>
 
       <section className="detailHero">
+        {subtitleCacheBadge ? (
+          <div className={`detailSubtitleCache ${subtitleCacheBadge.tone}`}>
+            <Captions size={16} />
+            <span>{subtitleCacheBadge.label}</span>
+          </div>
+        ) : null}
         <button
           aria-label={detailPosterSelected ? `取消 HLS 缓存 ${detail.title}` : `选择 HLS 缓存 ${detail.title}`}
           className={[
@@ -4176,6 +4220,32 @@ function watchedStatusLabel(file: VideoFileSummary | null): string {
   }
 
   return file.positionSeconds > 5 ? "未播完" : "未播";
+}
+
+function hasPrewarmableSubtitle(file: VideoFileSummary | null | undefined): boolean {
+  return !!file && file.subtitleStreams.length > 0;
+}
+
+function subtitleCacheStatusBadge(
+  status: SubtitleCacheStatus | null,
+  isLoading: boolean,
+  file: VideoFileSummary | null,
+): { label: string; tone: "checking" | "ready" | "pending" } | null {
+  if (!status) {
+    return isLoading && hasPrewarmableSubtitle(file)
+      ? { label: "字幕缓存 检测中", tone: "checking" }
+      : null;
+  }
+
+  if (status.subtitleTotal <= 0) {
+    return null;
+  }
+
+  if (status.subtitleCached >= status.subtitleTotal) {
+    return { label: `字幕已缓存 ${status.subtitleCached}/${status.subtitleTotal}`, tone: "ready" };
+  }
+
+  return { label: `字幕未全缓存 ${status.subtitleCached}/${status.subtitleTotal}`, tone: "pending" };
 }
 
 function FileRow({
@@ -5142,10 +5212,13 @@ function PlayerView({
     suppressProgressSaveRef.current = false;
     const resumeSeconds = resolveResumeSeconds();
     if (resumeSeconds > 0) {
+      pendingUserSeekRef.current = resumeSeconds;
+      seekHoldUntilRef.current = performance.now() + 15000;
       setCurrentTime(resumeSeconds);
     }
 
     const startPlayback = () => {
+      applyResumeSeekIfNeeded();
       setIsPaused(false);
       void video.play().catch((error: unknown) => {
         if (!isAutoplayIgnoredError(error)) {
@@ -5164,7 +5237,10 @@ function PlayerView({
         maxMaxBufferLength: 90,
         backBufferLength: 30,
       });
-      hls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        applyResumeSeekIfNeeded();
+        startPlayback();
+      });
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
     } else if (
@@ -5270,6 +5346,11 @@ function PlayerView({
 
   function readCurrentPlaybackTime(): number {
     const video = videoRef.current;
+    const pendingSeek = pendingUserSeekRef.current;
+    if (pendingSeek !== null && performance.now() < seekHoldUntilRef.current) {
+      return Math.max(0, pendingSeek);
+    }
+
     const hasLoadedSource =
       !!video &&
       Boolean(video.currentSrc || video.getAttribute("src")) &&
@@ -5284,6 +5365,27 @@ function PlayerView({
     }
 
     return Math.max(0, playbackPositionRef.current);
+  }
+
+  function applyResumeSeekIfNeeded() {
+    const video = videoRef.current;
+    const target = pendingSeekSecondsRef.current ?? pendingUserSeekRef.current;
+    if (!video || target === null || target <= 1) {
+      return;
+    }
+
+    const effectiveDuration = resolvePlaybackDuration(video.duration, duration || file.durationSeconds);
+    if (effectiveDuration > 0 && target >= effectiveDuration - 8) {
+      return;
+    }
+
+    if (Number.isFinite(video.duration) || video.readyState > 0) {
+      video.currentTime = target;
+    }
+    playbackPositionRef.current = target;
+    pendingUserSeekRef.current = target;
+    seekHoldUntilRef.current = performance.now() + 15000;
+    setCurrentTime(target);
   }
 
   function rememberPlaybackPosition(updateState = true) {
@@ -5342,6 +5444,8 @@ function PlayerView({
       video.currentTime = resumeSeconds;
       playbackPositionRef.current = resumeSeconds;
       pendingSeekSecondsRef.current = null;
+      pendingUserSeekRef.current = resumeSeconds;
+      seekHoldUntilRef.current = performance.now() + 15000;
       setCurrentTime(resumeSeconds);
     } else if (pendingSeekSecondsRef.current !== null) {
       pendingSeekSecondsRef.current = null;

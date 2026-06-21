@@ -1725,6 +1725,41 @@ input {
   z-index: 1;
 }
 
+.detailSubtitleCache {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 999px;
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.12);
+  color: #4b5563;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 7px;
+  height: 34px;
+  padding: 0 13px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  z-index: 2;
+}
+
+.detailSubtitleCache.ready {
+  color: #16a34a;
+}
+
+.detailSubtitleCache.pending {
+  color: #d97706;
+}
+
+.detailSubtitleCache.checking {
+  color: #6b7280;
+}
+
+.detailSubtitleCache svg {
+  flex: 0 0 auto;
+}
+
 .detailPoster {
   align-items: center;
   aspect-ratio: 2 / 3;

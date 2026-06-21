@@ -107,6 +107,22 @@ public sealed class LibraryDetailTests : IDisposable
         Assert.NotNull(zeroUpdateDetail);
         Assert.Equal(95, zeroUpdateDetail.MaxProgressSeconds);
 
+        Assert.True(await repository.UpdatePlaybackProgressAsync(new PlaybackProgressUpdateRequest(
+            firstFile.Id,
+            PositionSeconds: 4,
+            DurationSeconds: 100)));
+        var nearZeroUpdateDetail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(nearZeroUpdateDetail);
+        Assert.Equal(95, nearZeroUpdateDetail.MaxProgressSeconds);
+
+        Assert.True(await repository.UpdatePlaybackProgressAsync(new PlaybackProgressUpdateRequest(
+            firstFile.Id,
+            PositionSeconds: 6,
+            DurationSeconds: 100)));
+        var intentionalRestartDetail = await repository.GetItemDetailAsync(item.Id);
+        Assert.NotNull(intentionalRestartDetail);
+        Assert.Equal(6, intentionalRestartDetail.MaxProgressSeconds);
+
         Assert.True(await repository.SetWatchedAsync(new WatchedStatusUpdateRequest(firstFile.Id, IsWatched: false)));
         var unwatchedDetail = await repository.GetItemDetailAsync(item.Id);
         Assert.NotNull(unwatchedDetail);

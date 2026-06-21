@@ -381,6 +381,14 @@ export interface PlaybackCacheStatus {
   canStreamDirect: boolean;
 }
 
+export interface SubtitleCacheStatus {
+  pgsTotal: number;
+  pgsCached: number;
+  cachedBytes: number;
+  subtitleTotal: number;
+  subtitleCached: number;
+}
+
 export interface HlsPlaybackProfile {
   mode: string;
   transcodeVideo: boolean;
@@ -923,6 +931,10 @@ export async function getPlaybackDiagnostics(
 
 export async function getPlaybackCacheStatus(videoFileId: string): Promise<PlaybackCacheStatus> {
   return readJson<PlaybackCacheStatus>(`/api/playback/files/${encodeURIComponent(videoFileId)}/cache`);
+}
+
+export async function getSubtitleCacheStatus(videoFileId: string): Promise<SubtitleCacheStatus> {
+  return readJson<SubtitleCacheStatus>(`/api/playback/files/${encodeURIComponent(videoFileId)}/subtitle-cache/status`);
 }
 
 export async function preparePlaybackCache(videoFileId: string): Promise<PlaybackCacheStatus> {
