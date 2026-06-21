@@ -46,7 +46,7 @@ ENV OMNIPLAY_LOCAL_SHARE_ROOTS=/media
 ENV OMNIPLAY_FFMPEG_PATH=/usr/bin/ffmpeg
 ENV OMNIPLAY_FFPROBE_PATH=/usr/bin/ffprobe
 ENV OMNIPLAY_VAAPI_DEVICE=/dev/dri/renderD128
-ENV OMNIPLAY_ENABLE_QSV=1
+ENV OMNIPLAY_ENABLE_QSV=0
 ENV DOTNET_EnableDiagnostics=0
 
 VOLUME ["/var/lib/omniplay", "/var/cache/omniplay", "/media"]

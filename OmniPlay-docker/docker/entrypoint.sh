@@ -9,7 +9,7 @@ set -eu
 : "${OMNIPLAY_FFPROBE_PATH:=/usr/bin/ffprobe}"
 : "${OMNIPLAY_LOCAL_SHARE_ROOTS:=/media}"
 : "${OMNIPLAY_VAAPI_DEVICE:=/dev/dri/renderD128}"
-: "${OMNIPLAY_ENABLE_QSV:=1}"
+: "${OMNIPLAY_ENABLE_QSV:=0}"
 
 export OMNIPLAY_APP_ROOT
 export OMNIPLAY_CACHE_ROOT

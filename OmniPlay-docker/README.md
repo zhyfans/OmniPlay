@@ -4,9 +4,18 @@
 
 ## 快速运行
 
+无硬解通用版，适合所有 Docker 主机：
+
 ```sh
 cd OmniPlay-docker
 docker compose up -d --build
+```
+
+Intel VAAPI/QSV 硬解版，适合有 `/dev/dri` 的 NAS/主机：
+
+```sh
+cd OmniPlay-docker
+docker compose -f compose.hwaccel.yml up -d --build
 ```
 
 默认访问地址：
@@ -17,17 +26,17 @@ http://NAS_IP:45722
 
 首次打开后注册管理员账号。
 
-默认 `compose.yml` 使用 host 网络。这样容器内访问 `127.0.0.1/localhost` 就是宿主机，适合直接使用 NAS/宿主机本机代理，例如 `http://localhost:20171`。
+默认 `compose.yml` 和 `compose.hwaccel.yml` 都使用 host 网络。这样容器内访问 `127.0.0.1/localhost` 就是宿主机，适合直接使用 NAS/宿主机本机代理，例如 `http://localhost:20171`。
 
 ## 目录挂载
 
-`compose.yml` 默认挂载：
+两个 compose 默认都挂载：
 
 - `./data:/var/lib/omniplay`：数据库、设置、日志等小文件。
 - `./cache:/var/cache/omniplay`：海报、缩略图、HLS、字幕和 WebDAV 缓存。
 - `./media:/media:ro`：媒体目录，只读挂载。
 
-下载源码后可以直接运行默认 compose。首次使用前，把媒体文件放到 `OmniPlay-docker/media`，或把 `compose.yml` 里的左侧媒体路径改成实际目录，例如：
+下载源码后可以直接运行默认 compose。首次使用前，把媒体文件放到 `OmniPlay-docker/media`，或把所用 compose 文件里的左侧媒体路径改成实际目录，例如：
 
 ```yaml
 volumes:
@@ -68,9 +77,15 @@ IMAGE=omniplay-docker:x64 ./scripts/build-image.sh x64
 
 ## 硬件转码
 
-容器内默认安装系统 `ffmpeg`、`ffprobe`、VAAPI 基础库、Intel media driver、libvpl、Mesa VA 驱动和中文字体。默认 `compose.yml` 不挂载硬解设备，保证没有 `/dev/dri` 的机器也可以直接启动。
+容器内默认安装系统 `ffmpeg`、`ffprobe`、VAAPI 基础库、Intel media driver、libvpl、Mesa VA 驱动和中文字体。默认 `compose.yml` 不挂载硬解设备，也不启用 QSV/VAAPI，保证没有 `/dev/dri` 的机器可以直接启动。
 
-需要 Intel VAAPI/QSV 硬解时，可以在 `compose.yml` 中按实际设备加入：
+需要 Intel VAAPI/QSV 硬解时，使用硬解 compose：
+
+```sh
+docker compose -f compose.hwaccel.yml up -d --build
+```
+
+`compose.hwaccel.yml` 会挂载：
 
 ```yaml
 devices:
@@ -80,7 +95,7 @@ environment:
   OMNIPLAY_ENABLE_QSV: "1"
 ```
 
-如果设备路径不同，把 `OMNIPLAY_VAAPI_DEVICE` 改成实际的 `renderD*` 路径。
+如果设备路径不同，把 `compose.hwaccel.yml` 里的 `OMNIPLAY_VAAPI_DEVICE` 改成实际的 `renderD*` 路径。
 
 ## 常用环境变量
 
@@ -90,7 +105,7 @@ environment:
 - `OMNIPLAY_TMDB_ACCESS_TOKEN` / `OMNIPLAY_TMDB_API_KEY`：可选 TMDB 凭据。公开仓库不内置个人 TMDB Key，刮削前请在设置里填写自定义 API，或用环境变量提供。
 - `OMNIPLAY_FFMPEG_PATH` / `OMNIPLAY_FFPROBE_PATH`：FFmpeg 工具路径。
 - `OMNIPLAY_SCAN_PROBE_CONCURRENCY`：扫描时媒体探测并发数。
-- `OMNIPLAY_ENABLE_QSV`：是否启用 Intel QSV/VAAPI，默认 compose 设为 `0`，需要硬解时改为 `1` 并挂载 `/dev/dri`。
+- `OMNIPLAY_ENABLE_QSV`：是否启用 Intel QSV/VAAPI。`compose.yml` 为 `0`，`compose.hwaccel.yml` 为 `1` 并挂载 `/dev/dri`。
 
 ## 和套件版的关系
 

@@ -1,5 +1,3 @@
-# Default compose: no hardware acceleration device mount.
-# Use compose.hwaccel.yml on Intel VAAPI/QSV hosts with /dev/dri.
 services:
   omniplay:
     build:
@@ -11,6 +9,12 @@ services:
 
     network_mode: host
 
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+
     environment:
       TZ: Asia/Shanghai
       OMNIPLAY_APP_ROOT: /var/lib/omniplay
@@ -20,7 +24,8 @@ services:
       OMNIPLAY_LOCAL_SHARE_ROOTS: /media
       OMNIPLAY_FFMPEG_PATH: /usr/bin/ffmpeg
       OMNIPLAY_FFPROBE_PATH: /usr/bin/ffprobe
-      OMNIPLAY_ENABLE_QSV: "0"
+      OMNIPLAY_VAAPI_DEVICE: /dev/dri/renderD128
+      OMNIPLAY_ENABLE_QSV: "1"
       OMNIPLAY_DOCKER_HOST_NETWORK: "1"
 
     volumes:
