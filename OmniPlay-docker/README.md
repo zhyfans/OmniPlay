@@ -12,7 +12,7 @@ docker compose up -d --build
 默认访问地址：
 
 ```text
-http://NAS_IP:45721
+http://NAS_IP:45722
 ```
 
 首次打开后注册管理员账号。
@@ -21,18 +21,22 @@ http://NAS_IP:45721
 
 `compose.yml` 默认挂载：
 
-- `./data:/var/lib/omniplay`：数据库、设置、海报、缩略图、HLS 和 WebDAV 缓存。
-- `/volume1:/media/volume1:ro`：媒体目录，只读挂载。
+- `./data:/var/lib/omniplay`：数据库、设置、日志等小文件。
+- `./cache:/var/cache/omniplay`：海报、缩略图、HLS、字幕和 WebDAV 缓存。
+- `./media:/media:ro`：媒体目录，只读挂载。
 
-普通 Linux、飞牛或其他 NAS 需要把 `compose.yml` 里的左侧路径改成实际媒体目录，例如：
+下载源码后可以直接运行默认 compose。首次使用前，把媒体文件放到 `OmniPlay-docker/media`，或把 `compose.yml` 里的左侧媒体路径改成实际目录，例如：
 
 ```yaml
 volumes:
   - ./data:/var/lib/omniplay
+  - /mnt/big-disk/omniplay-cache:/var/cache/omniplay
   - /mnt/media:/media/video:ro
 ```
 
 然后在 OmniPlay Web UI 中添加容器内路径，例如 `/media/video`。
+
+不要把自己的 TMDB API Key、代理地址、账号密码写进 `compose.yml` 后提交。需要固定运行配置时，建议在本机创建未纳入 Git 的 `.env` 文件，或只在 Docker 管理界面里填写。
 
 ## 构建镜像
 
@@ -51,7 +55,9 @@ IMAGE=omniplay-docker:x64 ./scripts/build-image.sh x64
 
 ## 硬件转码
 
-容器内默认安装系统 `ffmpeg`、`ffprobe`、VAAPI 基础库、Intel media driver、libvpl、Mesa VA 驱动和中文字体，并默认按 Intel VAAPI/QSV 硬解配置启动。宿主机需要存在 `/dev/dri`，`compose.yml` 默认挂载：
+容器内默认安装系统 `ffmpeg`、`ffprobe`、VAAPI 基础库、Intel media driver、libvpl、Mesa VA 驱动和中文字体。默认 `compose.yml` 不挂载硬解设备，保证没有 `/dev/dri` 的机器也可以直接启动。
+
+需要 Intel VAAPI/QSV 硬解时，可以在 `compose.yml` 中按实际设备加入：
 
 ```yaml
 devices:
@@ -61,15 +67,17 @@ environment:
   OMNIPLAY_ENABLE_QSV: "1"
 ```
 
-如果宿主机没有 `/dev/dri` 或不需要硬解，删除 `compose.yml` 中的 `devices` 段，并移除 `OMNIPLAY_VAAPI_DEVICE`、`OMNIPLAY_ENABLE_QSV`。
+如果设备路径不同，把 `OMNIPLAY_VAAPI_DEVICE` 改成实际的 `renderD*` 路径。
 
 ## 常用环境变量
 
 - `OMNIPLAY_APP_ROOT`：容器内数据根目录，默认 `/var/lib/omniplay`。
+- `OMNIPLAY_CACHE_ROOT`：容器内缓存根目录，默认 `/var/cache/omniplay`。将宿主机机械硬盘目录挂载到这里即可迁移大缓存。
 - `OMNIPLAY_LOCAL_SHARE_ROOTS`：本地目录浏览根，默认 `/media`。
-- `OMNIPLAY_TMDB_ACCESS_TOKEN` / `OMNIPLAY_TMDB_API_KEY`：可选 TMDB 凭据。
+- `OMNIPLAY_TMDB_ACCESS_TOKEN` / `OMNIPLAY_TMDB_API_KEY`：可选 TMDB 凭据。公开仓库不内置个人 TMDB Key，刮削前请在设置里填写自定义 API，或用环境变量提供。
 - `OMNIPLAY_FFMPEG_PATH` / `OMNIPLAY_FFPROBE_PATH`：FFmpeg 工具路径。
 - `OMNIPLAY_SCAN_PROBE_CONCURRENCY`：扫描时媒体探测并发数。
+- `OMNIPLAY_ENABLE_QSV`：是否启用 Intel QSV/VAAPI，默认 compose 设为 `0`，需要硬解时改为 `1` 并挂载 `/dev/dri`。
 
 ## 和套件版的关系
 

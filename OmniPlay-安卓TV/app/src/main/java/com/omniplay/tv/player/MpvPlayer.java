@@ -104,12 +104,16 @@ public final class MpvPlayer {
     }
 
     public boolean load(String url, String cookieHeader, double startSeconds) {
+        return load(url, cookieHeader, startSeconds, false);
+    }
+
+    public boolean load(String url, String cookieHeader, double startSeconds, boolean isoPlayback) {
         if (!initialize()) {
             return false;
         }
 
         paused = false;
-        boolean loaded = MpvBridge.nativeLoad(handle, url, cookieHeader, "OmniPlay-Android/0.1", startSeconds);
+        boolean loaded = MpvBridge.nativeLoad(handle, url, cookieHeader, "OmniPlay-Android/0.1", startSeconds, isoPlayback);
         if (!loaded) {
             String detail = MpvBridge.nativeLastError(handle);
             lastError = detail == null || detail.isEmpty()
@@ -154,6 +158,20 @@ public final class MpvPlayer {
         if (initialized) {
             MpvBridge.nativeSetString(handle, "sid", value == null || value.isEmpty() ? "auto" : value);
         }
+    }
+
+    public String getStringProperty(String property, String fallback) {
+        if (!initialized) {
+            return fallback;
+        }
+        return MpvBridge.nativeGetString(handle, property, fallback);
+    }
+
+    public double getDoubleProperty(String property, double fallback) {
+        if (!initialized) {
+            return fallback;
+        }
+        return MpvBridge.nativeGetDouble(handle, property, fallback);
     }
 
     public double currentTimeSeconds() {

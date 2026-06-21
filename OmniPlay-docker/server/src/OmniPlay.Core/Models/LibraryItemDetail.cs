@@ -8,6 +8,8 @@ public sealed record LibraryItemDetail(
     string? Overview,
     string? PosterAssetId,
     double? VoteAverage,
+    double? DoubanRating,
+    DoubanMetadata? Douban,
     bool IsLocked,
     bool IsWatched,
     int VideoFileCount,

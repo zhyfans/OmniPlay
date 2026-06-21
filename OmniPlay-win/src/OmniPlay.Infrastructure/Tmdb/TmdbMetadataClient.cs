@@ -17,7 +17,7 @@ namespace OmniPlay.Infrastructure.Tmdb;
 
 public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTester
 {
-    private const string DefaultApiKey = "d05a3f7e939f5034054090b376de6f8c";
+    private const string DefaultApiKey = "";
     private const string TmdbApiBaseUrl = "https://api.themoviedb.org/3";
     private const string TmdbImageBaseUrl = "https://image.tmdb.org/t/p/w500";
     private const int DefaultSearchQueryLimit = 4;
@@ -1441,7 +1441,7 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient, ITmdbConnectionTes
     {
         var settings = overrideSettings ?? (await settingsService.LoadAsync(cancellationToken)).Tmdb;
         var language = ResolveLanguage(settings);
-        var builtInConfiguration = settings.EnableBuiltInPublicSource
+        var builtInConfiguration = settings.EnableBuiltInPublicSource && !string.IsNullOrWhiteSpace(DefaultApiKey)
             ? CreateBuiltInConfiguration(language)
             : null;
 

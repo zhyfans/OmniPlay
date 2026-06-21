@@ -62,7 +62,7 @@ public final class PhoneMainActivity extends Activity {
         getWindow().setNavigationBarColor(COLOR_BACKGROUND);
 
         api = new OmniPlayApi(this);
-        imageLoader = new ImageLoader();
+        imageLoader = new ImageLoader(this);
         root = new FrameLayout(this);
         root.setBackgroundColor(COLOR_BACKGROUND);
         setContentView(root);
@@ -104,15 +104,15 @@ public final class PhoneMainActivity extends Activity {
         scroll.addView(page, matchWidth());
 
         page.addView(title("OmniPlay"));
-        page.addView(body("连接群晖套件版服务端，手机端直接调用原文件播放地址。"));
+        page.addView(body("连接docker服务端，安卓端只播放，不扫描刮削。"));
 
-        EditText serverInput = input("服务端地址，例如 192.168.1.10:45721", api.serverUrl());
+        EditText serverInput = input("Docker 服务端地址，例如 http://192.168.1.10:45722", api.serverUrl());
         page.addView(serverInput, margin(matchWidth(), 0, dp(18), 0, 0));
 
-        EditText usernameInput = input("用户名", "");
+        EditText usernameInput = input("用户名", api.savedUsername());
         page.addView(usernameInput, margin(matchWidth(), 0, dp(12), 0, 0));
 
-        EditText passwordInput = input("密码", "");
+        EditText passwordInput = input("密码", api.savedPassword());
         passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         page.addView(passwordInput, margin(matchWidth(), 0, dp(12), 0, 0));
 
@@ -203,14 +203,15 @@ public final class PhoneMainActivity extends Activity {
         params.width = (getResources().getDisplayMetrics().widthPixels - dp(48)) / 2;
         params.setMargins(dp(4), dp(4), dp(4), dp(14));
         card.setLayoutParams(params);
+        int posterHeight = dp(238);
 
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        card.addView(poster, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(238)));
+        card.addView(poster, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, posterHeight));
         if (item.posterAssetId != null) {
-            imageLoader.load(poster, api.posterUrl(item.posterAssetId), api.cookieHeader());
+            imageLoader.load(poster, api.posterUrl(item.posterAssetId), api.cookieHeader(), params.width, posterHeight);
         } else {
-            imageLoader.load(poster, null, api.cookieHeader());
+            imageLoader.load(poster, null, api.cookieHeader(), params.width, posterHeight);
         }
 
         TextView name = text(item.title, 15, Typeface.BOLD, COLOR_TEXT);
@@ -259,11 +260,13 @@ public final class PhoneMainActivity extends Activity {
 
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        page.addView(poster, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(420)), 0, dp(16), 0, dp(18)));
+        int detailPosterHeight = dp(420);
+        page.addView(poster, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, detailPosterHeight), 0, dp(16), 0, dp(18)));
+        int detailPosterWidth = Math.max(dp(1), getResources().getDisplayMetrics().widthPixels - dp(32));
         if (detail.posterAssetId != null) {
-            imageLoader.load(poster, api.posterUrl(detail.posterAssetId), api.cookieHeader());
+            imageLoader.load(poster, api.posterUrl(detail.posterAssetId), api.cookieHeader(), detailPosterWidth, detailPosterHeight);
         } else {
-            imageLoader.load(poster, null, api.cookieHeader());
+            imageLoader.load(poster, null, api.cookieHeader(), detailPosterWidth, detailPosterHeight);
         }
 
         page.addView(title(detail.title));

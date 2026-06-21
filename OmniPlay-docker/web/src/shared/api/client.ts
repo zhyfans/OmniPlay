@@ -84,9 +84,14 @@ export interface ProxyConnectionTestResult {
 
 export interface CacheSettings {
   hlsRetentionHours: number;
+  hlsMaxGb: number;
+  hlsCachePath: string;
   imageCleanupScope: "orphans-and-untracked" | "orphans-only" | string;
   webDavRetentionHours: number;
   webDavMaxGb: number;
+  subtitleCachePath: string;
+  subtitleMaxGb: number;
+  subtitleCacheStrategy: "optimized" | "full" | string;
 }
 
 export interface PlaybackSettings {
@@ -163,6 +168,7 @@ export interface LibraryItemSummary {
   overview: string | null;
   posterAssetId: string | null;
   voteAverage: number | null;
+  doubanRating: number | null;
   isLocked: boolean;
   isWatched: boolean;
   videoFileCount: number;
@@ -176,6 +182,7 @@ export interface LibraryItemCustomMetadataUpdateRequest {
   releaseDate: string | null;
   overview: string | null;
   voteAverage: number | null;
+  doubanRating: number | null;
   posterFile?: File | null;
   episodeId?: string | null;
   episodeSubtitle?: string | null;
@@ -183,8 +190,40 @@ export interface LibraryItemCustomMetadataUpdateRequest {
 
 export interface LibraryItemDetail extends LibraryItemSummary {
   tmdbId: number | null;
+  douban: DoubanMetadata | null;
   videoFiles: VideoFileSummary[];
   seasons: SeasonDetail[];
+}
+
+export interface DoubanMetadata {
+  libraryItemId: string;
+  subjectId: string;
+  subjectUrl: string;
+  title: string;
+  originalTitle: string | null;
+  year: string | null;
+  rating: number | null;
+  ratingCount: number | null;
+  summary: string | null;
+  genres: string | null;
+  countries: string | null;
+  posterUrl: string | null;
+  fetchedAt: string;
+}
+
+export interface DoubanMetadataImportRequest {
+  subjectId: string;
+  subjectUrl: string;
+  title: string;
+  originalTitle?: string | null;
+  year?: string | null;
+  rating?: number | null;
+  ratingCount?: number | null;
+  summary?: string | null;
+  genres?: string | null;
+  countries?: string | null;
+  posterUrl?: string | null;
+  fetchedAt?: string | null;
 }
 
 export interface SeasonDetail {
@@ -481,6 +520,11 @@ export interface CacheUsageBucket {
   fileCount: number;
 }
 
+export interface HlsCachePrepareRequest {
+  libraryItemIds?: string[];
+  videoFileIds?: string[];
+}
+
 export async function getHealthStatus(): Promise<HealthStatus> {
   const response = await fetch("/api/health");
   if (!response.ok) {
@@ -701,6 +745,27 @@ export async function applyLibraryItemMetadata(
   return readResponse<LibraryItemDetail>(response);
 }
 
+export async function bindLibraryItemDouban(libraryItemId: string, subject: string): Promise<LibraryItemDetail> {
+  const response = await fetch(`/api/library/items/${encodeURIComponent(libraryItemId)}/douban/bind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subject }),
+  });
+  return readResponse<LibraryItemDetail>(response);
+}
+
+export async function importLibraryItemDouban(
+  libraryItemId: string,
+  request: DoubanMetadataImportRequest,
+): Promise<LibraryItemDetail> {
+  const response = await fetch(`/api/library/items/${encodeURIComponent(libraryItemId)}/douban/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  return readResponse<LibraryItemDetail>(response);
+}
+
 export async function setLibraryItemLocked(libraryItemId: string, isLocked: boolean): Promise<LibraryItemDetail> {
   const response = await fetch(`/api/library/items/${encodeURIComponent(libraryItemId)}/metadata/lock`, {
     method: "POST",
@@ -719,6 +784,7 @@ export async function updateLibraryItemCustomMetadata(
   body.set("releaseDate", request.releaseDate ?? "");
   body.set("overview", request.overview ?? "");
   body.set("voteAverage", request.voteAverage === null ? "" : String(request.voteAverage));
+  body.set("doubanRating", request.doubanRating === null ? "" : String(request.doubanRating));
   if (request.episodeId) {
     body.set("episodeId", request.episodeId);
     body.set("episodeSubtitle", request.episodeSubtitle ?? "");
@@ -893,10 +959,48 @@ export async function stopHlsSession(sessionId: string): Promise<void> {
   await readEmptyResponse(response);
 }
 
-export async function cleanupHlsCache(maxAgeHours?: number): Promise<BackgroundTaskStatus> {
-  const query = maxAgeHours === undefined ? "" : `?maxAgeHours=${encodeURIComponent(maxAgeHours)}`;
+export async function cleanupHlsCache(maxAgeHours?: number, maxGb?: number, clearAll?: boolean): Promise<BackgroundTaskStatus> {
+  const params = new URLSearchParams();
+  if (maxAgeHours !== undefined) {
+    params.set("maxAgeHours", String(maxAgeHours));
+  }
+  if (maxGb !== undefined) {
+    params.set("maxGb", String(maxGb));
+  }
+  if (clearAll !== undefined) {
+    params.set("clearAll", String(clearAll));
+  }
+  const queryString = params.toString();
+  const query = queryString ? `?${queryString}` : "";
   const response = await fetch(`/api/playback/hls/cleanup${query}`, {
     method: "POST",
+  });
+  return readResponse<BackgroundTaskStatus>(response);
+}
+
+export async function cleanupSubtitleCache(maxGb?: number, clearAll?: boolean): Promise<BackgroundTaskStatus> {
+  const params = new URLSearchParams();
+  if (maxGb !== undefined) {
+    params.set("maxGb", String(maxGb));
+  }
+  if (clearAll !== undefined) {
+    params.set("clearAll", String(clearAll));
+  }
+  const queryString = params.toString();
+  const query = queryString ? `?${queryString}` : "";
+  const response = await fetch(`/api/playback/subtitles/cache/cleanup${query}`, {
+    method: "POST",
+  });
+  return readResponse<BackgroundTaskStatus>(response);
+}
+
+export async function prewarmHlsCache(request: HlsCachePrepareRequest): Promise<BackgroundTaskStatus> {
+  const response = await fetch("/api/playback/hls/prewarm", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
   });
   return readResponse<BackgroundTaskStatus>(response);
 }

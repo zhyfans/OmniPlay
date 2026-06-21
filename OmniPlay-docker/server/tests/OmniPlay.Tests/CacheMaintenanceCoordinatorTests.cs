@@ -16,6 +16,7 @@ public sealed class CacheMaintenanceCoordinatorTests
             new TmdbSettings(),
             new CacheSettings(
                 HlsRetentionHours: 12,
+                HlsMaxGb: 9,
                 ImageCleanupScope: "orphans-only",
                 WebDavRetentionHours: 48,
                 WebDavMaxGb: 7),
@@ -35,6 +36,7 @@ public sealed class CacheMaintenanceCoordinatorTests
         await coordinator.RunOnceAsync();
 
         Assert.Equal(TimeSpan.FromHours(12), hlsService.LastRetention);
+        Assert.Equal(9L * 1024 * 1024 * 1024, hlsService.LastMaxBytes);
         Assert.Equal(TimeSpan.FromHours(48), webDavService.LastRetention);
         Assert.Equal(7L * 1024 * 1024 * 1024, webDavService.LastMaxBytes);
         Assert.Equal(1, hlsService.CallCount);
@@ -170,6 +172,7 @@ public sealed class CacheMaintenanceCoordinatorTests
     {
         public int CallCount { get; private set; }
         public TimeSpan? LastRetention { get; private set; }
+        public long? LastMaxBytes { get; private set; }
 
         public Task<HlsPlaybackSession> EnsureSessionAsync(
             PlayableVideoFile file,
@@ -177,6 +180,22 @@ public sealed class CacheMaintenanceCoordinatorTests
             CancellationToken cancellationToken = default)
         {
             throw new NotImplementedException();
+        }
+
+        public Task<HlsPlaybackSession> EnsureCompletedSessionAsync(
+            PlayableVideoFile file,
+            HlsPlaybackProfile profile,
+            IProgress<BackgroundTaskProgress>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            throw new NotImplementedException();
+        }
+
+        public HlsPlaybackSession? GetCompletedSession(
+            PlayableVideoFile file,
+            HlsPlaybackProfile profile)
+        {
+            return null;
         }
 
         public HlsPlaybackAsset? GetAsset(string sessionId, string assetName)
@@ -199,10 +218,11 @@ public sealed class CacheMaintenanceCoordinatorTests
             throw new NotImplementedException();
         }
 
-        public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge)
+        public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge, long? maxBytes = null)
         {
             CallCount++;
             LastRetention = maxAge;
+            LastMaxBytes = maxBytes;
             return new HlsCacheCleanupSummary(0, 0);
         }
     }

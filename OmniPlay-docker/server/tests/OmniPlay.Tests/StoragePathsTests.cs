@@ -23,6 +23,20 @@ public sealed class StoragePathsTests : IDisposable
         Assert.True(Directory.Exists(paths.LogsDirectory));
     }
 
+    [Fact]
+    public void CacheRootCanBeConfiguredSeparately()
+    {
+        var cacheRoot = Path.Combine(root, "hdd-cache");
+        var paths = new StoragePaths(Path.Combine(root, "app"), cacheRoot);
+
+        paths.EnsureCreated();
+
+        Assert.Equal(Path.GetFullPath(cacheRoot), paths.CacheDirectory);
+        Assert.StartsWith(Path.GetFullPath(cacheRoot), paths.PostersDirectory, StringComparison.Ordinal);
+        Assert.StartsWith(Path.GetFullPath(cacheRoot), paths.TranscodeDirectory, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(cacheRoot));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(root))

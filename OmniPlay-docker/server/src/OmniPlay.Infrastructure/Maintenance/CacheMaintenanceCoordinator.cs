@@ -10,19 +10,22 @@ public sealed class CacheMaintenanceCoordinator
     private readonly IWebDavCacheCleanupService webDavCacheCleanupService;
     private readonly IAssetCacheCleanupService assetCacheCleanupService;
     private readonly IBackgroundTaskCenter backgroundTaskCenter;
+    private readonly ISubtitleCacheService? subtitleCacheService;
 
     public CacheMaintenanceCoordinator(
         IAppSettingsRepository appSettingsRepository,
         IHlsSessionService hlsSessionService,
         IWebDavCacheCleanupService webDavCacheCleanupService,
         IAssetCacheCleanupService assetCacheCleanupService,
-        IBackgroundTaskCenter backgroundTaskCenter)
+        IBackgroundTaskCenter backgroundTaskCenter,
+        ISubtitleCacheService? subtitleCacheService = null)
     {
         this.appSettingsRepository = appSettingsRepository;
         this.hlsSessionService = hlsSessionService;
         this.webDavCacheCleanupService = webDavCacheCleanupService;
         this.assetCacheCleanupService = assetCacheCleanupService;
         this.backgroundTaskCenter = backgroundTaskCenter;
+        this.subtitleCacheService = subtitleCacheService;
     }
 
     public async Task RunOnceAsync(CancellationToken cancellationToken = default)
@@ -40,7 +43,8 @@ public sealed class CacheMaintenanceCoordinator
         }
 
         var hlsRetentionHours = Math.Clamp(settings.Cache.HlsRetentionHours, 1, 24 * 30);
-        hlsSessionService.CleanupCache(TimeSpan.FromHours(hlsRetentionHours));
+        var hlsMaxBytes = Math.Max(1, settings.Cache.HlsMaxGb) * 1024L * 1024L * 1024L;
+        hlsSessionService.CleanupCache(TimeSpan.FromHours(hlsRetentionHours), hlsMaxBytes);
 
         if (HasActiveBackgroundTask())
         {
@@ -53,6 +57,17 @@ public sealed class CacheMaintenanceCoordinator
             TimeSpan.FromHours(webDavRetentionHours),
             cancellationToken: cancellationToken,
             maxBytes: maxBytes);
+
+        if (HasActiveBackgroundTask())
+        {
+            return;
+        }
+
+        if (subtitleCacheService is not null)
+        {
+            var subtitleMaxBytes = Math.Max(1, settings.Cache.SubtitleMaxGb) * 1024L * 1024L * 1024L;
+            await subtitleCacheService.CleanupAsync(subtitleMaxBytes, cancellationToken);
+        }
 
         if (HasActiveBackgroundTask())
         {

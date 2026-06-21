@@ -9,15 +9,24 @@ public sealed class LibraryMetadataEnrichmentJobService : ILibraryMetadataEnrich
     private readonly IBackgroundTaskCenter taskCenter;
     private readonly ILibraryMetadataEnricher enricher;
     private readonly IMetadataEnrichmentStatusStore statusStore;
+    private readonly IAppSettingsRepository settingsRepository;
+    private readonly ITmdbMetadataClient tmdbClient;
+    private readonly ISubtitleCacheService? subtitleCacheService;
 
     public LibraryMetadataEnrichmentJobService(
         IBackgroundTaskCenter taskCenter,
         ILibraryMetadataEnricher enricher,
-        IMetadataEnrichmentStatusStore statusStore)
+        IMetadataEnrichmentStatusStore statusStore,
+        IAppSettingsRepository settingsRepository,
+        ITmdbMetadataClient tmdbClient,
+        ISubtitleCacheService? subtitleCacheService = null)
     {
         this.taskCenter = taskCenter;
         this.enricher = enricher;
         this.statusStore = statusStore;
+        this.settingsRepository = settingsRepository;
+        this.tmdbClient = tmdbClient;
+        this.subtitleCacheService = subtitleCacheService;
     }
 
     public bool TryStartMissing(out LibraryMetadataEnrichmentStatus status)
@@ -66,11 +75,29 @@ public sealed class LibraryMetadataEnrichmentJobService : ILibraryMetadataEnrich
         try
         {
             var progress = new MetadataTaskProgress(statusStore, taskProgress);
+            var settings = (await settingsRepository.GetAsync(cancellationToken)).Tmdb;
+            var connectionResult = await TestTmdbConnectionAsync(settings, progress, cancellationToken);
+            if ((settings.EnableMetadataEnrichment || settings.EnablePosterDownloads) && !connectionResult.IsReachable)
+            {
+                var message = BuildTmdbConnectionFailureMessage(connectionResult);
+                statusStore.MarkFailed(message, DateTimeOffset.UtcNow);
+                return message;
+            }
+
             var summary = string.IsNullOrWhiteSpace(targetLibraryItemId)
                 ? await enricher.EnrichMissingAsync(progress, cancellationToken)
                 : await enricher.EnrichItemAsync(targetLibraryItemId, progress, cancellationToken);
+            var subtitleSummary = subtitleCacheService is null
+                ? new SubtitleCachePrewarmSummary(0, 0, 0, 0)
+                : await subtitleCacheService.PrewarmLibraryAsync(
+                    targetLibraryItemId,
+                    taskProgress,
+                    cancellationToken);
             statusStore.MarkCompleted(summary, DateTimeOffset.UtcNow);
-            return $"刮削完成：{summary.UpdatedItems} 个条目，{summary.DownloadedPosters} 张海报";
+            var subtitleText = subtitleSummary.CandidateTrackCount > 0
+                ? $"，字幕缓存 {subtitleSummary.CachedTrackCount}/{subtitleSummary.CandidateTrackCount} 条"
+                : string.Empty;
+            return $"刮削完成：{summary.UpdatedItems} 个条目，{summary.DownloadedPosters} 张海报{subtitleText}";
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -82,6 +109,40 @@ public sealed class LibraryMetadataEnrichmentJobService : ILibraryMetadataEnrich
             statusStore.MarkFailed(UserFacingErrorMessages.FromException(ex), DateTimeOffset.UtcNow);
             throw;
         }
+    }
+
+    private async Task<TmdbConnectionTestResult> TestTmdbConnectionAsync(
+        TmdbSettings settings,
+        IProgress<LibraryMetadataEnrichmentProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        progress.Report(new LibraryMetadataEnrichmentProgress(
+            "checking-tmdb",
+            0,
+            0,
+            0,
+            0,
+            0,
+            null,
+            null,
+            DateTimeOffset.UtcNow));
+
+        return await tmdbClient.TestConnectionAsync(settings, cancellationToken);
+    }
+
+    private static string BuildTmdbConnectionFailureMessage(TmdbConnectionTestResult result)
+    {
+        var details = string.Join(
+            " · ",
+            new[]
+            {
+                string.IsNullOrWhiteSpace(result.Source) ? null : result.Source,
+                result.StatusCode.HasValue ? $"HTTP {result.StatusCode.Value}" : null,
+                string.IsNullOrWhiteSpace(result.Message) ? null : result.Message
+            }.Where(static item => !string.IsNullOrWhiteSpace(item)));
+        return string.IsNullOrWhiteSpace(details)
+            ? "TMDB API 无法连接。请开启代理，或在设置中添加自定义 TMDB API 后重试刮削。"
+            : $"TMDB API 无法连接。请开启代理，或在设置中添加自定义 TMDB API 后重试刮削。{details}";
     }
 
     private sealed class MetadataTaskProgress : IProgress<LibraryMetadataEnrichmentProgress>
@@ -113,6 +174,7 @@ public sealed class LibraryMetadataEnrichmentJobService : ILibraryMetadataEnrich
             var phase = value.Phase switch
             {
                 "starting" => "准备刮削",
+                "checking-tmdb" => "检测 TMDB 连通性",
                 "searching" => "匹配元数据",
                 "fetching-details" => "精确刷新 TMDB",
                 "fetching-episodes" => "刷新分集信息",

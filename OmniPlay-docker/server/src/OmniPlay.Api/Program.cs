@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
-using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.FileProviders;
@@ -10,6 +9,7 @@ using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
 using OmniPlay.Core.Runtime;
 using OmniPlay.Infrastructure.Data;
+using OmniPlay.Infrastructure.Douban;
 using OmniPlay.Infrastructure.FileSystem;
 using OmniPlay.Infrastructure.Library;
 using OmniPlay.Infrastructure.Maintenance;
@@ -69,6 +69,7 @@ builder.Services.AddSingleton<IMetadataEnrichmentStatusStore, InMemoryMetadataEn
 builder.Services.AddSingleton<ILibraryMetadataEnrichmentJobService, LibraryMetadataEnrichmentJobService>();
 builder.Services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
 builder.Services.AddSingleton<IHlsSessionService, FfmpegHlsSessionService>();
+builder.Services.AddSingleton<ISubtitleCacheService, FfmpegSubtitleCacheService>();
 builder.Services.AddSingleton<HttpClient>(serviceProvider =>
 {
     var settingsRepository = serviceProvider.GetRequiredService<IAppSettingsRepository>();
@@ -80,13 +81,15 @@ builder.Services.AddSingleton<HttpClient>(serviceProvider =>
     return httpClient;
 });
 builder.Services.AddSingleton<ITmdbMetadataClient, TmdbMetadataClient>();
+builder.Services.AddSingleton<IDoubanMetadataClient, DoubanMetadataClient>();
 builder.Services.AddSingleton<IProxyConnectionTester, ProxyConnectionTester>();
 builder.Services.AddSingleton<IRuntimeSelfCheckService>(serviceProvider => new RuntimeSelfCheckService(
     serviceProvider.GetRequiredService<IStoragePaths>(),
     serviceProvider.GetRequiredService<SqliteDatabase>(),
     serviceProvider.GetRequiredService<IHlsSessionService>(),
     serviceProvider.GetRequiredService<HttpClient>(),
-    listenUri));
+    listenUri,
+    serviceProvider.GetRequiredService<IAppSettingsRepository>()));
 
 Console.WriteLine("[OmniPlay] Building app...");
 var app = builder.Build();
@@ -733,6 +736,91 @@ app.MapPost("/api/library/items/{id}/metadata/apply", async (
     return detail is null ? Results.NotFound() : Results.Ok(detail);
 });
 
+app.MapPost("/api/library/items/{id}/douban/bind", async (
+    string id,
+    HttpRequest httpRequest,
+    ILibraryRepository repository,
+    IDoubanMetadataClient doubanClient,
+    CancellationToken cancellationToken) =>
+{
+    var request = await ReadJsonBodyAsync<DoubanBindRequest>(httpRequest, cancellationToken);
+    if (request is null || string.IsNullOrWhiteSpace(request.Subject))
+    {
+        return Results.BadRequest(new { error = "请填写豆瓣影视链接或 subject ID。" });
+    }
+
+    var item = await repository.GetItemDetailAsync(id, cancellationToken);
+    if (item is null)
+    {
+        return Results.NotFound();
+    }
+
+    try
+    {
+        var metadata = await doubanClient.FetchSubjectAsync(
+            id,
+            request.Subject,
+            item.Title,
+            item.ReleaseDate,
+            cancellationToken);
+        return await SaveDoubanMetadataAndReturnDetailAsync(id, metadata, repository, cancellationToken);
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+    catch (Exception ex) when (ex is HttpRequestException
+                               or TaskCanceledException
+                               or InvalidOperationException
+                               or JsonException)
+    {
+        var metadata = doubanClient.CreateSubjectPlaceholder(
+            id,
+            request.Subject,
+            item.Title,
+            item.ReleaseDate);
+        return await SaveDoubanMetadataAndReturnDetailAsync(id, metadata, repository, cancellationToken);
+    }
+});
+
+app.MapPost("/api/library/items/{id}/douban/import", async (
+    string id,
+    HttpRequest httpRequest,
+    ILibraryRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    var request = await ReadJsonBodyAsync<DoubanMetadataImportRequest>(httpRequest, cancellationToken);
+    if (request is null
+        || string.IsNullOrWhiteSpace(request.SubjectId)
+        || string.IsNullOrWhiteSpace(request.SubjectUrl)
+        || string.IsNullOrWhiteSpace(request.Title))
+    {
+        return Results.BadRequest(new { error = "豆瓣元数据缺少 subject、链接或标题。" });
+    }
+
+    if (request.Rating is < 0 or > 10)
+    {
+        return Results.BadRequest(new { error = "豆瓣评分需要在 0 到 10 之间。" });
+    }
+
+    var metadata = new DoubanMetadata(
+        id,
+        request.SubjectId,
+        request.SubjectUrl,
+        request.Title,
+        request.OriginalTitle,
+        request.Year,
+        request.Rating,
+        request.RatingCount,
+        request.Summary,
+        request.Genres,
+        request.Countries,
+        request.PosterUrl,
+        request.FetchedAt ?? DateTimeOffset.UtcNow);
+
+    return await SaveDoubanMetadataAndReturnDetailAsync(id, metadata, repository, cancellationToken);
+});
+
 app.MapPatch("/api/library/items/{id}/metadata/custom", async (
     string id,
     HttpRequest httpRequest,
@@ -757,7 +845,12 @@ app.MapPatch("/api/library/items/{id}/metadata/custom", async (
 
     if (request.VoteAverage is < 0 or > 10)
     {
-        return Results.BadRequest(new { error = "评分需要在 0 到 10 之间。" });
+        return Results.BadRequest(new { error = "TMDB评分需要在 0 到 10 之间。" });
+    }
+
+    if (request.DoubanRating is < 0 or > 10)
+    {
+        return Results.BadRequest(new { error = "豆瓣评分需要在 0 到 10 之间。" });
     }
 
     var updated = await repository.UpdateCustomMetadataAsync(request with { LibraryItemId = id }, cancellationToken);
@@ -797,6 +890,7 @@ app.MapPost("/api/library/items/{id}/metadata/lock", async (
 app.MapPost("/api/playback/progress", async (
     HttpRequest httpRequest,
     ILibraryRepository repository,
+    ISubtitleCacheService subtitleCacheService,
     CancellationToken cancellationToken) =>
 {
     var request = await ReadJsonBodyAsync<PlaybackProgressUpdateRequest>(httpRequest, cancellationToken);
@@ -806,6 +900,21 @@ app.MapPost("/api/playback/progress", async (
     }
 
     var updated = await repository.UpdatePlaybackProgressAsync(request, cancellationToken);
+    if (updated && ShouldPrewarmNextEpisodeSubtitle(request))
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await subtitleCacheService.PrewarmNextEpisodeAsync(request.VideoFileId, CancellationToken.None);
+            }
+            catch
+            {
+                // Playback progress must stay non-blocking; the next scan/scrape will retry subtitle prewarming.
+            }
+        });
+    }
+
     return updated ? Results.NoContent() : Results.NotFound();
 });
 
@@ -927,6 +1036,29 @@ app.MapGet("/api/playback/decision/{fileId}", async (
 
         if (remotePolicy.Mode == "direct")
         {
+            var remoteCacheStatus = await cacheService.GetStatusAsync(remoteFile.Id, cancellationToken);
+            if (remoteCacheStatus?.IsReady == true)
+            {
+                var completedCachedPath = await cacheService.EnsureCachedAsync(remoteFile.Id, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(completedCachedPath))
+                {
+                    var cachedRemoteFile = remoteFile with { AbsolutePath = completedCachedPath };
+                    var cachedHlsProfile = HlsPlaybackProfile.CreateRemux(audioTrackIndex);
+                    if (hlsSessionService.GetCompletedSession(cachedRemoteFile, cachedHlsProfile) is { } cachedHlsSession)
+                    {
+                        return Results.Ok(new PlaybackDecision(
+                            remoteFile.Id,
+                            "hls-remux",
+                            null,
+                            $"/api/playback/hls/{Uri.EscapeDataString(cachedHlsSession.SessionId)}/index.m3u8",
+                            cachedHlsSession.SessionId,
+                            true,
+                            "已命中预生成 HLS 缓存。",
+                            remoteDurationSeconds));
+                    }
+                }
+            }
+
             return Results.Ok(new PlaybackDecision(
                 remoteFile.Id,
                 "direct",
@@ -1054,6 +1186,20 @@ app.MapGet("/api/playback/decision/{fileId}", async (
     profile = policy.Profile;
     if (mode == "direct")
     {
+        var cachedHlsProfile = HlsPlaybackProfile.CreateRemux(audioTrackIndex);
+        if (hlsSessionService.GetCompletedSession(file, cachedHlsProfile) is { } cachedHlsSession)
+        {
+            return Results.Ok(new PlaybackDecision(
+                file.Id,
+                "hls-remux",
+                null,
+                $"/api/playback/hls/{Uri.EscapeDataString(cachedHlsSession.SessionId)}/index.m3u8",
+                cachedHlsSession.SessionId,
+                true,
+                "已命中预生成 HLS 缓存。",
+                durationSeconds));
+        }
+
         return Results.Ok(new PlaybackDecision(
             file.Id,
             "direct",
@@ -1136,6 +1282,27 @@ app.MapGet("/api/playback/files/{fileId}/subtitles", async (
     }
 
     return Results.Ok(subtitles);
+});
+
+app.MapGet("/api/playback/files/{fileId}/subtitle-cache/status", async (
+    string fileId,
+    ISubtitleCacheService subtitleCacheService,
+    IPlayableFileResolver playableFileResolver,
+    IWebDavRangeStreamService webDavRangeStreamService,
+    IPlaybackCacheService cacheService,
+    CancellationToken cancellationToken) =>
+{
+    var file = await playableFileResolver.ResolveAsync(fileId, cancellationToken);
+    var inputPath = file?.AbsolutePath;
+    if (string.IsNullOrWhiteSpace(inputPath))
+    {
+        var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
+        inputPath = remoteFile is null
+            ? null
+            : await cacheService.GetCompletedCachedPathAsync(fileId, cancellationToken);
+    }
+
+    return Results.Ok(await subtitleCacheService.GetPgsCacheStatusAsync(fileId, inputPath, cancellationToken));
 });
 
 app.MapGet("/api/playback/files/{fileId}/streams", async (
@@ -1280,8 +1447,106 @@ app.MapPost("/api/playback/hls/{sessionId}/stop", (
     return hlsSessionService.StopSession(sessionId) ? Results.NoContent() : Results.NotFound();
 });
 
+app.MapPost("/api/playback/hls/prewarm", (
+    HlsCachePrepareRequest request,
+    ILibraryRepository repository,
+    IPlayableFileResolver playableFileResolver,
+    IPlaybackSubtitleService playbackSubtitleService,
+    IWebDavRangeStreamService webDavRangeStreamService,
+    IPlaybackCacheService cacheService,
+    IAppSettingsRepository settingsRepository,
+    IHlsSessionService hlsSessionService,
+    IMediaProbeService mediaProbeService,
+    IBackgroundTaskCenter taskCenter) =>
+{
+    var libraryItemIds = NormalizeRequestIds(request.LibraryItemIds);
+    var videoFileIds = NormalizeRequestIds(request.VideoFileIds);
+    if (libraryItemIds.Count == 0 && videoFileIds.Count == 0)
+    {
+        return Results.BadRequest(new { error = "请选择要生成 HLS 缓存的影视或分集。" });
+    }
+
+    return taskCenter.TryStartExclusive(
+        "hls-cache-prewarm",
+        "生成 HLS 缓存",
+        async (_, progress, cancellationToken) =>
+        {
+            var targetFileIds = await ResolveHlsPrewarmFileIdsAsync(
+                libraryItemIds,
+                videoFileIds,
+                repository,
+                cancellationToken);
+            if (targetFileIds.Count == 0)
+            {
+                return "没有找到可生成 HLS 缓存的视频文件。";
+            }
+
+            var completed = 0;
+            var failed = 0;
+            for (var index = 0; index < targetFileIds.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var fileId = targetFileIds[index];
+                var offset = index * 100d / targetFileIds.Count;
+                var span = 100d / targetFileIds.Count;
+                progress.Report(new BackgroundTaskProgress(
+                    "hls-cache",
+                    $"准备 HLS 缓存 {index + 1}/{targetFileIds.Count}",
+                    offset,
+                    fileId));
+
+                var target = await ResolveHlsPrewarmTargetAsync(
+                    fileId,
+                    repository,
+                    playableFileResolver,
+                    playbackSubtitleService,
+                    webDavRangeStreamService,
+                    cacheService,
+                    settingsRepository,
+                    hlsSessionService,
+                    mediaProbeService,
+                    ScaleProgress(progress, offset, span * 0.2),
+                    cancellationToken);
+                if (target is null)
+                {
+                    failed++;
+                    continue;
+                }
+
+                var session = await hlsSessionService.EnsureCompletedSessionAsync(
+                    target.File,
+                    target.Profile,
+                    ScaleProgress(progress, offset + span * 0.2, span * 0.8),
+                    cancellationToken);
+                if (session.IsReady && !session.IsRunning && string.IsNullOrWhiteSpace(session.ErrorMessage))
+                {
+                    completed++;
+                }
+                else
+                {
+                    failed++;
+                }
+            }
+
+            progress.Report(new BackgroundTaskProgress(
+                "completed",
+                $"HLS 缓存完成：{completed}/{targetFileIds.Count}",
+                100,
+                null));
+            return failed > 0
+                ? $"HLS 缓存完成：成功 {completed} 个，失败 {failed} 个"
+                : $"HLS 缓存完成：成功 {completed} 个";
+        },
+        onAccepted: null,
+        out var status)
+        ? Results.Accepted("/api/tasks", status)
+        : Results.Conflict(new { error = "已有后台任务正在运行，请稍后再试。", status });
+});
+
 app.MapPost("/api/playback/hls/cleanup", (
     int? maxAgeHours,
+    int? maxGb,
+    bool? clearAll,
     IHlsSessionService hlsSessionService,
     IAppSettingsRepository settingsRepository,
     IBackgroundTaskCenter taskCenter) =>
@@ -1293,13 +1558,49 @@ app.MapPost("/api/playback/hls/cleanup", (
         {
             cancellationToken.ThrowIfCancellationRequested();
             var settings = await settingsRepository.GetAsync(cancellationToken);
+            var shouldClearAll = clearAll == true;
             var retentionHours = Math.Clamp(maxAgeHours ?? settings.Cache.HlsRetentionHours, 1, 24 * 30);
-            var maxAge = TimeSpan.FromHours(retentionHours);
+            var maxSizeGb = Math.Clamp(maxGb ?? settings.Cache.HlsMaxGb, 1, 1024);
+            var maxAge = shouldClearAll ? TimeSpan.Zero : TimeSpan.FromHours(retentionHours);
+            var maxBytes = shouldClearAll ? 0L : maxSizeGb * 1024L * 1024L * 1024L;
             progress.Report(new BackgroundTaskProgress("cleanup", "正在清理转码缓存", null, null));
-            var summary = hlsSessionService.CleanupCache(maxAge);
+            var summary = hlsSessionService.CleanupCache(maxAge, maxBytes);
             cancellationToken.ThrowIfCancellationRequested();
             await Task.CompletedTask;
-            return $"清理 {summary.RemovedSessionCount} 个会话，释放 {summary.RemovedBytes} 字节";
+            return shouldClearAll
+                ? $"清除 HLS 缓存：{summary.RemovedSessionCount} 个会话，释放 {summary.RemovedBytes} 字节"
+                : $"清理 {summary.RemovedSessionCount} 个会话，释放 {summary.RemovedBytes} 字节，HLS 上限 {maxSizeGb} GB";
+        },
+        onAccepted: null,
+        out var status)
+        ? Results.Accepted("/api/tasks", status)
+        : Results.Conflict(new { error = "已有后台任务正在运行，请稍后再试。", status });
+});
+
+app.MapPost("/api/playback/subtitles/cache/cleanup", (
+    int? maxGb,
+    bool? clearAll,
+    ISubtitleCacheService subtitleCacheService,
+    IAppSettingsRepository settingsRepository,
+    IBackgroundTaskCenter taskCenter) =>
+{
+    return taskCenter.TryStartExclusive(
+        "subtitle-cache-cleanup",
+        "清理字幕缓存",
+        async (_, progress, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var settings = await settingsRepository.GetAsync(cancellationToken);
+            var shouldClearAll = clearAll == true;
+            var maxSizeGb = Math.Clamp(maxGb ?? settings.Cache.SubtitleMaxGb, 1, 1024);
+            var maxBytes = shouldClearAll ? 0L : maxSizeGb * 1024L * 1024L * 1024L;
+            progress.Report(new BackgroundTaskProgress("cleanup", "正在清理字幕缓存", null, null));
+            var summary = await subtitleCacheService.CleanupAsync(maxBytes, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            progress.Report(new BackgroundTaskProgress("completed", "字幕缓存清理完成", 100, null));
+            return shouldClearAll
+                ? $"清除字幕缓存：{summary.RemovedFileCount} 个文件，释放 {summary.RemovedBytes} 字节"
+                : $"清理 {summary.RemovedFileCount} 个文件，释放 {summary.RemovedBytes} 字节，字幕上限 {maxSizeGb} GB";
         },
         onAccepted: null,
         out var status)
@@ -1369,7 +1670,7 @@ app.MapGet("/api/playback/files/{fileId}/subtitles/{subtitleId}.vtt", async (
     string fileId,
     string subtitleId,
     IPlaybackSubtitleService playbackSubtitleService,
-    IStoragePaths storagePaths,
+    ISubtitleCacheService subtitleCacheService,
     CancellationToken cancellationToken) =>
 {
     var subtitlePath = await playbackSubtitleService.ResolveSubtitlePathAsync(fileId, subtitleId, cancellationToken);
@@ -1378,7 +1679,7 @@ app.MapGet("/api/playback/files/{fileId}/subtitles/{subtitleId}.vtt", async (
         return Results.NotFound();
     }
 
-    var webVtt = await ReadSubtitleAsWebVttAsync(subtitlePath, storagePaths, cancellationToken);
+    var webVtt = await subtitleCacheService.ReadExternalSubtitleAsWebVttAsync(subtitlePath, cancellationToken);
     return webVtt is null
         ? Results.NotFound()
         : Results.Text(webVtt, "text/vtt; charset=utf-8");
@@ -1390,7 +1691,7 @@ app.MapGet("/api/playback/files/{fileId}/embedded-subtitles/{subtitleOrdinal:int
     IPlayableFileResolver playableFileResolver,
     IWebDavRangeStreamService webDavRangeStreamService,
     IPlaybackCacheService cacheService,
-    IStoragePaths storagePaths,
+    ISubtitleCacheService subtitleCacheService,
     CancellationToken cancellationToken) =>
 {
     if (subtitleOrdinal < 0)
@@ -1413,10 +1714,49 @@ app.MapGet("/api/playback/files/{fileId}/embedded-subtitles/{subtitleOrdinal:int
         return Results.NotFound();
     }
 
-    var webVtt = await ReadEmbeddedSubtitleAsWebVttAsync(inputPath, subtitleOrdinal, storagePaths, cancellationToken);
+    var webVtt = await subtitleCacheService.ReadEmbeddedSubtitleAsWebVttAsync(inputPath, subtitleOrdinal, cancellationToken);
     return webVtt is null
         ? Results.NotFound()
         : Results.Text(webVtt, "text/vtt; charset=utf-8");
+});
+
+app.MapGet("/api/playback/files/{fileId}/embedded-subtitles/{subtitleOrdinal:int}.sup", async (
+    string fileId,
+    int subtitleOrdinal,
+    IPlayableFileResolver playableFileResolver,
+    IWebDavRangeStreamService webDavRangeStreamService,
+    IPlaybackCacheService cacheService,
+    ISubtitleCacheService subtitleCacheService,
+    CancellationToken cancellationToken) =>
+{
+    if (subtitleOrdinal < 0)
+    {
+        return Results.NotFound();
+    }
+
+    var file = await playableFileResolver.ResolveAsync(fileId, cancellationToken);
+    var inputPath = file?.AbsolutePath;
+    if (string.IsNullOrWhiteSpace(inputPath))
+    {
+        var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
+        inputPath = remoteFile is null
+            ? null
+            : await cacheService.EnsureCachedAsync(fileId, cancellationToken);
+    }
+
+    if (string.IsNullOrWhiteSpace(inputPath) || !System.IO.File.Exists(inputPath))
+    {
+        return Results.NotFound();
+    }
+
+    var supPath = await subtitleCacheService.ExtractEmbeddedSubtitleAsSupAsync(inputPath, subtitleOrdinal, cancellationToken);
+    return string.IsNullOrWhiteSpace(supPath)
+        ? Results.NotFound()
+        : Results.File(
+            supPath,
+            "application/octet-stream",
+            fileDownloadName: $"{Path.GetFileNameWithoutExtension(inputPath)}.s{subtitleOrdinal}.sup",
+            enableRangeProcessing: true);
 });
 
 app.MapGet("/api/assets/posters/{id}", async (
@@ -1656,6 +1996,7 @@ static async Task<LibraryItemCustomMetadataUpdateRequest?> ReadCustomMetadataReq
         ReadFormString(form, "releaseDate"),
         ReadFormString(form, "overview"),
         ReadFormDouble(form, "voteAverage"),
+        ReadFormDouble(form, "doubanRating"),
         posterLocalPath,
         posterFile is { Length: > 0 } ? posterFile.FileName : null,
         LockMetadata: true,
@@ -2172,6 +2513,203 @@ static IReadOnlyList<PlaybackDiagnosticStep> BuildDiagnosticSteps(
     return steps;
 }
 
+static IReadOnlyList<string> NormalizeRequestIds(IEnumerable<string>? values)
+{
+    return values?
+        .Select(static value => value.Trim())
+        .Where(static value => !string.IsNullOrWhiteSpace(value))
+        .Distinct(StringComparer.Ordinal)
+        .ToArray() ?? [];
+}
+
+static async Task<IReadOnlyList<string>> ResolveHlsPrewarmFileIdsAsync(
+    IReadOnlyList<string> libraryItemIds,
+    IReadOnlyList<string> videoFileIds,
+    ILibraryRepository repository,
+    CancellationToken cancellationToken)
+{
+    List<string> resolved = [];
+    foreach (var libraryItemId in libraryItemIds)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var detail = await repository.GetItemDetailAsync(libraryItemId, cancellationToken);
+        if (detail is null)
+        {
+            continue;
+        }
+
+        resolved.AddRange(SelectDefaultHlsPrewarmFiles(detail).Select(static file => file.Id));
+    }
+
+    resolved.AddRange(videoFileIds);
+    return resolved
+        .Where(static id => !string.IsNullOrWhiteSpace(id))
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+}
+
+static IReadOnlyList<VideoFileSummary> SelectDefaultHlsPrewarmFiles(LibraryItemDetail detail)
+{
+    if (!string.Equals(detail.ItemKind, "tv", StringComparison.OrdinalIgnoreCase))
+    {
+        return detail.VideoFiles;
+    }
+
+    var orderedEpisodes = detail.Seasons
+        .OrderBy(static season => season.SeasonNumber)
+        .SelectMany(static season => season.Episodes.OrderBy(static episode => episode.EpisodeNumber))
+        .Select(static episode => episode.VideoFile)
+        .Where(static file => file is not null)
+        .Cast<VideoFileSummary>()
+        .ToArray();
+    var target = orderedEpisodes.FirstOrDefault(IsUnfinishedForHlsPrewarm)
+                 ?? orderedEpisodes.FirstOrDefault(static file => !file.IsWatched)
+                 ?? orderedEpisodes.FirstOrDefault();
+    return target is null ? [] : [target];
+}
+
+static bool IsUnfinishedForHlsPrewarm(VideoFileSummary file)
+{
+    if (file.IsWatched || file.PositionSeconds <= 5)
+    {
+        return false;
+    }
+
+    return file.DurationSeconds <= 0 || file.PositionSeconds < file.DurationSeconds * 0.95;
+}
+
+static async Task<HlsPrewarmTarget?> ResolveHlsPrewarmTargetAsync(
+    string fileId,
+    ILibraryRepository repository,
+    IPlayableFileResolver playableFileResolver,
+    IPlaybackSubtitleService playbackSubtitleService,
+    IWebDavRangeStreamService webDavRangeStreamService,
+    IPlaybackCacheService cacheService,
+    IAppSettingsRepository settingsRepository,
+    IHlsSessionService hlsSessionService,
+    IMediaProbeService mediaProbeService,
+    IProgress<BackgroundTaskProgress> progress,
+    CancellationToken cancellationToken)
+{
+    _ = playbackSubtitleService;
+    var settings = await settingsRepository.GetAsync(cancellationToken);
+    var effectiveQuality = ResolveEffectiveQuality(null, settings.Playback.PlaybackQualityPreference);
+    var remoteFile = await webDavRangeStreamService.GetFileInfoAsync(fileId, cancellationToken);
+    if (remoteFile is not null)
+    {
+        progress.Report(new BackgroundTaskProgress("hls-cache", "正在准备 WebDAV 原文件缓存", 10, remoteFile.FileName));
+        var cachedPath = await cacheService.EnsureCachedAsync(remoteFile.Id, cancellationToken);
+        if (string.IsNullOrWhiteSpace(cachedPath))
+        {
+            return null;
+        }
+
+        var remoteProbe = CreateProbeFromStoredMetadata(remoteFile);
+        var target = await BuildHlsPrewarmTargetAsync(
+            remoteFile with { AbsolutePath = cachedPath },
+            remoteProbe,
+            effectiveQuality,
+            settings.Playback,
+            hlsSessionService,
+            cancellationToken);
+        progress.Report(new BackgroundTaskProgress("hls-cache", "WebDAV 原文件缓存已就绪", 100, remoteFile.FileName));
+        return target;
+    }
+
+    var file = await playableFileResolver.ResolveAsync(fileId, cancellationToken);
+    if (file is null)
+    {
+        return null;
+    }
+
+    var probe = await mediaProbeService.ProbeAsync(file.AbsolutePath, cancellationToken);
+    if (probe is not null)
+    {
+        await repository.UpdateVideoFileProbeAsync(
+            new VideoFileProbeUpdate(
+                file.Id,
+                probe.DurationSeconds,
+                probe.Container,
+                probe.VideoCodec,
+                probe.AudioCodec,
+                probe.SubtitleSummary,
+                probe.RawJson),
+            cancellationToken);
+    }
+    else
+    {
+        probe = CreateProbeFromStoredMetadata(file);
+    }
+
+    return await BuildHlsPrewarmTargetAsync(
+        file,
+        probe,
+        effectiveQuality,
+        settings.Playback,
+        hlsSessionService,
+        cancellationToken);
+}
+
+static async Task<HlsPrewarmTarget?> BuildHlsPrewarmTargetAsync(
+    PlayableVideoFile file,
+    MediaProbeSnapshot? probe,
+    string effectiveQuality,
+    PlaybackSettings playbackSettings,
+    IHlsSessionService hlsSessionService,
+    CancellationToken cancellationToken)
+{
+    var sourceVideoCodec = ResolveSourceVideoCodec(file.FileName, probe);
+    var dynamicRange = AnalyzeSourceDynamicRange(file.FileName, probe);
+    var plan = ResolvePlaybackPlan(file.FileName, probe);
+    var profile = await ResolveRequestedProfileAsync(
+        plan.Profile,
+        effectiveQuality,
+        audioTrackIndex: null,
+        subtitleMode: "off",
+        externalSubtitlePath: null,
+        embeddedSubtitleStreamIndex: null,
+        embeddedSubtitleCodec: null,
+        sourceVideoCodec: sourceVideoCodec,
+        hardware: null,
+        toneMapToSdr: dynamicRange.ShouldToneMapToSdr,
+        toneMapMode: dynamicRange.ToneMapMode,
+        hlsSessionService: hlsSessionService,
+        cancellationToken: cancellationToken);
+    var mode = ResolveRequestedMode(plan.Mode, profile, effectiveQuality, audioTrackIndex: null, subtitleMode: "off");
+    var policy = await ApplyPlaybackSettingsAsync(
+        file.Id,
+        plan,
+        profile,
+        mode,
+        playbackSettings,
+        effectiveQuality,
+        audioTrackIndex: null,
+        subtitleMode: "off",
+        externalSubtitlePath: null,
+        embeddedSubtitleStreamIndex: null,
+        embeddedSubtitleCodec: null,
+        sourceVideoCodec: sourceVideoCodec,
+        hardware: null,
+        hlsSessionService: hlsSessionService,
+        cancellationToken: cancellationToken);
+    if (policy.Decision is not null)
+    {
+        return null;
+    }
+
+    mode = policy.Mode;
+    profile = policy.Profile;
+    if (string.Equals(mode, "direct", StringComparison.OrdinalIgnoreCase))
+    {
+        mode = "hls-remux";
+        profile = HlsPlaybackProfile.CreateRemux();
+    }
+
+    return string.Equals(mode, "unavailable", StringComparison.OrdinalIgnoreCase)
+        ? null
+        : new HlsPrewarmTarget(file, profile, mode);
+}
+
 static PlaybackPlan ResolvePlaybackPlan(string fileName, MediaProbeSnapshot? probe)
 {
     var extension = Path.GetExtension(fileName).ToLowerInvariant();
@@ -2279,6 +2817,16 @@ static double ResolvePlaybackDurationSeconds(MediaProbeSnapshot? probe, double s
     }
 
     return storedDurationSeconds > 0 ? storedDurationSeconds : 0;
+}
+
+static bool ShouldPrewarmNextEpisodeSubtitle(PlaybackProgressUpdateRequest request)
+{
+    if (request.DurationSeconds <= 0 || request.PositionSeconds <= 0)
+    {
+        return false;
+    }
+
+    return request.PositionSeconds >= request.DurationSeconds * 0.65;
 }
 
 static async Task<HlsPlaybackProfile> ResolveRequestedProfileAsync(
@@ -2667,24 +3215,38 @@ static SourceDynamicRange AnalyzeSourceDynamicRange(string fileName, MediaProbeS
 
     var compatibilityId = ResolveDolbyVisionCompatibilityId(probe?.RawJson);
     var dolbyVisionProfile = ResolveDolbyVisionProfile(probe?.RawJson);
-    var hasExplicitDolbyVisionOnlySignal = compatibilityId == 0 || dolbyVisionProfile == 5;
-    var hasDolbyVisionFallback =
-        !hasDolbyVisionSignal
-        || (!hasExplicitDolbyVisionOnlySignal
-            && (hasHdrSignal
-                || compatibilityId is > 0
-                || dolbyVisionProfile is 7));
-    if (hasDolbyVisionSignal && !hasDolbyVisionFallback)
+    var hasExplicitDolbyVisionCompatibility = compatibilityId.HasValue || dolbyVisionProfile.HasValue;
+    var hasDolbyVisionOnlySignal =
+        compatibilityId == 0
+        || dolbyVisionProfile == 5
+        || (!hasExplicitDolbyVisionCompatibility && HasDolbyVisionOnlyNameHint(tokens))
+        || HasIctcpDolbyVisionSignal(rawJson);
+    if (hasDolbyVisionSignal && hasDolbyVisionOnlySignal)
     {
         return new SourceDynamicRange(true, true, "dolby-vision");
     }
 
     if (hasHdrSignal || hasDolbyVisionSignal)
     {
-        return new SourceDynamicRange(true, false, ResolveToneMapMode(probe));
+        return new SourceDynamicRange(true, false, hasDolbyVisionSignal ? "software" : ResolveToneMapMode(probe));
     }
 
     return new SourceDynamicRange(false, false, "off");
+}
+
+static bool HasDolbyVisionOnlyNameHint(string[] tokens)
+{
+    var hasDolbyVisionToken = tokens.Any(static token => token is "dv" or "dovi");
+    var hasHdrFallbackToken = tokens.Any(static token => token is "hdr" or "hdr10" or "hdr10plus" or "hlg");
+    return hasDolbyVisionToken && !hasHdrFallbackToken;
+}
+
+static bool HasIctcpDolbyVisionSignal(string? rawJson)
+{
+    return rawJson is not null
+           && (rawJson.Contains("ictcp", StringComparison.Ordinal)
+               || rawJson.Contains("ipt-pq-c2", StringComparison.Ordinal)
+               || rawJson.Contains("iptpqc2", StringComparison.Ordinal));
 }
 
 static string ResolveToneMapMode(MediaProbeSnapshot? probe)
@@ -3047,301 +3609,6 @@ static string? ResolveEmbeddedSubtitleCodec(MediaProbeSnapshot? probe, int? embe
         ?.Codec;
 }
 
-static Task<string?> ReadSubtitleAsWebVttAsync(
-    string subtitlePath,
-    IStoragePaths storagePaths,
-    CancellationToken cancellationToken)
-{
-    var cacheKey = BuildSubtitleWebVttCacheKey("external", subtitlePath, null);
-    return ReadCachedWebVttAsync(
-        storagePaths,
-        cacheKey,
-        token => ReadSubtitleAsWebVttUncachedAsync(subtitlePath, token),
-        cancellationToken);
-}
-
-static async Task<string?> ReadSubtitleAsWebVttUncachedAsync(string subtitlePath, CancellationToken cancellationToken)
-{
-    var extension = Path.GetExtension(subtitlePath).ToLowerInvariant();
-    if (extension == ".vtt")
-    {
-        var text = await File.ReadAllTextAsync(subtitlePath, cancellationToken);
-        return text.TrimStart().StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase)
-            ? text
-            : $"WEBVTT\n\n{text}";
-    }
-
-    if (extension is not ".srt")
-    {
-        return await ConvertSubtitleFileAsWebVttAsync(subtitlePath, cancellationToken);
-    }
-
-    var srt = await System.IO.File.ReadAllTextAsync(subtitlePath, cancellationToken);
-    var builder = new StringBuilder("WEBVTT\n\n");
-    foreach (var line in srt.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
-    {
-        builder.AppendLine(line.Contains("-->", StringComparison.Ordinal)
-            ? line.Replace(',', '.')
-            : line);
-    }
-
-    return builder.ToString();
-}
-
-static async Task<string?> ConvertSubtitleFileAsWebVttAsync(string subtitlePath, CancellationToken cancellationToken)
-{
-    using var process = new Process
-    {
-        StartInfo = new ProcessStartInfo
-        {
-            FileName = ResolveFfmpegExecutablePath(),
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        }
-    };
-
-    ConfigureFfmpegFontEnvironment(process.StartInfo);
-    foreach (var argument in new[]
-             {
-                 "-hide_banner",
-                 "-nostdin",
-                 "-loglevel", "error",
-                 "-i", subtitlePath,
-                 "-vn",
-                 "-an",
-                 "-f", "webvtt",
-                 "-"
-             })
-    {
-        process.StartInfo.ArgumentList.Add(argument);
-    }
-
-    try
-    {
-        process.Start();
-    }
-    catch (Exception)
-    {
-        return null;
-    }
-
-    using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    timeoutSource.CancelAfter(TimeSpan.FromMinutes(2));
-    try
-    {
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutSource.Token);
-        _ = process.StandardError.ReadToEndAsync(timeoutSource.Token);
-        await process.WaitForExitAsync(timeoutSource.Token);
-        var stdout = await stdoutTask;
-        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
-        {
-            return null;
-        }
-
-        var text = stdout.TrimStart('\uFEFF');
-        return text.StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase)
-            ? text
-            : $"WEBVTT\n\n{text}";
-    }
-    catch (OperationCanceledException)
-    {
-        TryKillProcess(process);
-        return null;
-    }
-}
-
-static async Task<string?> ReadEmbeddedSubtitleAsWebVttAsync(
-    string inputPath,
-    int subtitleOrdinal,
-    IStoragePaths storagePaths,
-    CancellationToken cancellationToken)
-{
-    if (subtitleOrdinal < 0)
-    {
-        return null;
-    }
-
-    var cacheKey = BuildSubtitleWebVttCacheKey("embedded", inputPath, subtitleOrdinal);
-    return await ReadCachedWebVttAsync(
-        storagePaths,
-        cacheKey,
-        token => ReadEmbeddedSubtitleAsWebVttUncachedAsync(inputPath, subtitleOrdinal, token),
-        cancellationToken);
-}
-
-static async Task<string?> ReadEmbeddedSubtitleAsWebVttUncachedAsync(
-    string inputPath,
-    int subtitleOrdinal,
-    CancellationToken cancellationToken)
-{
-    using var process = new Process
-    {
-        StartInfo = new ProcessStartInfo
-        {
-            FileName = ResolveFfmpegExecutablePath(),
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        }
-    };
-
-    ConfigureFfmpegFontEnvironment(process.StartInfo);
-    foreach (var argument in new[]
-             {
-                 "-hide_banner",
-                 "-nostdin",
-                 "-loglevel", "error",
-                 "-i", inputPath,
-                 "-map", $"0:s:{subtitleOrdinal}",
-                 "-vn",
-                 "-an",
-                 "-f", "webvtt",
-                 "-"
-             })
-    {
-        process.StartInfo.ArgumentList.Add(argument);
-    }
-
-    try
-    {
-        process.Start();
-    }
-    catch (Exception)
-    {
-        return null;
-    }
-
-    using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    timeoutSource.CancelAfter(TimeSpan.FromMinutes(2));
-    try
-    {
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutSource.Token);
-        var stderrTask = process.StandardError.ReadToEndAsync(timeoutSource.Token);
-        await process.WaitForExitAsync(timeoutSource.Token);
-        var stdout = await stdoutTask;
-        _ = await stderrTask;
-        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
-        {
-            return null;
-        }
-
-        var text = stdout.TrimStart('\uFEFF');
-        return text.StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase)
-            ? text
-            : $"WEBVTT\n\n{text}";
-    }
-    catch (OperationCanceledException)
-    {
-        TryKillProcess(process);
-        return null;
-    }
-}
-
-static async Task<string?> ReadCachedWebVttAsync(
-    IStoragePaths storagePaths,
-    string cacheKey,
-    Func<CancellationToken, Task<string?>> factory,
-    CancellationToken cancellationToken)
-{
-    var cachePath = ResolveSubtitleWebVttCachePath(storagePaths, cacheKey);
-    if (System.IO.File.Exists(cachePath))
-    {
-        try
-        {
-            return await System.IO.File.ReadAllTextAsync(cachePath, cancellationToken);
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
-    }
-
-    var webVtt = await factory(cancellationToken);
-    if (string.IsNullOrWhiteSpace(webVtt))
-    {
-        return webVtt;
-    }
-
-    try
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-        var tempPath = $"{cachePath}.{Guid.NewGuid():N}.tmp";
-        await System.IO.File.WriteAllTextAsync(tempPath, webVtt, Encoding.UTF8, cancellationToken);
-        System.IO.File.Move(tempPath, cachePath, overwrite: true);
-    }
-    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-    {
-        // Subtitle conversion can still be served for this request even if cache write fails.
-    }
-
-    return webVtt;
-}
-
-static string ResolveSubtitleWebVttCachePath(IStoragePaths storagePaths, string cacheKey)
-{
-    var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cacheKey))).ToLowerInvariant();
-    return Path.Combine(storagePaths.CacheDirectory, "subtitles", "webvtt", $"{hash}.vtt");
-}
-
-static string BuildSubtitleWebVttCacheKey(string scope, string subtitlePath, int? subtitleOrdinal)
-{
-    var info = new FileInfo(subtitlePath);
-    var length = info.Exists ? info.Length : 0;
-    var lastWriteTicks = info.Exists ? info.LastWriteTimeUtc.Ticks : 0;
-    return string.Join(
-        "|",
-        scope,
-        Path.GetFullPath(subtitlePath),
-        length.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        lastWriteTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        subtitleOrdinal?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "file");
-}
-
-static string ResolveFfmpegExecutablePath()
-{
-    var configured = Environment.GetEnvironmentVariable("OMNIPLAY_FFMPEG_PATH");
-    return string.IsNullOrWhiteSpace(configured) ? "ffmpeg" : configured;
-}
-
-static void ConfigureFfmpegFontEnvironment(ProcessStartInfo startInfo)
-{
-    var packagedFontconfigPath = Path.Combine(AppContext.BaseDirectory, "tools", "fontconfig");
-    var packagedFontconfigFile = Path.Combine(packagedFontconfigPath, "fonts.conf");
-    if (File.Exists(packagedFontconfigFile))
-    {
-        startInfo.Environment.TryAdd("FONTCONFIG_FILE", packagedFontconfigFile);
-        startInfo.Environment.TryAdd("FONTCONFIG_PATH", packagedFontconfigPath);
-    }
-
-    var appRoot = Environment.GetEnvironmentVariable("OMNIPLAY_APP_ROOT");
-    if (!string.IsNullOrWhiteSpace(appRoot))
-    {
-        var fontconfigCache = Path.Combine(appRoot, "cache", "fontconfig");
-        Directory.CreateDirectory(fontconfigCache);
-        startInfo.Environment.TryAdd("FONTCONFIG_CACHE", fontconfigCache);
-    }
-}
-
-static void TryKillProcess(Process process)
-{
-    try
-    {
-        if (!process.HasExited)
-        {
-            process.Kill(entireProcessTree: true);
-            process.WaitForExit(2000);
-        }
-    }
-    catch
-    {
-    }
-}
-
 static MediaNameParser.CombinedSearchMetadataResult? ResolveSourceSearchMetadata(
     IReadOnlyList<VideoFileSummary> videoFiles)
 {
@@ -3456,6 +3723,22 @@ static IReadOnlyList<string> ResolveMetadataSearchTypes(string? requestedMediaTy
     return [normalizedItemKind];
 }
 
+static async Task<IResult> SaveDoubanMetadataAndReturnDetailAsync(
+    string libraryItemId,
+    DoubanMetadata metadata,
+    ILibraryRepository repository,
+    CancellationToken cancellationToken)
+{
+    var updated = await repository.SaveDoubanMetadataAsync(metadata, cancellationToken);
+    if (!updated)
+    {
+        return Results.NotFound();
+    }
+
+    var detail = await repository.GetItemDetailAsync(libraryItemId, cancellationToken);
+    return detail is null ? Results.NotFound() : Results.Ok(detail);
+}
+
 sealed record PlaybackPlan(string Mode, HlsPlaybackProfile Profile, string Reason);
 
 sealed record PlaybackAccessTicket(string FileId, DateTimeOffset ExpiresAt);
@@ -3471,6 +3754,15 @@ sealed record PlaybackPolicyResult(
     HlsPlaybackProfile Profile,
     string Reason,
     PlaybackDecision? Decision);
+
+sealed record HlsCachePrepareRequest(
+    IReadOnlyList<string>? LibraryItemIds,
+    IReadOnlyList<string>? VideoFileIds);
+
+sealed record HlsPrewarmTarget(
+    PlayableVideoFile File,
+    HlsPlaybackProfile Profile,
+    string Mode);
 
 sealed class InlineProgress<T> : IProgress<T>
 {

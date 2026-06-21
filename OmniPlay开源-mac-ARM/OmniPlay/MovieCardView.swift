@@ -21,6 +21,7 @@ struct MovieCardView: View {
     @State private var isFullyWatched = false
     @State private var movieFiles: [VideoFile] = []
     @State private var sourcePairs: [(VideoFile, MediaSource?)] = []
+    @State private var doubanMetadata: DoubanMetadata? = nil
     @State private var refreshTask: Task<Void, Never>? = nil
     
     private let availabilityTimer = Timer.publish(every: 15.0, on: .main, in: .common).autoconnect()
@@ -36,19 +37,12 @@ struct MovieCardView: View {
                     
                     VStack {
                         Spacer()
-                        HStack {
-                            if let vote = movie.voteAverage, vote > 0 {
-                                Text(String(format: "%.1f", vote))
-                                    .font(.caption.bold())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 4)
-                                    .background(Color.black.opacity(0.7))
-                                    .foregroundColor(Color(hex: "FFD700"))
-                                    .cornerRadius(6)
-                                    .padding(8)
-                            }
-                            Spacer()
+                        HStack(alignment: .bottom, spacing: 5) {
+                            ratingBadge(value: movie.voteAverage, tint: Color(hex: "FFD700"))
+                            ratingBadge(value: doubanMetadata?.rating, tint: Color(hex: "00B51D"))
+                            Spacer(minLength: 0)
                         }
+                        .padding(8)
                     }
 
                     if isHomeCacheModeActive {
@@ -88,8 +82,8 @@ struct MovieCardView: View {
             Text(movie.title)
                 .font(.headline)
                 .foregroundColor(theme.textPrimary)
-                .lineLimit(nil)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(2)
+                .frame(height: 42, alignment: .topLeading)
                 .multilineTextAlignment(.leading)
             
             VStack(alignment: .leading, spacing: 6) {
@@ -130,8 +124,9 @@ struct MovieCardView: View {
                     .frame(height: 4)
                 }
             }
+            .frame(height: isContinueWatchingContext ? 20 : 18, alignment: .topLeading)
         }
-        .frame(width: 160)
+        .frame(width: 160, height: isContinueWatchingContext ? 318 : 310, alignment: .topLeading)
         .onAppear { refreshCardState() }
         .onDisappear {
             refreshTask?.cancel()
@@ -177,6 +172,20 @@ struct MovieCardView: View {
     }
 
     @ViewBuilder
+    private func ratingBadge(value: Double?, tint: Color) -> some View {
+        if let value, value > 0 {
+            Text(String(format: "%.1f", value))
+                .font(.caption.bold())
+            .padding(.horizontal, 5)
+            .padding(.vertical, 4)
+            .background(Color.black.opacity(0.72))
+            .foregroundColor(tint)
+            .cornerRadius(6)
+            .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
     private var posterCacheOverlayContent: some View {
         if let progress = aggregateCacheProgress {
             OfflineCacheProgressBadge(progress: progress, tint: theme.accent)
@@ -217,18 +226,21 @@ struct MovieCardView: View {
         refreshTask?.cancel()
         refreshTask = Task {
             do {
-                let pairs = try await AppDatabase.shared.dbQueue.read { db in
-                    try VideoFile.fetchVisibleSourcePairs(movieId: movie.id, in: db)
+                let snapshot = try await AppDatabase.shared.dbQueue.read { db -> (pairs: [(VideoFile, MediaSource?)], douban: DoubanMetadata?) in
+                    let pairs = try VideoFile.fetchVisibleSourcePairs(movieId: movie.id, in: db)
+                    let douban = try movie.id.flatMap { try DoubanMetadata.fetchOne(db, key: $0) }
+                    return (pairs, douban)
                 }
                 if Task.isCancelled { return }
-                let files = pairs.map(\.0)
+                let files = snapshot.pairs.map(\.0)
                 let allFilesWatched = !files.isEmpty && files.allSatisfy { file in
                     file.duration > 0 && (file.playProgress / file.duration) >= 0.95
                 }
-                let missingFiles = evaluateMissingState(with: pairs)
+                let missingFiles = evaluateMissingState(with: snapshot.pairs)
                 await MainActor.run {
                     self.movieFiles = files
-                    self.sourcePairs = pairs
+                    self.sourcePairs = snapshot.pairs
+                    self.doubanMetadata = snapshot.douban?.isInvalidPlaceholder == true ? nil : snapshot.douban
                     self.isFullyWatched = allFilesWatched
                     self.hasMissingFiles = missingFiles
                 }

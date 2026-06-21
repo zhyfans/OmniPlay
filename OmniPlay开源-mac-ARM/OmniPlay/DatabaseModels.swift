@@ -10,6 +10,7 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
     case plex
     case emby
     case jellyfin
+    case omniplayDocker
 
     nonisolated func normalizedBaseURL(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -23,7 +24,7 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
                 value.removeLast()
             }
             return value
-        case .webdav, .plex, .emby, .jellyfin:
+        case .webdav, .plex, .emby, .jellyfin, .omniplayDocker:
             guard let url = URL(string: trimmed) else { return trimmed }
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             if components?.host?.caseInsensitiveCompare("localhost") == .orderedSame {
@@ -35,6 +36,8 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
                     components?.port = 32400
                 case .emby, .jellyfin:
                     components?.port = 8096
+                case .omniplayDocker:
+                    components?.port = 45722
                 default:
                     break
                 }
@@ -54,7 +57,7 @@ enum MediaSourceProtocol: String, Codable, CaseIterable {
         switch self {
         case .local:
             return !normalized.isEmpty
-        case .webdav, .plex, .emby, .jellyfin:
+        case .webdav, .plex, .emby, .jellyfin, .omniplayDocker:
             guard let url = URL(string: normalized), let scheme = url.scheme?.lowercased() else { return false }
             return (scheme == "http" || scheme == "https") && (url.host?.isEmpty == false)
         case .direct:
@@ -428,7 +431,7 @@ extension MediaSource {
             sql: """
             SELECT *
             FROM mediaSource
-            WHERE protocolType IN (?, ?, ?, ?, ?)
+            WHERE protocolType IN (?, ?, ?, ?, ?, ?)
             ORDER BY id DESC
             """,
             arguments: [
@@ -436,7 +439,8 @@ extension MediaSource {
                 MediaSourceProtocol.webdav.rawValue,
                 MediaSourceProtocol.plex.rawValue,
                 MediaSourceProtocol.emby.rawValue,
-                MediaSourceProtocol.jellyfin.rawValue
+                MediaSourceProtocol.jellyfin.rawValue,
+                MediaSourceProtocol.omniplayDocker.rawValue
             ]
         )
     }
@@ -447,7 +451,7 @@ extension MediaSource {
             sql: """
             SELECT *
             FROM mediaSource
-            WHERE protocolType IN (?, ?, ?, ?, ?)
+            WHERE protocolType IN (?, ?, ?, ?, ?, ?)
               AND COALESCE(isEnabled, 1) = 1
             ORDER BY id ASC
             """,
@@ -456,7 +460,8 @@ extension MediaSource {
                 MediaSourceProtocol.webdav.rawValue,
                 MediaSourceProtocol.plex.rawValue,
                 MediaSourceProtocol.emby.rawValue,
-                MediaSourceProtocol.jellyfin.rawValue
+                MediaSourceProtocol.jellyfin.rawValue,
+                MediaSourceProtocol.omniplayDocker.rawValue
             ]
         )
     }
@@ -468,7 +473,7 @@ extension MediaSource {
             SELECT *
             FROM mediaSource
             WHERE id = ?
-              AND protocolType IN (?, ?, ?, ?, ?)
+              AND protocolType IN (?, ?, ?, ?, ?, ?)
               AND COALESCE(isEnabled, 1) = 1
             LIMIT 1
             """,
@@ -478,7 +483,8 @@ extension MediaSource {
                 MediaSourceProtocol.webdav.rawValue,
                 MediaSourceProtocol.plex.rawValue,
                 MediaSourceProtocol.emby.rawValue,
-                MediaSourceProtocol.jellyfin.rawValue
+                MediaSourceProtocol.jellyfin.rawValue,
+                MediaSourceProtocol.omniplayDocker.rawValue
             ]
         )
     }
@@ -521,6 +527,10 @@ extension VideoFile {
         let fallback = relative.isEmpty ? fileName : relative
         guard let source, source.protocolKind != .direct else {
             return fallback
+        }
+        if source.protocolKind == .omniplayDocker {
+            let displayName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return displayName.isEmpty ? fallback : displayName
         }
         if (source.protocolKind == .plex || source.protocolKind == .emby || source.protocolKind == .jellyfin),
            isMediaServerPlaybackEndpointPath(relative),

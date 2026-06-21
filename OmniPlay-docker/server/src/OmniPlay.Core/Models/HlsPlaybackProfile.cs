@@ -19,7 +19,7 @@ public sealed record HlsPlaybackProfile(
     bool ToneMapToSdr,
     string ToneMapMode)
 {
-    private const string PipelineVersion = "v7";
+    private const string PipelineVersion = "v9";
 
     public string CacheKey =>
         string.Join(
@@ -115,6 +115,9 @@ public sealed record HlsPlaybackQuality(
     int? VideoBitrateKbps,
     int AudioBitrateKbps)
 {
+    public const int AutoMaxHeight = 1080;
+    public const int AutoVideoBitrateKbps = 8000;
+
     public static HlsPlaybackQuality Resolve(string? id)
     {
         return (id ?? "auto").Trim().ToLowerInvariant() switch
@@ -123,7 +126,7 @@ public sealed record HlsPlaybackQuality(
             "720p" => new("720p", 720, 3500, 160),
             "480p" => new("480p", 480, 1600, 128),
             "360p" => new("360p", 360, 900, 96),
-            _ => new("auto", null, null, 160)
+            _ => new("auto", AutoMaxHeight, AutoVideoBitrateKbps, 160)
         };
     }
 }

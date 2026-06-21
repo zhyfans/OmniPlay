@@ -170,6 +170,7 @@ public sealed class LibraryDetailTests : IDisposable
             ReleaseDate: "",
             Overview: "",
             VoteAverage: null,
+            DoubanRating: null,
             PosterLocalPath: customPosterPath,
             PosterRemotePath: "custom-upload",
             LockMetadata: true)));
@@ -260,6 +261,7 @@ public sealed class LibraryDetailTests : IDisposable
             ReleaseDate: detail.ReleaseDate,
             Overview: detail.Overview,
             VoteAverage: detail.VoteAverage,
+            DoubanRating: null,
             EpisodeId: episode.Id,
             EpisodeSubtitle: "加更")));
 

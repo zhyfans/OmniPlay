@@ -6,6 +6,7 @@ public sealed record LibraryItemCustomMetadataUpdateRequest(
     string? ReleaseDate,
     string? Overview,
     double? VoteAverage,
+    double? DoubanRating,
     string? PosterLocalPath = null,
     string? PosterRemotePath = null,
     bool LockMetadata = true,

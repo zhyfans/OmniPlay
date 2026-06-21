@@ -1446,7 +1446,7 @@ struct PlayerScreen: View {
                                         }
                                     }
                                 }
-                            } label: { HStack(spacing: 6) { Image(systemName: "waveform").font(.system(size: 16)); Text("音轨").font(.system(size: 14, weight: .bold)) }.padding(.horizontal, 16).padding(.vertical, 10).background(Color.black.opacity(0.75)).foregroundColor(.white).cornerRadius(8) }.menuStyle(.borderlessButton).fixedSize().colorScheme(.dark).simultaneousGesture(TapGesture().onEnded { beginMenuInteraction() })
+                            } label: { Image(systemName: "waveform").font(.system(size: 16, weight: .semibold)).frame(width: 44, height: 38).background(Color.black.opacity(0.75)).foregroundColor(.white).cornerRadius(8) }.help("音轨").menuStyle(.borderlessButton).fixedSize().colorScheme(.dark).simultaneousGesture(TapGesture().onEnded { beginMenuInteraction() })
                                                                                 
                             // 🌟 字幕菜单 (含本地外挂及时间轴控制)
                             Menu {
@@ -1550,7 +1550,7 @@ struct PlayerScreen: View {
                                     .background(Color.white.opacity(0.1)).cornerRadius(6)
                                 }.padding(.horizontal, 10)
                                 
-                            } label: { HStack(spacing: 6) { Image(systemName: "captions.bubble").font(.system(size: 16)); Text("字幕").font(.system(size: 14, weight: .bold)) }.padding(.horizontal, 16).padding(.vertical, 10).background(Color.black.opacity(0.75)).foregroundColor(.white).cornerRadius(8) }.menuStyle(.borderlessButton).fixedSize().colorScheme(.dark).simultaneousGesture(TapGesture().onEnded { beginMenuInteraction() })
+                            } label: { Image(systemName: "captions.bubble").font(.system(size: 16, weight: .semibold)).frame(width: 44, height: 38).background(Color.black.opacity(0.75)).foregroundColor(.white).cornerRadius(8) }.help("字幕").menuStyle(.borderlessButton).fixedSize().colorScheme(.dark).simultaneousGesture(TapGesture().onEnded { beginMenuInteraction() })
 
                         }
                     }.foregroundColor(.white).padding(.horizontal, 30).padding(.bottom, 30).padding(.top, 40).background(LinearGradient(gradient: Gradient(colors: [.clear, .black.opacity(0.9)]), startPoint: .top, endPoint: .bottom))
@@ -1940,6 +1940,43 @@ struct PlayerScreen: View {
         return min(file.playProgress, max(file.duration - 5.0, 0.0))
     }
 
+    nonisolated private static func omniPlayDockerRemoteFileId(from file: VideoFile) -> String? {
+        let idParts = file.id.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        if idParts.count == 3, idParts[0] == "omniplay-docker", !idParts[2].isEmpty {
+            return idParts[2].removingPercentEncoding ?? idParts[2]
+        }
+
+        let trimmed = file.relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let parts = trimmed.split(separator: "/").map(String.init)
+        guard parts.count >= 5,
+              parts[0] == "api",
+              parts[1] == "playback",
+              parts[2] == "files",
+              parts[4] == "stream" else {
+            return nil
+        }
+        return parts[3].removingPercentEncoding ?? parts[3]
+    }
+
+    private static func syncOmniPlayDockerProgressIfNeeded(file: VideoFile, source: MediaSource?) async {
+        guard source?.protocolKind == .omniplayDocker,
+              let source,
+              let remoteFileId = omniPlayDockerRemoteFileId(from: file) else {
+            return
+        }
+        let config = OmniPlayDockerAuthConfig.decode(source.authConfig)
+        do {
+            let client = try OmniPlayDockerClient(baseURLString: source.baseUrl, sessionCookie: config?.sessionCookie)
+            try await client.updateProgress(
+                videoFileId: remoteFileId,
+                positionSeconds: file.playProgress,
+                durationSeconds: file.duration
+            )
+        } catch {
+            print("Docker 进度同步失败：\(error.localizedDescription)")
+        }
+    }
+
     private func normalizedPlaybackFilename(_ value: String) -> String {
         let decoded = value.removingPercentEncoding ?? value
         return (decoded as NSString).lastPathComponent.lowercased()
@@ -2036,7 +2073,9 @@ struct PlayerScreen: View {
                 let thread = "bg"
                 print("[PlayerScreenClose][\(formatter.string(from: Date()))][\(thread)][q:\(queue)] progress save task begin fileId=\(fileId)")
                 do {
-                    try await AppDatabase.shared.dbQueue.write { db in
+                    let syncTarget = try await AppDatabase.shared.dbQueue.write { db -> (VideoFile, MediaSource?)? in
+                        var fileForRemoteSync: VideoFile?
+                        var sourceForRemoteSync: MediaSource?
                         for completedId in completedFileIds where completedId != fileId {
                             if var completedFile = try VideoFile.fetchOne(db, key: completedId) {
                                 Self.applyFinishedPlaybackState(to: &completedFile)
@@ -2059,7 +2098,14 @@ struct PlayerScreen: View {
                                 file.lastPlayedAt = thresholded > 0.0 ? Date().timeIntervalSince1970 : nil
                             }
                             try file.update(db)
+                            fileForRemoteSync = file
+                            sourceForRemoteSync = try file.request(for: VideoFile.mediaSource).fetchOne(db)
                         }
+                        guard let fileForRemoteSync else { return nil }
+                        return (fileForRemoteSync, sourceForRemoteSync)
+                    }
+                    if let syncTarget {
+                        await Self.syncOmniPlayDockerProgressIfNeeded(file: syncTarget.0, source: syncTarget.1)
                     }
                     await MainActor.run { NotificationCenter.default.post(name: .libraryUpdated, object: nil) }
                     let doneFormatter = ISO8601DateFormatter()
@@ -2123,8 +2169,11 @@ struct PlayerScreen: View {
         let mediaServerCredential = (sourceKind == .plex || sourceKind == .emby || sourceKind == .jellyfin)
             ? MediaServerAuthConfig.decode(sourceAuthConfig)
             : nil
+        let omniPlayDockerAuth = sourceKind == .omniplayDocker
+            ? OmniPlayDockerAuthConfig.decode(sourceAuthConfig)
+            : nil
         switch sourceKind {
-        case .webdav, .plex, .emby, .jellyfin:
+        case .webdav, .plex, .emby, .jellyfin, .omniplayDocker:
             guard let remoteBase = URL(string: normalizedBase) else { return false }
             sourceBaseUrl = remoteBase
         case .local, .direct:
@@ -2538,6 +2587,15 @@ struct PlayerScreen: View {
                 }
                 components.queryItems = items.isEmpty ? nil : items
                 return components.url
+            case .omniplayDocker:
+                guard let remoteId = Self.omniPlayDockerRemoteFileId(from: file),
+                      let client = try? OmniPlayDockerClient(
+                        baseURLString: normalizedBase,
+                        sessionCookie: omniPlayDockerAuth?.sessionCookie
+                      ) else {
+                    return nil
+                }
+                return try? await client.playbackURL(videoFileId: remoteId)
             case .local, .direct:
                 let relativePath = file.relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 return sourceBaseUrl.appendingPathComponent(relativePath)
@@ -2740,7 +2798,7 @@ struct PlayerScreen: View {
             switch sourceKind {
             case .local:
                 return FileManager.default.fileExists(atPath: targetSourceURL.path)
-            case .webdav, .direct, .plex, .emby, .jellyfin:
+            case .webdav, .direct, .plex, .emby, .jellyfin, .omniplayDocker:
                 return true
             }
         }()

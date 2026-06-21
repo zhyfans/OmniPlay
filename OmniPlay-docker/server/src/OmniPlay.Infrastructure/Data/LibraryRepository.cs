@@ -29,6 +29,7 @@ public sealed class LibraryRepository : ILibraryRepository
                    li.overview,
                    li.poster_asset_id,
                    li.vote_average,
+                   dm.rating AS douban_rating,
                    li.is_locked,
                    COALESCE(MIN(COALESCE(pp.is_watched, 0)), 0) AS is_watched,
                    COUNT(vf.id) AS video_count,
@@ -49,6 +50,7 @@ public sealed class LibraryRepository : ILibraryRepository
             FROM library_items li
             JOIN video_files vf ON vf.library_item_id = li.id AND vf.missing_at IS NULL
             JOIN media_sources ms ON ms.id = vf.source_id AND ms.is_enabled = 1 AND ms.removed_at IS NULL
+            LEFT JOIN douban_metadata dm ON dm.library_item_id = li.id
             LEFT JOIN playback_progress pp ON pp.video_file_id = vf.id AND pp.user_id = $userId
             WHERE li.is_visible = 1
             GROUP BY li.id
@@ -80,6 +82,7 @@ public sealed class LibraryRepository : ILibraryRepository
         var files = await GetVideoFilesAsync(connection, id, cancellationToken);
         var seasons = await GetSeasonsAsync(connection, id, files, cancellationToken);
         var tmdbId = await GetTmdbIdAsync(connection, id, item.ItemKind, cancellationToken);
+        var douban = await GetDoubanMetadataAsync(connection, id, cancellationToken);
 
         return new LibraryItemDetail(
             item.Id,
@@ -89,6 +92,8 @@ public sealed class LibraryRepository : ILibraryRepository
             item.Overview,
             item.PosterAssetId,
             item.VoteAverage,
+            item.DoubanRating,
+            douban,
             item.IsLocked,
             item.IsWatched,
             item.VideoFileCount,
@@ -164,6 +169,33 @@ public sealed class LibraryRepository : ILibraryRepository
             reader.IsDBNull(7) ? null : reader.GetString(7),
             reader.IsDBNull(8) ? null : reader.GetString(8),
             reader.IsDBNull(9) ? null : reader.GetString(9));
+    }
+
+    public async Task<string?> GetLibraryItemIdForVideoFileAsync(
+        string videoFileId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(videoFileId))
+        {
+            return null;
+        }
+
+        using var connection = database.OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT vf.library_item_id
+            FROM video_files vf
+            JOIN media_sources ms ON ms.id = vf.source_id
+            WHERE vf.id = $id
+              AND vf.missing_at IS NULL
+              AND ms.is_enabled = 1
+              AND ms.removed_at IS NULL
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$id", videoFileId.Trim());
+
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is string id && !string.IsNullOrWhiteSpace(id) ? id : null;
     }
 
     public async Task<bool> UpdateVideoFileProbeAsync(
@@ -354,6 +386,18 @@ public sealed class LibraryRepository : ILibraryRepository
         update.Parameters.AddWithValue("$isLocked", request.LockMetadata ? 1 : 0);
         update.Parameters.AddWithValue("$updatedAt", now);
         var updated = await update.ExecuteNonQueryAsync(cancellationToken) > 0;
+        if (updated)
+        {
+            await UpsertCustomDoubanRatingAsync(
+                connection,
+                transaction,
+                request.LibraryItemId.Trim(),
+                request.Title.Trim(),
+                request.ReleaseDate,
+                request.DoubanRating,
+                now,
+                cancellationToken);
+        }
         if (updated && !string.IsNullOrWhiteSpace(request.EpisodeId))
         {
             await UpdateEpisodeSubtitleAsync(
@@ -368,6 +412,132 @@ public sealed class LibraryRepository : ILibraryRepository
 
         transaction.Commit();
         return updated;
+    }
+
+    public async Task<bool> SaveDoubanMetadataAsync(
+        DoubanMetadata metadata,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(metadata.LibraryItemId)
+            || string.IsNullOrWhiteSpace(metadata.SubjectId)
+            || string.IsNullOrWhiteSpace(metadata.Title))
+        {
+            return false;
+        }
+
+        using var connection = database.OpenConnection();
+        if (await GetLibraryItemKindAsync(connection, metadata.LibraryItemId.Trim(), cancellationToken) is null)
+        {
+            return false;
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO douban_metadata (
+                library_item_id,
+                subject_id,
+                subject_url,
+                title,
+                original_title,
+                year,
+                rating,
+                rating_count,
+                summary,
+                genres,
+                countries,
+                poster_url,
+                fetched_at
+            )
+            VALUES (
+                $libraryItemId,
+                $subjectId,
+                $subjectUrl,
+                $title,
+                $originalTitle,
+                $year,
+                $rating,
+                $ratingCount,
+                $summary,
+                $genres,
+                $countries,
+                $posterUrl,
+                $fetchedAt
+            )
+            ON CONFLICT(library_item_id) DO UPDATE SET
+                subject_id = excluded.subject_id,
+                subject_url = excluded.subject_url,
+                title = excluded.title,
+                original_title = excluded.original_title,
+                year = excluded.year,
+                rating = excluded.rating,
+                rating_count = excluded.rating_count,
+                summary = excluded.summary,
+                genres = excluded.genres,
+                countries = excluded.countries,
+                poster_url = excluded.poster_url,
+                fetched_at = excluded.fetched_at;
+            """;
+        AddDoubanParameters(command, metadata);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        return true;
+    }
+
+    private static async Task UpsertCustomDoubanRatingAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string libraryItemId,
+        string title,
+        string? releaseDate,
+        double? rating,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO douban_metadata (
+                library_item_id,
+                subject_id,
+                subject_url,
+                title,
+                original_title,
+                year,
+                rating,
+                rating_count,
+                summary,
+                genres,
+                countries,
+                poster_url,
+                fetched_at
+            )
+            VALUES (
+                $libraryItemId,
+                $subjectId,
+                '',
+                $title,
+                NULL,
+                $year,
+                $rating,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                $fetchedAt
+            )
+            ON CONFLICT(library_item_id) DO UPDATE SET
+                title = CASE WHEN douban_metadata.subject_url = '' THEN excluded.title ELSE douban_metadata.title END,
+                year = COALESCE(douban_metadata.year, excluded.year),
+                rating = excluded.rating,
+                fetched_at = excluded.fetched_at;
+            """;
+        command.Parameters.AddWithValue("$libraryItemId", libraryItemId);
+        command.Parameters.AddWithValue("$subjectId", $"manual-{libraryItemId}");
+        command.Parameters.AddWithValue("$title", title);
+        command.Parameters.AddWithValue("$year", NormalizeYear(releaseDate) ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("$rating", rating ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("$fetchedAt", now);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static async Task UpdateEpisodeSubtitleAsync(
@@ -631,6 +801,7 @@ public sealed class LibraryRepository : ILibraryRepository
                    li.overview,
                    li.poster_asset_id,
                    li.vote_average,
+                   dm.rating AS douban_rating,
                    li.is_locked,
                    COALESCE(MIN(COALESCE(pp.is_watched, 0)), 0) AS is_watched,
                    COUNT(vf.id) AS video_count,
@@ -651,6 +822,7 @@ public sealed class LibraryRepository : ILibraryRepository
             FROM library_items li
             JOIN video_files vf ON vf.library_item_id = li.id AND vf.missing_at IS NULL
             JOIN media_sources ms ON ms.id = vf.source_id AND ms.is_enabled = 1 AND ms.removed_at IS NULL
+            LEFT JOIN douban_metadata dm ON dm.library_item_id = li.id
             LEFT JOIN playback_progress pp ON pp.video_file_id = vf.id AND pp.user_id = $userId
             WHERE li.id = $id
             GROUP BY li.id
@@ -861,6 +1033,54 @@ public sealed class LibraryRepository : ILibraryRepository
         return value is null or DBNull ? null : Convert.ToInt32(value);
     }
 
+    private static async Task<DoubanMetadata?> GetDoubanMetadataAsync(
+        SqliteConnection connection,
+        string libraryItemId,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT library_item_id,
+                   subject_id,
+                   subject_url,
+                   title,
+                   original_title,
+                   year,
+                   rating,
+                   rating_count,
+                   summary,
+                   genres,
+                   countries,
+                   poster_url,
+                   fetched_at
+            FROM douban_metadata
+            WHERE library_item_id = $libraryItemId
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$libraryItemId", libraryItemId);
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new DoubanMetadata(
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetDouble(6),
+            reader.IsDBNull(7) ? null : reader.GetInt32(7),
+            reader.IsDBNull(8) ? null : reader.GetString(8),
+            reader.IsDBNull(9) ? null : reader.GetString(9),
+            reader.IsDBNull(10) ? null : reader.GetString(10),
+            reader.IsDBNull(11) ? null : reader.GetString(11),
+            DateTimeOffset.Parse(reader.GetString(12)));
+    }
+
     private static async Task<string?> GetLibraryItemKindAsync(
         SqliteConnection connection,
         string libraryItemId,
@@ -1034,12 +1254,41 @@ public sealed class LibraryRepository : ILibraryRepository
             reader.IsDBNull(4) ? null : reader.GetString(4),
             reader.IsDBNull(5) ? null : reader.GetString(5),
             reader.IsDBNull(6) ? null : reader.GetDouble(6),
-            reader.GetInt64(7) == 1,
+            reader.IsDBNull(7) ? null : reader.GetDouble(7),
             reader.GetInt64(8) == 1,
-            reader.GetInt32(9),
-            reader.GetDouble(10),
+            reader.GetInt64(9) == 1,
+            reader.GetInt32(10),
             reader.GetDouble(11),
-            DateTimeOffset.Parse(reader.GetString(12)));
+            reader.GetDouble(12),
+            DateTimeOffset.Parse(reader.GetString(13)));
+    }
+
+    private static void AddDoubanParameters(SqliteCommand command, DoubanMetadata metadata)
+    {
+        command.Parameters.AddWithValue("$libraryItemId", metadata.LibraryItemId.Trim());
+        command.Parameters.AddWithValue("$subjectId", metadata.SubjectId.Trim());
+        command.Parameters.AddWithValue("$subjectUrl", metadata.SubjectUrl.Trim());
+        command.Parameters.AddWithValue("$title", metadata.Title.Trim());
+        command.Parameters.AddWithValue("$originalTitle", NullIfWhiteSpace(metadata.OriginalTitle));
+        command.Parameters.AddWithValue("$year", NullIfWhiteSpace(metadata.Year));
+        command.Parameters.AddWithValue("$rating", metadata.Rating ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("$ratingCount", metadata.RatingCount ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("$summary", NullIfWhiteSpace(metadata.Summary));
+        command.Parameters.AddWithValue("$genres", NullIfWhiteSpace(metadata.Genres));
+        command.Parameters.AddWithValue("$countries", NullIfWhiteSpace(metadata.Countries));
+        command.Parameters.AddWithValue("$posterUrl", NullIfWhiteSpace(metadata.PosterUrl));
+        command.Parameters.AddWithValue("$fetchedAt", metadata.FetchedAt.ToString("O"));
+    }
+
+    private static string? NormalizeYear(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.Length >= 4 && trimmed[..4].All(char.IsDigit) ? trimmed[..4] : null;
     }
 
     private static async Task<bool> VideoFileExistsAsync(

@@ -1,3 +1,4 @@
+using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
 using OmniPlay.Infrastructure.FileSystem;
 using OmniPlay.Media;
@@ -92,6 +93,31 @@ public sealed class HlsSessionServiceTests : IDisposable
     }
 
     [Fact]
+    public void GetAssetUsesConfiguredHlsCacheDirectory()
+    {
+        var paths = new StoragePaths(Path.Combine(root, "custom-hls-app"));
+        paths.EnsureCreated();
+        var hlsPath = Path.Combine(root, "custom-hls-cache");
+        var settings = new AppSettingsSnapshot(
+            "OmniPlay",
+            "phase-2",
+            new TmdbSettings(),
+            new CacheSettings(HlsCachePath: hlsPath),
+            new PlaybackSettings(),
+            new ProxySettings(),
+            new AutomationSettings());
+        var service = new FfmpegHlsSessionService(paths, "ffmpeg", appSettingsRepository: new FixedSettingsRepository(settings));
+        var sessionDirectory = Path.Combine(hlsPath, "vf_sample");
+        Directory.CreateDirectory(sessionDirectory);
+        File.WriteAllText(Path.Combine(sessionDirectory, "index.m3u8"), "#EXTM3U");
+
+        var manifest = service.GetAsset("vf_sample", "index.m3u8");
+
+        Assert.NotNull(manifest);
+        Assert.Equal(Path.Combine(sessionDirectory, "index.m3u8"), manifest.FullPath);
+    }
+
+    [Fact]
     public async Task GetCapabilitiesReportsMissingFfmpeg()
     {
         var paths = new StoragePaths(Path.Combine(root, "app"));
@@ -128,6 +154,8 @@ public sealed class HlsSessionServiceTests : IDisposable
         Assert.Contains("-init_hw_device vaapi=va:/dev/dri/renderD128", command);
         Assert.Contains("-filter_hw_device va", command);
         Assert.Contains("-c:v h264_vaapi", command);
+        Assert.Contains("-maxrate 3500k", command);
+        Assert.Contains("-bufsize 7000k", command);
         Assert.Contains("format=nv12,hwupload", command);
         Assert.Contains("-hls_playlist_type event", command);
         Assert.Contains("-hls_time 2", command);
@@ -156,9 +184,11 @@ public sealed class HlsSessionServiceTests : IDisposable
 
         Assert.Contains("-hwaccel vaapi", command);
         Assert.Contains("-hwaccel_output_format vaapi", command);
-        Assert.Contains("-vf hwdownload,format=nv12,format=nv12,hwupload", command);
+        Assert.Contains("-vf hwdownload,format=nv12,scale=-2:min(ih\\,1080),format=nv12,hwupload", command);
         Assert.DoesNotContain("scale_vaapi", command);
         Assert.Contains("-c:v h264_vaapi", command);
+        Assert.Contains("-maxrate 8000k", command);
+        Assert.Contains("-bufsize 16000k", command);
     }
 
     [Fact]
@@ -281,7 +311,7 @@ public sealed class HlsSessionServiceTests : IDisposable
                 toneMapToSdr: true,
                 toneMapMode: "dolby-vision"));
 
-        Assert.Contains("zscale=matrixin=ictcp:transferin=smpte2084:primariesin=bt2020:rangein=tv:matrix=gbr:transfer=linear:primaries=bt2020:npl=100", command);
+        Assert.Contains("zscale=matrixin=ictcp:transferin=smpte2084:primariesin=bt2020:rangein=pc:matrix=gbr:transfer=linear:primaries=bt2020:npl=100", command);
         Assert.Contains("format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=tv", command);
         Assert.DoesNotContain("colorspace=iall=bt2020", command);
         Assert.Contains("format=nv12,hwupload", command);
@@ -339,6 +369,7 @@ public sealed class HlsSessionServiceTests : IDisposable
         Directory.CreateDirectory(oldDirectory);
         File.WriteAllBytes(Path.Combine(oldDirectory, "segment_00000.ts"), [0, 1, 2, 3]);
         Directory.SetLastWriteTimeUtc(oldDirectory, DateTime.UtcNow.AddHours(-48));
+        Directory.SetLastAccessTimeUtc(oldDirectory, DateTime.UtcNow.AddHours(-48));
 
         var summary = service.CleanupCache(TimeSpan.FromHours(24));
 
@@ -347,10 +378,57 @@ public sealed class HlsSessionServiceTests : IDisposable
         Assert.False(Directory.Exists(oldDirectory));
     }
 
+    [Fact]
+    public void CleanupCacheRemovesOldestInactiveSessionsWhenAboveMaxBytes()
+    {
+        var paths = new StoragePaths(Path.Combine(root, "size-limit"));
+        paths.EnsureCreated();
+        var service = new FfmpegHlsSessionService(paths, "ffmpeg");
+        var olderDirectory = Path.Combine(paths.TranscodeDirectory, "older-session");
+        var newerDirectory = Path.Combine(paths.TranscodeDirectory, "newer-session");
+        Directory.CreateDirectory(olderDirectory);
+        Directory.CreateDirectory(newerDirectory);
+        File.WriteAllBytes(Path.Combine(olderDirectory, "segment_00000.m4s"), [0, 1, 2, 3]);
+        File.WriteAllBytes(Path.Combine(newerDirectory, "segment_00000.m4s"), [4, 5, 6, 7]);
+        Directory.SetLastWriteTimeUtc(olderDirectory, DateTime.UtcNow.AddHours(-2));
+        Directory.SetLastAccessTimeUtc(olderDirectory, DateTime.UtcNow.AddHours(-2));
+        Directory.SetLastWriteTimeUtc(newerDirectory, DateTime.UtcNow.AddHours(-1));
+        Directory.SetLastAccessTimeUtc(newerDirectory, DateTime.UtcNow.AddHours(-1));
+
+        var summary = service.CleanupCache(TimeSpan.FromHours(24), maxBytes: 4);
+
+        Assert.Equal(1, summary.RemovedSessionCount);
+        Assert.Equal(4, summary.RemovedBytes);
+        Assert.False(Directory.Exists(olderDirectory));
+        Assert.True(Directory.Exists(newerDirectory));
+    }
+
     private static void Touch(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllBytes(path, [0, 1, 2, 3]);
+    }
+
+    private sealed class FixedSettingsRepository : IAppSettingsRepository
+    {
+        private readonly AppSettingsSnapshot snapshot;
+
+        public FixedSettingsRepository(AppSettingsSnapshot snapshot)
+        {
+            this.snapshot = snapshot;
+        }
+
+        public Task<AppSettingsSnapshot> GetAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(snapshot);
+        }
+
+        public Task<AppSettingsSnapshot> UpdateAsync(
+            AppSettingsUpdateRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(snapshot);
+        }
     }
 
     public void Dispose()

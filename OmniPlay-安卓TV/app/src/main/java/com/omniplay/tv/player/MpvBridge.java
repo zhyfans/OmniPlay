@@ -31,7 +31,7 @@ final class MpvBridge {
 
     static native void nativeDetachSurface(long handle);
 
-    static native boolean nativeLoad(long handle, String url, String cookieHeader, String userAgent, double startSeconds);
+    static native boolean nativeLoad(long handle, String url, String cookieHeader, String userAgent, double startSeconds, boolean isoPlayback);
 
     static native boolean nativeAddSubtitle(long handle, String url, String cookieHeader);
 
@@ -44,6 +44,8 @@ final class MpvBridge {
     static native void nativeSeekAbsolute(long handle, double seconds);
 
     static native void nativeSetString(long handle, String property, String value);
+
+    static native String nativeGetString(long handle, String property, String fallback);
 
     static native double nativeGetDouble(long handle, String property, double fallback);
 

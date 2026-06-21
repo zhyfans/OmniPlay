@@ -28,6 +28,8 @@
 # Local environment, signing material, and secrets
 .env
 .env.*
+*.env
+*.env.*
 *.p12
 *.pfx
 *.cer
@@ -38,11 +40,18 @@
 *.crt
 *.keystore
 *.jks
+*.idsig
+keystore.properties
+signing.properties
 local.properties
 LICENSE(*.local)
 
 # Logs and local data
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 *.db
 *.sqlite
 *.sqlite3
@@ -93,6 +102,7 @@ publish/
 *.app
 *.ipa
 *.apk
+*.apk.idsig
 *.aab
 *.ap_
 *.xcarchive/
@@ -174,11 +184,23 @@ node_modules/
 .vite/
 **/.vite/
 
+# Docker runtime data. The sample compose file creates these locally.
+OmniPlay-docker/data/
+OmniPlay-docker/cache/
+OmniPlay-docker/logs/
+OmniPlay-docker/media/
+OmniPlay-docker/.env
+OmniPlay-docker/.env.*
+
 # Windows native runtime binaries are large local dependencies.
 # Keep them outside git, or use Git LFS / GitHub Releases if they
 # must be distributed with source.
 OmniPlay-win/native/mpv/
 OmniPlay-win/src/OmniPlay.Desktop/Native/mpv/*.dll
+
+# NAS package runtime binaries should be generated or attached to releases,
+# not committed to the source repository.
+OmniPlay-群晖-飞牛/packaging/media-tools/
 
 # ============================================================
 # Third-party binary frameworks / generated vendor artifacts
@@ -191,6 +213,8 @@ OmniPlay-win/src/OmniPlay.Desktop/Native/mpv/*.dll
 # ============================================================
 .gradle/
 **/.gradle/
+.cxx/
+**/.cxx/
 captures/
 **/captures/
 app/build/

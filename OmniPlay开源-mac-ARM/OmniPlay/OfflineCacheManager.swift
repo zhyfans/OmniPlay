@@ -107,7 +107,7 @@ class OfflineCacheManager: ObservableObject {
         switch kind {
         case .local, .direct, .webdav:
             return true
-        case .plex, .emby, .jellyfin:
+        case .plex, .emby, .jellyfin, .omniplayDocker:
             return false
         }
     }
@@ -116,7 +116,7 @@ class OfflineCacheManager: ObservableObject {
         if isCached(file) { return false }
         guard let mediaSource else { return true }
         guard let kind = mediaSource.protocolKind else { return true }
-        if kind == .webdav || kind == .plex || kind == .emby || kind == .jellyfin { return false }
+        if kind == .webdav || kind == .plex || kind == .emby || kind == .jellyfin || kind == .omniplayDocker { return false }
         let sourceURL = sourceFileURL(for: file, mediaSource: mediaSource)
         return !FileManager.default.fileExists(atPath: sourceURL.path)
     }
@@ -281,7 +281,7 @@ class OfflineCacheManager: ObservableObject {
                 }
                 let fileSize = await remoteFileSize(for: request, fallback: file.fileSize)
                 plannedFiles.append(CacheFilePlan(file: file, source: .remote(request), destinationURL: destinationURL, fileSize: fileSize))
-            case .plex, .emby, .jellyfin:
+            case .plex, .emby, .jellyfin, .omniplayDocker:
                 skippedUnsupportedCount += 1
             }
         }

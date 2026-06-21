@@ -147,7 +147,7 @@ paths:
           description: Task is missing or not running
   /api/cache/status:
     get:
-      summary: Read poster, thumbnail, HLS, and total cache usage
+      summary: Read poster, thumbnail, HLS, subtitle, and total cache usage
       responses:
         "200":
           description: Cache usage summary
@@ -156,6 +156,11 @@ paths:
       summary: Submit background cleanup for WebDAV playback cache
       parameters:
         - name: maxAgeHours
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: maxGb
           in: query
           required: false
           schema:

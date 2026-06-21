@@ -14,7 +14,7 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient
 {
     private const string ApiBaseUrl = "https://api.themoviedb.org/3";
     private const string ImageBaseUrl = "https://image.tmdb.org/t/p/w500";
-    private const string BuiltInPublicApiKey = "d05a3f7e939f5034054090b376de6f8c";
+    private const string BuiltInPublicApiKey = "";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly HttpClient httpClient;
@@ -508,7 +508,7 @@ public sealed class TmdbMetadataClient : ITmdbMetadataClient
             yield return new TmdbCredential(envKey.Trim(), null, "环境变量 API Key", false);
         }
 
-        if (settings.EnableBuiltInPublicSource)
+        if (settings.EnableBuiltInPublicSource && !string.IsNullOrWhiteSpace(BuiltInPublicApiKey))
         {
             yield return new TmdbCredential(BuiltInPublicApiKey, null, "内置公共源", true);
         }

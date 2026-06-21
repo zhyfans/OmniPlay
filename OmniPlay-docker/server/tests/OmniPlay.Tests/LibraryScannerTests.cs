@@ -119,7 +119,7 @@ public sealed class LibraryScannerTests : IDisposable
     }
 
     [Fact]
-    public async Task ScanAllSkipsProbeWhenNewItemsAreHiddenUntilScraped()
+    public async Task ScanAllStillProbesWhenNewItemsAreHiddenUntilScraped()
     {
         var mediaRoot = Path.Combine(root, "media");
         Touch(Path.Combine(mediaRoot, "Movies", "Inception (2010)", "Inception.2010.2160p.mkv"));
@@ -139,7 +139,7 @@ public sealed class LibraryScannerTests : IDisposable
         Assert.True(await reader.ReadAsync());
 
         Assert.Equal(1, summary.NewVideoFileCount);
-        Assert.Equal(0, probeService.ProbeCount);
+        Assert.Equal(1, probeService.ProbeCount);
         Assert.Equal(1, reader.GetInt32(0));
         Assert.Equal(0, reader.GetDouble(1));
     }
@@ -166,6 +166,36 @@ public sealed class LibraryScannerTests : IDisposable
         Assert.Equal("movie", item.ItemKind);
         Assert.Equal(2, item.VideoFileCount);
         Assert.Equal(2, detail.VideoFiles.Count);
+    }
+
+    [Fact]
+    public async Task ScanAllUsesBdmvStreamFilesInsteadOfPlaylistFiles()
+    {
+        var mediaRoot = Path.Combine(root, "media");
+        var movieFolder = Path.Combine(
+            mediaRoot,
+            "Movies",
+            "L.ultima.volta.che.siamo.stati.bambini.2023.1080p.Blu-ray.AVC.DTS-HD MA 5.1-nan@LuckDIY");
+        Touch(Path.Combine(
+            movieFolder,
+            "BDMV",
+            "PLAYLIST",
+            "L.ultima.volta.che.siamo.stati.bambini.BD_00002.mkv"));
+        Touch(Path.Combine(movieFolder, "BDMV", "STREAM", "00000.m2ts"), [0, 1, 2, 3, 4, 5, 6, 7]);
+
+        var database = new SqliteDatabase(new StoragePaths(Path.Combine(root, "app")));
+        database.EnsureInitialized();
+
+        await new MediaSourceRepository(database).AddLocalAsync("测试媒体", mediaRoot);
+        var summary = await new LibraryScanner(database).ScanAllAsync();
+
+        var item = Assert.Single(await new LibraryRepository(database).GetItemsAsync());
+        var detail = await new LibraryRepository(database).GetItemDetailAsync(item.Id);
+        var videoFile = Assert.Single(detail!.VideoFiles);
+
+        Assert.Equal(1, summary.NewMovieCount);
+        Assert.Equal(1, summary.NewVideoFileCount);
+        Assert.Contains("/BDMV/STREAM/00000.m2ts", videoFile.RelativePath.Replace('\\', '/'));
     }
 
     [Fact]
@@ -428,10 +458,10 @@ public sealed class LibraryScannerTests : IDisposable
         Assert.NotNull(sources.Single(item => item.Id == source.Id).LastScannedAt);
     }
 
-    private static void Touch(string path)
+    private static void Touch(string path, byte[]? bytes = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllBytes(path, [0, 1, 2, 3]);
+        File.WriteAllBytes(path, bytes ?? [0, 1, 2, 3]);
     }
 
     public void Dispose()

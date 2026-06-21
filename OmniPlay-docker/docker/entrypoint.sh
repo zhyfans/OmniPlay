@@ -2,7 +2,8 @@
 set -eu
 
 : "${OMNIPLAY_APP_ROOT:=/var/lib/omniplay}"
-: "${OMNIPLAY_URLS:=http://0.0.0.0:45721}"
+: "${OMNIPLAY_CACHE_ROOT:=/var/cache/omniplay}"
+: "${OMNIPLAY_URLS:=http://0.0.0.0:45722}"
 : "${ASPNETCORE_URLS:=${OMNIPLAY_URLS}}"
 : "${OMNIPLAY_FFMPEG_PATH:=/usr/bin/ffmpeg}"
 : "${OMNIPLAY_FFPROBE_PATH:=/usr/bin/ffprobe}"
@@ -11,6 +12,7 @@ set -eu
 : "${OMNIPLAY_ENABLE_QSV:=1}"
 
 export OMNIPLAY_APP_ROOT
+export OMNIPLAY_CACHE_ROOT
 export OMNIPLAY_URLS
 export ASPNETCORE_URLS
 export OMNIPLAY_FFMPEG_PATH
@@ -21,8 +23,8 @@ export OMNIPLAY_ENABLE_QSV
 
 mkdir -p \
   "${OMNIPLAY_APP_ROOT}/data" \
-  "${OMNIPLAY_APP_ROOT}/cache" \
   "${OMNIPLAY_APP_ROOT}/logs" \
-  "${OMNIPLAY_APP_ROOT}/settings"
+  "${OMNIPLAY_APP_ROOT}/settings" \
+  "${OMNIPLAY_CACHE_ROOT}"
 
 exec dotnet OmniPlay.Api.dll "$@"

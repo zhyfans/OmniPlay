@@ -11,19 +11,28 @@ public sealed class LibraryScanJobService : ILibraryScanJobService
     private readonly IScanStatusStore statusStore;
     private readonly ILibraryMetadataEnricher metadataEnricher;
     private readonly IMetadataEnrichmentStatusStore metadataStatusStore;
+    private readonly IAppSettingsRepository settingsRepository;
+    private readonly ITmdbMetadataClient tmdbClient;
+    private readonly ISubtitleCacheService? subtitleCacheService;
 
     public LibraryScanJobService(
         IBackgroundTaskCenter taskCenter,
         ILibraryScanner scanner,
         IScanStatusStore statusStore,
         ILibraryMetadataEnricher metadataEnricher,
-        IMetadataEnrichmentStatusStore metadataStatusStore)
+        IMetadataEnrichmentStatusStore metadataStatusStore,
+        IAppSettingsRepository settingsRepository,
+        ITmdbMetadataClient tmdbClient,
+        ISubtitleCacheService? subtitleCacheService = null)
     {
         this.taskCenter = taskCenter;
         this.scanner = scanner;
         this.statusStore = statusStore;
         this.metadataEnricher = metadataEnricher;
         this.metadataStatusStore = metadataStatusStore;
+        this.settingsRepository = settingsRepository;
+        this.tmdbClient = tmdbClient;
+        this.subtitleCacheService = subtitleCacheService;
     }
 
     public bool TryStartScan(LibraryRefreshRequest order, out LibraryScanStatus status)
@@ -70,25 +79,51 @@ public sealed class LibraryScanJobService : ILibraryScanJobService
         CancellationToken cancellationToken)
     {
         var metadataStarted = false;
+        var scanCompleted = false;
         try
         {
             var progress = new ScanTaskProgress(statusStore, taskProgress);
             var summary = sourceId.HasValue
-                ? await scanner.ScanSourceAsync(sourceId.Value, progress, hideNewItemsUntilScraped: true, cancellationToken)
-                : await scanner.ScanAllAsync(progress, hideNewItemsUntilScraped: true, cancellationToken);
+                ? await scanner.ScanSourceAsync(sourceId.Value, progress, hideNewItemsUntilScraped: false, cancellationToken)
+                : await scanner.ScanAllAsync(progress, hideNewItemsUntilScraped: false, cancellationToken);
+
+            statusStore.MarkCompleted(summary, DateTimeOffset.UtcNow);
+            scanCompleted = true;
 
             metadataStarted = true;
             metadataStatusStore.MarkStarted(targetLibraryItemId: null, DateTimeOffset.UtcNow);
             var metadataProgress = new MetadataTaskProgress(metadataStatusStore, taskProgress);
+            var settings = (await settingsRepository.GetAsync(cancellationToken)).Tmdb;
+            var connectionResult = await TestTmdbConnectionAsync(settings, metadataProgress, cancellationToken);
+            if ((settings.EnableMetadataEnrichment || settings.EnablePosterDownloads) && !connectionResult.IsReachable)
+            {
+                var message = BuildTmdbConnectionFailureMessage(connectionResult);
+                metadataStatusStore.MarkFailed(message, DateTimeOffset.UtcNow);
+                return $"扫描完成：{summary.NewVideoFileCount} 个新视频。{message}";
+            }
+
             var metadataSummary = await metadataEnricher.EnrichMissingAsync(metadataProgress, order, cancellationToken);
             metadataStatusStore.MarkCompleted(metadataSummary, DateTimeOffset.UtcNow);
 
-            statusStore.MarkCompleted(summary, DateTimeOffset.UtcNow);
-            return $"刷新完成：{summary.NewVideoFileCount} 个新视频，刮削 {metadataSummary.UpdatedItems} 个条目";
+            var subtitleSummary = subtitleCacheService is null
+                ? new SubtitleCachePrewarmSummary(0, 0, 0, 0)
+                : await subtitleCacheService.PrewarmLibraryAsync(
+                    targetLibraryItemId: null,
+                    progress: taskProgress,
+                    cancellationToken: cancellationToken);
+
+            var subtitleText = subtitleSummary.CandidateTrackCount > 0
+                ? $"，字幕缓存 {subtitleSummary.CachedTrackCount}/{subtitleSummary.CandidateTrackCount} 条"
+                : string.Empty;
+            return $"刷新完成：{summary.NewVideoFileCount} 个新视频，刮削 {metadataSummary.UpdatedItems} 个条目{subtitleText}";
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            statusStore.MarkCanceled(DateTimeOffset.UtcNow);
+            if (!scanCompleted)
+            {
+                statusStore.MarkCanceled(DateTimeOffset.UtcNow);
+            }
+
             if (metadataStarted)
             {
                 metadataStatusStore.MarkCanceled(DateTimeOffset.UtcNow);
@@ -99,7 +134,11 @@ public sealed class LibraryScanJobService : ILibraryScanJobService
         catch (Exception ex)
         {
             var message = UserFacingErrorMessages.FromException(ex);
-            statusStore.MarkFailed(message, DateTimeOffset.UtcNow);
+            if (!scanCompleted)
+            {
+                statusStore.MarkFailed(message, DateTimeOffset.UtcNow);
+            }
+
             if (metadataStarted)
             {
                 metadataStatusStore.MarkFailed(message, DateTimeOffset.UtcNow);
@@ -107,6 +146,40 @@ public sealed class LibraryScanJobService : ILibraryScanJobService
 
             throw;
         }
+    }
+
+    private async Task<TmdbConnectionTestResult> TestTmdbConnectionAsync(
+        TmdbSettings settings,
+        IProgress<LibraryMetadataEnrichmentProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        progress.Report(new LibraryMetadataEnrichmentProgress(
+            "checking-tmdb",
+            0,
+            0,
+            0,
+            0,
+            0,
+            null,
+            null,
+            DateTimeOffset.UtcNow));
+
+        return await tmdbClient.TestConnectionAsync(settings, cancellationToken);
+    }
+
+    private static string BuildTmdbConnectionFailureMessage(TmdbConnectionTestResult result)
+    {
+        var details = string.Join(
+            " · ",
+            new[]
+            {
+                string.IsNullOrWhiteSpace(result.Source) ? null : result.Source,
+                result.StatusCode.HasValue ? $"HTTP {result.StatusCode.Value}" : null,
+                string.IsNullOrWhiteSpace(result.Message) ? null : result.Message
+            }.Where(static item => !string.IsNullOrWhiteSpace(item)));
+        return string.IsNullOrWhiteSpace(details)
+            ? "TMDB API 无法连接。请开启代理，或在设置中添加自定义 TMDB API 后重试刮削。"
+            : $"TMDB API 无法连接。请开启代理，或在设置中添加自定义 TMDB API 后重试刮削。{details}";
     }
 
     private sealed class ScanTaskProgress : IProgress<LibraryScanProgress>
@@ -197,6 +270,7 @@ public sealed class LibraryScanJobService : ILibraryScanJobService
             var phase = value.Phase switch
             {
                 "starting" => "准备刮削",
+                "checking-tmdb" => "检测 TMDB 连通性",
                 "searching" => "匹配元数据",
                 "fetching-details" => "精确刷新 TMDB",
                 "fetching-episodes" => "刷新分集信息和剧照",

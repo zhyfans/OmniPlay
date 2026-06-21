@@ -18,7 +18,9 @@ public sealed class LibraryScanJobServiceTests
             scanner,
             statusStore,
             new FakeMetadataEnricher(),
-            metadataStatusStore);
+            metadataStatusStore,
+            new FakeAppSettingsRepository(),
+            new AlwaysReachableTmdbClient());
 
         Assert.True(service.TryStartScan(new LibraryRefreshRequest(), out var started));
         Assert.True(started.IsRunning);
@@ -45,7 +47,9 @@ public sealed class LibraryScanJobServiceTests
             scanner,
             statusStore,
             new FakeMetadataEnricher(),
-            new InMemoryMetadataEnrichmentStatusStore());
+            new InMemoryMetadataEnrichmentStatusStore(),
+            new FakeAppSettingsRepository(),
+            new AlwaysReachableTmdbClient());
 
         Assert.True(service.TryStartScan(new LibraryRefreshRequest(), out _));
         await scanner.WaitUntilStartedAsync();
@@ -189,6 +193,98 @@ public sealed class LibraryScanJobServiceTests
             CancellationToken cancellationToken = default)
         {
             return EnrichItemAsync(libraryItemId, cancellationToken);
+        }
+    }
+
+    private sealed class FakeAppSettingsRepository : IAppSettingsRepository
+    {
+        public Task<AppSettingsSnapshot> GetAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new AppSettingsSnapshot(
+                "OmniPlay",
+                "test",
+                new TmdbSettings(),
+                new CacheSettings(),
+                new PlaybackSettings(),
+                new ProxySettings(),
+                new AutomationSettings()));
+        }
+
+        public Task<AppSettingsSnapshot> UpdateAsync(
+            AppSettingsUpdateRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            return GetAsync(cancellationToken);
+        }
+    }
+
+    private sealed class AlwaysReachableTmdbClient : ITmdbMetadataClient
+    {
+        public Task<TmdbConnectionTestResult> TestConnectionAsync(
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new TmdbConnectionTestResult(true, "测试", 200, "TMDB 连接正常。"));
+        }
+
+        public Task<TmdbMetadataMatch?> SearchAsync(
+            string mediaType,
+            string title,
+            string? year,
+            TmdbSettings settings,
+            string? secondaryQuery = null,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbMetadataMatch?>(null);
+        }
+
+        public Task<IReadOnlyList<TmdbMetadataMatch>> SearchCandidatesAsync(
+            string mediaType,
+            string title,
+            string? year,
+            TmdbSettings settings,
+            string? secondaryQuery = null,
+            int limit = 8,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<TmdbMetadataMatch>>([]);
+        }
+
+        public Task<TmdbMetadataMatch?> GetDetailsAsync(
+            string mediaType,
+            int tmdbId,
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbMetadataMatch?>(null);
+        }
+
+        public Task<TmdbSeasonDetail?> GetSeasonAsync(
+            int tvTmdbId,
+            int seasonNumber,
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbSeasonDetail?>(null);
+        }
+
+        public Task<string?> DownloadPosterAsync(
+            string posterPath,
+            string mediaType,
+            int tmdbId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
+        }
+
+        public Task<string?> DownloadStillAsync(
+            string stillPath,
+            int tvTmdbId,
+            int seasonNumber,
+            int episodeNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
         }
     }
 }

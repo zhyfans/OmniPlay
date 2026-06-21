@@ -142,6 +142,23 @@ public sealed class SqliteDatabase
                 FOREIGN KEY(video_file_id) REFERENCES video_files(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS douban_metadata (
+                library_item_id TEXT PRIMARY KEY,
+                subject_id TEXT NOT NULL,
+                subject_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                original_title TEXT NULL,
+                year TEXT NULL,
+                rating REAL NULL,
+                rating_count INTEGER NULL,
+                summary TEXT NULL,
+                genres TEXT NULL,
+                countries TEXT NULL,
+                poster_url TEXT NULL,
+                fetched_at TEXT NOT NULL,
+                FOREIGN KEY(library_item_id) REFERENCES library_items(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS scrape_overrides (
                 id TEXT PRIMARY KEY,
                 target_kind TEXT NOT NULL,

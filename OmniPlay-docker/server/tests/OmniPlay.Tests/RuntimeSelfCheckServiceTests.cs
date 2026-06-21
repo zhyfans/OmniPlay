@@ -52,6 +52,22 @@ public sealed class RuntimeSelfCheckServiceTests : IDisposable
             return Task.FromResult(new HlsPlaybackSession("stub", "", "", false, false, null));
         }
 
+        public Task<HlsPlaybackSession> EnsureCompletedSessionAsync(
+            PlayableVideoFile file,
+            HlsPlaybackProfile profile,
+            IProgress<BackgroundTaskProgress>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            return EnsureSessionAsync(file, profile, cancellationToken);
+        }
+
+        public HlsPlaybackSession? GetCompletedSession(
+            PlayableVideoFile file,
+            HlsPlaybackProfile profile)
+        {
+            return null;
+        }
+
         public HlsPlaybackAsset? GetAsset(string sessionId, string assetName)
         {
             return null;
@@ -81,7 +97,7 @@ public sealed class RuntimeSelfCheckServiceTests : IDisposable
             return false;
         }
 
-        public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge)
+        public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge, long? maxBytes = null)
         {
             return new HlsCacheCleanupSummary(0, 0);
         }

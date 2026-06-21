@@ -16,6 +16,10 @@ public interface IPlaybackCacheService
         string videoFileId,
         CancellationToken cancellationToken = default);
 
+    Task<string?> GetCompletedCachedPathAsync(
+        string videoFileId,
+        CancellationToken cancellationToken = default);
+
     Task<string?> EnsureCachedAsync(
         string videoFileId,
         CancellationToken cancellationToken = default);

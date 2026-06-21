@@ -12,15 +12,18 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.text.Html;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.view.ViewConfiguration;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Button;
@@ -35,13 +38,18 @@ import android.widget.TextView;
 
 import com.omniplay.tv.data.Models;
 import com.omniplay.tv.data.OmniPlayApi;
+import com.omniplay.tv.iso.RemoteIsoStreamServer;
 import com.omniplay.tv.player.MpvVideoView;
+import com.omniplay.tv.subtitle.PgsSubtitleCue;
+import com.omniplay.tv.subtitle.PgsSubtitleParser;
+import com.omniplay.tv.subtitle.PgsSubtitleView;
 import com.omniplay.tv.ui.ImageLoader;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -64,17 +72,23 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class MainActivity extends Activity {
     private static final String UI_PREFS = "omniplay_tv_ui";
-    private static final String KEY_SHOW_EPISODE_DETAILS = "show_episode_details";
-    private static final String KEY_DIRECT_4K_PLAYBACK = "direct_4k_playback";
+    private static final String KEY_4K_DV_HDR_PLAYBACK_MODE = "4k_dv_hdr_playback_mode";
+    private static final int DOCKER_SERVER_PORT = 45722;
+    private static final String PLAYBACK_MODE_COMPATIBLE_SUBTITLE = "compatible_subtitle";
+    private static final String PLAYBACK_MODE_HIGH_PERFORMANCE_DIRECT = "high_performance_direct";
     private static final int COLOR_BACKGROUND = Color.rgb(245, 247, 250);
     private static final int COLOR_SURFACE = Color.rgb(255, 255, 255);
     private static final int COLOR_SURFACE_ALT = Color.rgb(243, 244, 246);
@@ -88,6 +102,20 @@ public final class MainActivity extends Activity {
     private static final int COLOR_PLAYER_TEXT = Color.WHITE;
     private static final int COLOR_PLAYER_MUTED = Color.rgb(229, 231, 235);
     private static final int UNKNOWN_MOVIE_PART_INDEX = Integer.MAX_VALUE;
+    private static final int PLAYER_SEEK_REPEAT_MS = 80;
+    private static final double PLAYER_SEEK_STEP_SECONDS = 0.8d;
+    private static final int FOCUS_STROKE_PX = 1;
+    private static final float FOCUS_SCALE = 1.04f;
+    private static final int FOCUS_ANIMATION_MS = 120;
+    private static final int HOME_PAGE_HORIZONTAL_PADDING_DP = 44;
+    private static final int HOME_POSTER_COLUMNS = 8;
+    private static final int HOME_POSTER_CARD_MARGIN_DP = 4;
+    private static final int DETAIL_POSTER_WIDTH_DP = 230;
+    private static final int DETAIL_POSTER_HEIGHT_DP = 342;
+    private static final int EPISODE_CARD_WIDTH_DP = 286;
+    private static final int EPISODE_STILL_HEIGHT_DP = 152;
+    private static final Pattern SUBTITLE_TIME_LINE = Pattern.compile(
+            "^\\s*((?:\\d{1,2}:)?\\d{1,2}:\\d{2}[,.]\\d{1,3})\\s*-->\\s*((?:\\d{1,2}:)?\\d{1,2}:\\d{2}[,.]\\d{1,3})(?:\\s+.*)?$");
     private static final String[] MOVIE_PART_PREFIXES = {"volume", "part", "disc", "disk", "dvd", "vol", "pt", "cd"};
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -98,6 +126,10 @@ public final class MainActivity extends Activity {
     private ImageLoader imageLoader;
     private SharedPreferences uiPreferences;
     private List<Models.LibraryItem> libraryItems = Collections.emptyList();
+    private final Map<String, Models.LibraryDetail> detailCache = new ConcurrentHashMap<>();
+    private final Map<String, Models.SubtitleCacheStatus> subtitleCacheStatusCache = new ConcurrentHashMap<>();
+    private final Map<String, PlaybackTimeline> localPlaybackProgress = new ConcurrentHashMap<>();
+    private final Set<String> pendingDetailPrefetches = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private Models.LibraryDetail currentDetail;
     private MpvVideoView playerView;
     private ScrollView homeScrollView;
@@ -108,8 +140,12 @@ public final class MainActivity extends Activity {
     private List<Models.VideoFile> activePlaybackQueue = Collections.emptyList();
     private int activePlaybackIndex;
     private String activePlaybackTicket;
+    private String activeHlsSessionId;
     private List<Models.SubtitleTrack> activeExternalSubtitles = Collections.emptyList();
+    private List<RuntimeTrack> activeRuntimeAudioTracks = Collections.emptyList();
+    private List<RuntimeTrack> activeRuntimeSubtitleTracks = Collections.emptyList();
     private List<SubtitleCue> activeSubtitleCues = Collections.emptyList();
+    private List<PgsSubtitleCue> activePgsSubtitleCues = Collections.emptyList();
     private View playerMenuPanel;
     private View playerTopOverlay;
     private View playerControlsPanel;
@@ -117,7 +153,10 @@ public final class MainActivity extends Activity {
     private TextView playerTotalTime;
     private TextView playerStatusText;
     private TextView playerSubtitleOverlay;
+    private PgsSubtitleView playerPgsSubtitleOverlay;
     private ImageButton playerPlayPauseButton;
+    private ImageButton playerAudioButton;
+    private ImageButton playerSubtitleButton;
     private View playerProgressFill;
     private FrameLayout playerProgressTrack;
     private final List<View> playerProgressSegmentViews = new ArrayList<>();
@@ -125,7 +164,10 @@ public final class MainActivity extends Activity {
     private Runnable progressReporter;
     private Runnable playerChromeHider;
     private Runnable subtitleOverlayUpdater;
+    private Runnable playerSeekStarter;
+    private Runnable playerSeekRepeater;
     private long playerLoadStartedAtMs;
+    private double playerSeekPreviewPosition = -1;
     private Runnable pendingSearchRender;
     private int homeScrollY;
     private boolean restoreHomeScroll;
@@ -135,27 +177,49 @@ public final class MainActivity extends Activity {
     private boolean isSortOpen;
     private boolean isSettingsOpen;
     private boolean showEpisodeDetails = true;
-    private boolean direct4KPlayback = true;
+    private boolean highPerformanceDirectPlayback;
     private boolean activeDirectPlayback;
     private boolean playerChromeHidden;
     private boolean playerPaused;
+    private boolean playerHorizontalKeyDown;
+    private boolean playerHorizontalKeyWasChromeHidden;
+    private boolean playerSeekLongPressActive;
+    private int playerHorizontalKeyCode;
+    private int playerSeekDirection;
+    private int selectedAudioTrackOrdinal = -1;
+    private int selectedEmbeddedSubtitleOrdinal = -1;
+    private String selectedRuntimeAudioId;
+    private String selectedRuntimeSubtitleId;
+    private String selectedExternalSubtitleId;
+    private int pendingEmbeddedSubtitleOrdinal = -1;
+    private String pendingRuntimeSubtitleId;
+    private String pendingExternalSubtitleId;
+    private int subtitleLoadGeneration;
+    private long subtitleLoadStartedAtMs;
+    private double lastKnownPlaybackPositionSeconds;
+    private double lastKnownPlaybackDurationSeconds;
     private String searchText = "";
     private SortKey sortKey = SortKey.YEAR;
     private boolean sortDescending = true;
     private String selectedSeasonId = "";
+    private String requestedDetailItemId = "";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        preferHighestResolutionDisplayMode();
 
         api = new OmniPlayApi(this);
-        imageLoader = new ImageLoader();
+        imageLoader = new ImageLoader(this);
         uiPreferences = getApplicationContext().getSharedPreferences(UI_PREFS, MODE_PRIVATE);
-        showEpisodeDetails = uiPreferences.getBoolean(KEY_SHOW_EPISODE_DETAILS, true);
-        direct4KPlayback = uiPreferences.getBoolean(KEY_DIRECT_4K_PLAYBACK, true);
+        highPerformanceDirectPlayback = PLAYBACK_MODE_HIGH_PERFORMANCE_DIRECT.equals(uiPreferences.getString(
+                KEY_4K_DV_HDR_PLAYBACK_MODE,
+                PLAYBACK_MODE_COMPATIBLE_SUBTITLE));
         root = new FrameLayout(this);
+        root.setClipChildren(false);
+        root.setClipToPadding(false);
         applyAppBackground();
         setContentView(root);
 
@@ -164,6 +228,48 @@ public final class MainActivity extends Activity {
         } else {
             showSetup(null);
         }
+    }
+
+    private void preferHighestResolutionDisplayMode() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return;
+        }
+
+        Display display = getWindowManager().getDefaultDisplay();
+        if (display == null) {
+            return;
+        }
+
+        Display.Mode current = display.getMode();
+        Display.Mode best = current;
+        for (Display.Mode mode : display.getSupportedModes()) {
+            if (mode == null) {
+                continue;
+            }
+            if (best == null || displayModeRank(mode) > displayModeRank(best)) {
+                best = mode;
+            }
+        }
+
+        if (best != null && current != null && best.getModeId() != current.getModeId()) {
+            WindowManager.LayoutParams params = getWindow().getAttributes();
+            params.preferredDisplayModeId = best.getModeId();
+            getWindow().setAttributes(params);
+        }
+    }
+
+    private long displayModeRank(Display.Mode mode) {
+        long pixels = (long) mode.getPhysicalWidth() * (long) mode.getPhysicalHeight();
+        long refresh = Math.round(mode.getRefreshRate());
+        return pixels * 1000L + refresh;
+    }
+
+    @Override
+    protected void onStop() {
+        if (screen == Screen.PLAYER && playerView != null) {
+            closePlayer();
+        }
+        super.onStop();
     }
 
     private void checkSession() {
@@ -189,33 +295,39 @@ public final class MainActivity extends Activity {
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
+        scroll.setClipChildren(false);
+        scroll.setClipToPadding(false);
         root.addView(scroll, match());
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         page.setGravity(Gravity.CENTER_HORIZONTAL);
         page.setPadding(dp(96), dp(28), dp(96), dp(28));
+        page.setClipChildren(false);
+        page.setClipToPadding(false);
         scroll.addView(page, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(40), dp(26), dp(40), dp(28));
+        panel.setClipChildren(false);
+        panel.setClipToPadding(false);
         panel.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), dp(8)));
         panel.setElevation(dp(12));
         page.addView(panel, new LinearLayout.LayoutParams(dp(720), ViewGroup.LayoutParams.WRAP_CONTENT));
 
         panel.addView(title("OmniPlay TV"));
-        panel.addView(body("连接群晖套件版服务端后，安卓 TV 端将直接播放原文件。"));
+        panel.addView(body("连接docker服务端，安卓TV端只播放，不扫描刮削。"));
 
-        EditText serverInput = input("服务端地址，例如 http://192.168.1.10:45721", api.serverUrl());
+        EditText serverInput = input("Docker 服务端地址，例如 http://192.168.1.10:45722", api.serverUrl());
         panel.addView(serverInput, margin(matchWidth(), 0, dp(18), 0, 0));
         TextView discoveryStatus = text("", 13, Typeface.BOLD, COLOR_SUBTLE);
         panel.addView(discoveryStatus, margin(matchWidth(), 0, dp(6), 0, dp(8)));
 
-        EditText usernameInput = input("用户名", "");
+        EditText usernameInput = input("用户名", api.savedUsername());
         panel.addView(usernameInput, margin(matchWidth(), 0, dp(10), 0, 0));
 
-        EditText passwordInput = input("密码", "");
+        EditText passwordInput = input("密码", api.savedPassword());
         passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         panel.addView(passwordInput, margin(matchWidth(), 0, dp(10), 0, 0));
 
@@ -225,8 +337,20 @@ public final class MainActivity extends Activity {
             panel.addView(error, margin(matchWidth(), 0, 0, 0, dp(16)));
         }
 
+        LinearLayout actions = new LinearLayout(this);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+        actions.setClipChildren(false);
+        actions.setClipToPadding(false);
+        panel.addView(actions, margin(matchWidth(), 0, dp(14), 0, 0));
+
         Button login = button("登录");
-        panel.addView(login, margin(new LinearLayout.LayoutParams(dp(180), dp(52)), 0, dp(14), 0, 0));
+        login.setId(View.generateViewId());
+        actions.addView(login, new LinearLayout.LayoutParams(dp(180), dp(52)));
+        Button scan = button("预扫描");
+        scan.setId(View.generateViewId());
+        actions.addView(scan, margin(new LinearLayout.LayoutParams(dp(180), dp(52)), dp(14), 0, 0, 0));
+        login.setNextFocusRightId(scan.getId());
+        scan.setNextFocusLeftId(login.getId());
         login.setOnClickListener(view -> {
             String server = serverInput.getText().toString();
             String username = usernameInput.getText().toString();
@@ -237,6 +361,26 @@ public final class MainActivity extends Activity {
                     status -> showHome(),
                     error -> showSetup(error.getMessage()));
         });
+        scan.setOnClickListener(view -> {
+            discoveryStatus.setText("正在预扫描 Docker 服务端");
+            scan.setEnabled(false);
+            runAsync(
+                    this::discoverServerUrl,
+                    serverUrl -> {
+                        scan.setEnabled(true);
+                        if (serverUrl != null && !serverUrl.isEmpty()) {
+                            serverInput.setText(serverUrl);
+                            serverInput.setSelection(serverInput.getText().length());
+                            discoveryStatus.setText("已发现 Docker 服务端");
+                        } else {
+                            discoveryStatus.setText("未发现 Docker 服务端，可手动输入");
+                        }
+                    },
+                    error -> {
+                        scan.setEnabled(true);
+                        discoveryStatus.setText("未发现 Docker 服务端，可手动输入");
+                    });
+        });
         serverInput.requestFocus();
         startServerDiscovery(serverInput, discoveryStatus);
     }
@@ -246,7 +390,7 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        discoveryStatus.setText("正在扫描局域网服务端");
+        discoveryStatus.setText("正在预扫描 Docker 服务端");
         runAsync(
                 this::discoverServerUrl,
                 serverUrl -> {
@@ -256,14 +400,14 @@ public final class MainActivity extends Activity {
                     if (serverUrl != null && !serverUrl.isEmpty() && serverInput.getText().toString().trim().isEmpty()) {
                         serverInput.setText(serverUrl);
                         serverInput.setSelection(serverInput.getText().length());
-                        discoveryStatus.setText("已发现服务端");
+                        discoveryStatus.setText("已发现 Docker 服务端");
                     } else {
-                        discoveryStatus.setText("未自动发现服务端，可手动输入");
+                        discoveryStatus.setText("未发现 Docker 服务端，可手动输入");
                     }
                 },
                 error -> {
                     if (screen == Screen.SETUP) {
-                        discoveryStatus.setText("未自动发现服务端，可手动输入");
+                        discoveryStatus.setText("未发现 Docker 服务端，可手动输入");
                     }
                 });
     }
@@ -337,7 +481,7 @@ public final class MainActivity extends Activity {
     }
 
     private String probeServer(String host) {
-        String url = "http://" + host + ":45721";
+        String url = "http://" + host + ":" + DOCKER_SERVER_PORT;
         HttpURLConnection connection = null;
         try {
             connection = (HttpURLConnection) new URL(url + "/api/auth/status").openConnection();
@@ -365,6 +509,8 @@ public final class MainActivity extends Activity {
         screen = Screen.HOME;
         currentDetail = null;
         selectedSeasonId = "";
+        homeScrollY = 0;
+        restoreHomeScroll = false;
         destroyPlayer();
         boolean hasVisibleLibrary = !libraryItems.isEmpty();
         if (!hasVisibleLibrary) {
@@ -409,23 +555,29 @@ public final class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         homeScrollView = scroll;
         scroll.setFillViewport(false);
+        scroll.setClipChildren(false);
+        scroll.setClipToPadding(false);
         root.addView(scroll, match());
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(44), dp(28), dp(44), dp(36));
+        page.setPadding(sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), sdp(30), sdp(HOME_PAGE_HORIZONTAL_PADDING_DP), sdp(42));
+        page.setClipChildren(false);
+        page.setClipToPadding(false);
         scroll.addView(page, matchWidth());
 
         View firstFocusable = null;
 
         LinearLayout continueHeader = new LinearLayout(this);
         continueHeader.setGravity(Gravity.CENTER_VERTICAL);
-        page.addView(continueHeader, margin(matchWidth(), 0, 0, 0, dp(14)));
+        continueHeader.setClipChildren(false);
+        continueHeader.setClipToPadding(false);
+        page.addView(continueHeader, margin(matchWidth(), 0, 0, 0, sdp(16)));
         TextView continueTitle = sectionTitle("继续播放");
         continueTitle.setPadding(0, 0, 0, 0);
         continueHeader.addView(continueTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         Button settings = compactButton("设置");
-        continueHeader.addView(settings, new LinearLayout.LayoutParams(dp(96), dp(44)));
+        continueHeader.addView(settings, new LinearLayout.LayoutParams(sdp(106), sdp(48)));
         settings.setOnClickListener(view -> {
             openSettingsOverlay();
         });
@@ -435,7 +587,7 @@ public final class MainActivity extends Activity {
             page.addView(emptyText("暂无继续播放"));
         } else {
             GridLayout continueGrid = posterGrid();
-            page.addView(continueGrid, margin(matchWidth(), 0, 0, 0, dp(28)));
+            page.addView(continueGrid, margin(matchWidth(), 0, 0, 0, sdp(34)));
             for (Models.LibraryItem item : continueItems) {
                 View card = posterCard(item, true);
                 if (firstFocusable == null) {
@@ -447,28 +599,30 @@ public final class MainActivity extends Activity {
 
         LinearLayout libraryHeader = new LinearLayout(this);
         libraryHeader.setGravity(Gravity.CENTER_VERTICAL);
-        page.addView(libraryHeader, margin(matchWidth(), 0, dp(6), 0, dp(14)));
+        libraryHeader.setClipChildren(false);
+        libraryHeader.setClipToPadding(false);
+        page.addView(libraryHeader, margin(matchWidth(), 0, sdp(8), 0, sdp(16)));
 
         TextView libraryTitle = sectionTitle("所有影视");
         libraryTitle.setPadding(0, 0, 0, 0);
         libraryHeader.addView(libraryTitle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         Button search = compactButton("搜索");
-        libraryHeader.addView(search, margin(new LinearLayout.LayoutParams(dp(96), dp(44)), dp(18), 0, 0, 0));
+        libraryHeader.addView(search, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(20), 0, 0, 0));
         search.setOnClickListener(view -> {
             isSearchOpen = !isSearchOpen;
             renderHomeContentKeepingPosition();
         });
 
         Button sort = compactButton("排序");
-        libraryHeader.addView(sort, margin(new LinearLayout.LayoutParams(dp(96), dp(44)), dp(10), 0, 0, 0));
+        libraryHeader.addView(sort, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(12), 0, 0, 0));
         sort.setOnClickListener(view -> {
             isSortOpen = !isSortOpen;
             renderHomeContentKeepingPosition();
         });
 
         Button direction = compactButton(sortDescending ? "降序" : "升序");
-        libraryHeader.addView(direction, margin(new LinearLayout.LayoutParams(dp(96), dp(44)), dp(10), 0, 0, 0));
+        libraryHeader.addView(direction, margin(new LinearLayout.LayoutParams(sdp(106), sdp(48)), sdp(12), 0, 0, 0));
         direction.setOnClickListener(view -> {
             sortDescending = !sortDescending;
             renderHomeContentKeepingPosition();
@@ -478,7 +632,9 @@ public final class MainActivity extends Activity {
         if (isSearchOpen) {
             LinearLayout searchRow = new LinearLayout(this);
             searchRow.setGravity(Gravity.CENTER_VERTICAL);
-            page.addView(searchRow, margin(matchWidth(), 0, 0, 0, dp(14)));
+            searchRow.setClipChildren(false);
+            searchRow.setClipToPadding(false);
+            page.addView(searchRow, margin(matchWidth(), 0, 0, 0, sdp(16)));
             searchInput = input("搜索", searchText);
             searchInput.setSelection(searchInput.getText().length());
             searchInput.addTextChangedListener(new TextWatcher() {
@@ -505,11 +661,11 @@ public final class MainActivity extends Activity {
                     main.postDelayed(pendingSearchRender, 220);
                 }
             });
-            searchRow.addView(searchInput, new LinearLayout.LayoutParams(0, dp(56), 1f));
+            searchRow.addView(searchInput, new LinearLayout.LayoutParams(0, sdp(58), 1f));
 
             EditText finalSearchInput = searchInput;
             Button apply = compactButton("确定");
-            searchRow.addView(apply, margin(new LinearLayout.LayoutParams(dp(96), dp(48)), dp(12), dp(4), 0, dp(4)));
+            searchRow.addView(apply, margin(new LinearLayout.LayoutParams(sdp(106), sdp(50)), sdp(14), sdp(4), 0, sdp(4)));
             apply.setOnClickListener(view -> {
                 searchText = finalSearchInput.getText().toString();
                 renderHomeContentKeepingPosition();
@@ -519,7 +675,9 @@ public final class MainActivity extends Activity {
         if (isSortOpen) {
             LinearLayout sortRow = new LinearLayout(this);
             sortRow.setGravity(Gravity.CENTER_VERTICAL);
-            page.addView(sortRow, margin(matchWidth(), 0, 0, 0, dp(16)));
+            sortRow.setClipChildren(false);
+            sortRow.setClipToPadding(false);
+            page.addView(sortRow, margin(matchWidth(), 0, 0, 0, sdp(18)));
             addSortButton(sortRow, "名称", SortKey.TITLE);
             addSortButton(sortRow, "评分", SortKey.RATING);
             addSortButton(sortRow, "上映年份", SortKey.YEAR);
@@ -552,6 +710,7 @@ public final class MainActivity extends Activity {
             } else {
                 search.requestFocus();
             }
+            main.post(() -> scroll.scrollTo(0, 0));
         }
 
         if (isSettingsOpen) {
@@ -561,7 +720,7 @@ public final class MainActivity extends Activity {
 
     private void addSortButton(LinearLayout row, String label, SortKey key) {
         Button option = button(label, sortKey == key);
-        row.addView(option, margin(new LinearLayout.LayoutParams(dp(132), dp(44)), 0, 0, dp(10), 0));
+        row.addView(option, margin(new LinearLayout.LayoutParams(sdp(146), sdp(48)), 0, 0, sdp(12), 0));
         option.setOnClickListener(view -> {
             sortKey = key;
             isSortOpen = false;
@@ -613,11 +772,13 @@ public final class MainActivity extends Activity {
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(22), dp(20), dp(22), dp(22));
+        panel.setPadding(dp(18), dp(18), dp(18), dp(18));
+        panel.setClipChildren(false);
+        panel.setClipToPadding(false);
         panel.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), dp(12)));
         panel.setElevation(dp(18));
         panel.setFocusable(true);
-        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(dp(420), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT);
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(dp(340), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT);
         panelParams.setMargins(0, dp(84), dp(44), 0);
         root.addView(panel, panelParams);
         settingsPanel = panel;
@@ -625,7 +786,7 @@ public final class MainActivity extends Activity {
         TextView title = text("设置", 24, Typeface.BOLD, COLOR_TEXT);
         panel.addView(title, margin(matchWidth(), 0, 0, 0, dp(18)));
 
-        TextView version = text("版本 1.5", 14, Typeface.BOLD, COLOR_SUBTLE);
+        TextView version = text("版本 1.6", 14, Typeface.BOLD, COLOR_SUBTLE);
         panel.addView(version, margin(matchWidth(), 0, 0, 0, dp(14)));
 
         panel.addView(text("NAS 服务器", 14, Typeface.BOLD, COLOR_MUTED));
@@ -634,31 +795,23 @@ public final class MainActivity extends Activity {
         server.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         panel.addView(server, margin(matchWidth(), 0, dp(6), 0, dp(16)));
 
-        panel.addView(text("分集详情显示", 14, Typeface.BOLD, COLOR_MUTED));
-        LinearLayout episodeRow = new LinearLayout(this);
-        episodeRow.setOrientation(LinearLayout.VERTICAL);
-        panel.addView(episodeRow, margin(matchWidth(), 0, dp(8), 0, dp(18)));
-        Button detailsOn = button("显示详情", showEpisodeDetails);
-        detailsOn.setId(View.generateViewId());
-        episodeRow.addView(detailsOn, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)));
-        detailsOn.setOnClickListener(view -> updateShowEpisodeDetails(true));
-        Button detailsOff = button("只显示名称", !showEpisodeDetails);
-        detailsOff.setId(View.generateViewId());
-        episodeRow.addView(detailsOff, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)), 0, dp(8), 0, 0));
-        detailsOff.setOnClickListener(view -> updateShowEpisodeDetails(false));
-
-        panel.addView(text("4K直出硬解", 14, Typeface.BOLD, COLOR_MUTED), margin(matchWidth(), 0, 0, 0, dp(8)));
-        LinearLayout directRow = new LinearLayout(this);
-        directRow.setOrientation(LinearLayout.VERTICAL);
-        panel.addView(directRow, margin(matchWidth(), 0, 0, 0, dp(18)));
-        Button directOn = button("开启", direct4KPlayback);
-        directOn.setId(View.generateViewId());
-        directRow.addView(directOn, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)));
-        directOn.setOnClickListener(view -> updateDirect4KPlayback(true));
-        Button directOff = button("关闭", !direct4KPlayback);
-        directOff.setId(View.generateViewId());
-        directRow.addView(directOff, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)), 0, dp(8), 0, 0));
-        directOff.setOnClickListener(view -> updateDirect4KPlayback(false));
+        panel.addView(text("4K DV/HDR播放模式", 14, Typeface.BOLD, COLOR_MUTED), margin(matchWidth(), 0, 0, 0, dp(8)));
+        LinearLayout playbackModeRow = new LinearLayout(this);
+        playbackModeRow.setOrientation(LinearLayout.VERTICAL);
+        playbackModeRow.setClipChildren(false);
+        playbackModeRow.setClipToPadding(false);
+        panel.addView(playbackModeRow, margin(matchWidth(), 0, 0, 0, dp(8)));
+        Button compatibleSubtitle = settingsOptionButton("兼容字幕播放", !highPerformanceDirectPlayback);
+        compatibleSubtitle.setId(View.generateViewId());
+        playbackModeRow.addView(compatibleSubtitle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)));
+        compatibleSubtitle.setOnClickListener(view -> update4kDvHdrPlaybackMode(false));
+        Button highPerformanceDirect = settingsOptionButton("高性能直出", highPerformanceDirectPlayback);
+        highPerformanceDirect.setId(View.generateViewId());
+        playbackModeRow.addView(highPerformanceDirect, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)), 0, dp(8), 0, 0));
+        highPerformanceDirect.setOnClickListener(view -> update4kDvHdrPlaybackMode(true));
+        TextView playbackModeHint = text("兼容字幕播放模式字幕兼容性更好，但是资源要求更高，如果卡顿请切换至高性能直出模式。高性能直出模式资源要求低，但是可能无法直接烧录字幕，需要docker端开启字幕预缓存将字幕格式提前转为WebVTT格式并保存。", 12, Typeface.NORMAL, COLOR_SUBTLE);
+        playbackModeHint.setLineSpacing(dp(2), 1f);
+        panel.addView(playbackModeHint, margin(matchWidth(), 0, 0, 0, dp(18)));
 
         Button update = compactButton("软件更新");
         update.setId(View.generateViewId());
@@ -673,52 +826,38 @@ public final class MainActivity extends Activity {
         disconnect.setTextColor(COLOR_DANGER);
         disconnect.setOnClickListener(view -> disconnectFromServer());
 
-        trapSettingsFocus(detailsOn, detailsOff, directOn, directOff, update, disconnect);
+        trapSettingsFocus(compatibleSubtitle, highPerformanceDirect, update, disconnect);
         panel.bringToFront();
-        settingsInitialFocus = detailsOn;
-        detailsOn.requestFocus();
+        settingsInitialFocus = compatibleSubtitle;
+        compatibleSubtitle.requestFocus();
     }
 
-    private void updateShowEpisodeDetails(boolean value) {
-        showEpisodeDetails = value;
-        uiPreferences.edit().putBoolean(KEY_SHOW_EPISODE_DETAILS, value).apply();
+    private void update4kDvHdrPlaybackMode(boolean highPerformanceDirect) {
+        highPerformanceDirectPlayback = highPerformanceDirect;
+        uiPreferences.edit()
+                .putString(
+                        KEY_4K_DV_HDR_PLAYBACK_MODE,
+                        highPerformanceDirect ? PLAYBACK_MODE_HIGH_PERFORMANCE_DIRECT : PLAYBACK_MODE_COMPATIBLE_SUBTITLE)
+                .apply();
         closeSettingsOverlay();
         renderHomeContentKeepingPosition();
         openSettingsOverlay();
     }
 
-    private void updateDirect4KPlayback(boolean value) {
-        direct4KPlayback = value;
-        uiPreferences.edit().putBoolean(KEY_DIRECT_4K_PLAYBACK, value).apply();
-        closeSettingsOverlay();
-        renderHomeContentKeepingPosition();
-        openSettingsOverlay();
-    }
+    private void trapSettingsFocus(Button compatibleSubtitle, Button highPerformanceDirect, Button update, Button disconnect) {
+        compatibleSubtitle.setNextFocusLeftId(compatibleSubtitle.getId());
+        compatibleSubtitle.setNextFocusRightId(compatibleSubtitle.getId());
+        compatibleSubtitle.setNextFocusUpId(compatibleSubtitle.getId());
+        compatibleSubtitle.setNextFocusDownId(highPerformanceDirect.getId());
 
-    private void trapSettingsFocus(Button detailsOn, Button detailsOff, Button directOn, Button directOff, Button update, Button disconnect) {
-        detailsOn.setNextFocusLeftId(detailsOn.getId());
-        detailsOn.setNextFocusRightId(detailsOn.getId());
-        detailsOn.setNextFocusUpId(detailsOn.getId());
-        detailsOn.setNextFocusDownId(detailsOff.getId());
-
-        detailsOff.setNextFocusLeftId(detailsOff.getId());
-        detailsOff.setNextFocusRightId(detailsOff.getId());
-        detailsOff.setNextFocusUpId(detailsOn.getId());
-        detailsOff.setNextFocusDownId(directOn.getId());
-
-        directOn.setNextFocusLeftId(directOn.getId());
-        directOn.setNextFocusRightId(directOn.getId());
-        directOn.setNextFocusUpId(detailsOff.getId());
-        directOn.setNextFocusDownId(directOff.getId());
-
-        directOff.setNextFocusLeftId(directOff.getId());
-        directOff.setNextFocusRightId(directOff.getId());
-        directOff.setNextFocusUpId(directOn.getId());
-        directOff.setNextFocusDownId(update.getId());
+        highPerformanceDirect.setNextFocusLeftId(highPerformanceDirect.getId());
+        highPerformanceDirect.setNextFocusRightId(highPerformanceDirect.getId());
+        highPerformanceDirect.setNextFocusUpId(compatibleSubtitle.getId());
+        highPerformanceDirect.setNextFocusDownId(update.getId());
 
         update.setNextFocusLeftId(update.getId());
         update.setNextFocusRightId(update.getId());
-        update.setNextFocusUpId(directOff.getId());
+        update.setNextFocusUpId(highPerformanceDirect.getId());
         update.setNextFocusDownId(disconnect.getId());
 
         disconnect.setNextFocusLeftId(disconnect.getId());
@@ -897,70 +1036,77 @@ public final class MainActivity extends Activity {
     }
 
     private View posterCard(Models.LibraryItem item, boolean showProgress) {
+        int cardWidth = homePosterCardWidthPx();
+        int cardInnerWidth = Math.max(dp(1), cardWidth - sdp(16));
+        int posterHeight = Math.round(cardInnerWidth * 1.5f);
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setFocusable(true);
         card.setClickable(true);
-        card.setPadding(dp(8), dp(8), dp(8), dp(10));
-        card.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, dp(8)));
+        card.setPadding(sdp(8), sdp(8), sdp(8), sdp(10));
+        card.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, sdp(8)));
         GridLayout.LayoutParams params = new GridLayout.LayoutParams();
-        params.width = dp(204);
+        params.width = cardWidth;
         params.height = ViewGroup.LayoutParams.WRAP_CONTENT;
-        params.setMargins(dp(6), dp(6), dp(10), dp(22));
+        params.setMargins(sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(7), sdp(HOME_POSTER_CARD_MARGIN_DP), sdp(26));
         card.setLayoutParams(params);
-        applyCardFocus(card);
+        applyCardFocus(card, () -> scheduleDetailPrefetch(item.id, card));
 
         FrameLayout posterFrame = new FrameLayout(this);
         posterFrame.setPadding(dp(1), dp(1), dp(1), dp(1));
         posterFrame.setClipToOutline(true);
-        posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), dp(10)));
-        card.addView(posterFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(282)));
+        posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), sdp(12)));
+        card.addView(posterFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, posterHeight));
 
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
         poster.setClipToOutline(true);
         posterFrame.addView(poster, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        loadPoster(poster, item.posterAssetId);
+        loadPoster(poster, item.posterAssetId, cardInnerWidth, posterHeight);
 
         LinearLayout badges = new LinearLayout(this);
         badges.setGravity(Gravity.CENTER_VERTICAL);
         badges.setOrientation(LinearLayout.HORIZONTAL);
         FrameLayout.LayoutParams badgeParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.LEFT | Gravity.BOTTOM);
-        badgeParams.setMargins(dp(10), 0, dp(10), dp(10));
+        badgeParams.setMargins(sdp(10), 0, sdp(10), sdp(10));
         posterFrame.addView(badges, badgeParams);
 
         String rating = ratingText(item.voteAverage);
         if (rating != null) {
-            badges.addView(badge(rating));
+            badges.addView(badge(rating, Color.rgb(217, 119, 6)));
+        }
+        String doubanRating = ratingText(item.doubanRating);
+        if (doubanRating != null) {
+            badges.addView(badge(doubanRating, Color.rgb(0, 166, 41)), margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(30)), sdp(5), 0, 0, 0));
         }
 
         if (showProgress) {
             int progress = item.progressPercent();
             if (progress > 0 && progress < 95) {
-                card.addView(progressBar(progress, dp(188), dp(5)), margin(new LinearLayout.LayoutParams(dp(188), dp(5)), 0, dp(8), 0, 0));
+                card.addView(progressBar(progress, cardInnerWidth, sdp(5)), margin(new LinearLayout.LayoutParams(cardInnerWidth, sdp(5)), 0, sdp(9), 0, 0));
             }
         }
 
-        TextView name = text(item.title, 16, Typeface.BOLD, COLOR_TEXT);
+        TextView name = text(item.title, ssp(16), Typeface.BOLD, COLOR_TEXT);
         name.setMaxLines(2);
         name.setEllipsize(TextUtils.TruncateAt.END);
-        card.addView(name, margin(matchWidth(), 0, dp(10), 0, 0));
+        card.addView(name, margin(matchWidth(), 0, sdp(11), 0, 0));
 
         LinearLayout yearRow = new LinearLayout(this);
         yearRow.setGravity(Gravity.CENTER_VERTICAL);
-        card.addView(yearRow, margin(matchWidth(), 0, dp(2), 0, 0));
+        card.addView(yearRow, margin(matchWidth(), 0, sdp(2), 0, 0));
         String year = releaseYearText(item.releaseDate);
-        yearRow.addView(text(year == null ? "" : year, 13, Typeface.NORMAL, COLOR_SUBTLE), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        TextView watched = text(item.isWatched ? "✓" : "○", 17, Typeface.BOLD, item.isWatched ? COLOR_FOCUS : COLOR_SUBTLE);
+        yearRow.addView(text(year == null ? "" : year, ssp(13), Typeface.NORMAL, COLOR_SUBTLE), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView watched = text(item.isWatched ? "✓" : "○", ssp(17), Typeface.BOLD, item.isWatched ? COLOR_FOCUS : COLOR_SUBTLE);
         watched.setGravity(Gravity.CENTER);
         watched.setPadding(0, 0, 0, 0);
-        watched.setMinHeight(dp(28));
+        watched.setMinHeight(sdp(28));
         watched.setFocusable(true);
         watched.setClickable(true);
         watched.setBackgroundColor(Color.TRANSPARENT);
         watched.setOnClickListener(view -> toggleLibraryItemWatched(item));
         applyWatchedIconFocus(watched, item.isWatched);
-        yearRow.addView(watched, new LinearLayout.LayoutParams(dp(30), dp(28)));
+        yearRow.addView(watched, new LinearLayout.LayoutParams(sdp(30), sdp(28)));
 
         card.setOnClickListener(view -> showDetail(item.id));
         return card;
@@ -973,11 +1119,76 @@ public final class MainActivity extends Activity {
 
     private void loadDetail(String itemId) {
         screen = Screen.DETAIL;
-        showLoading("正在加载详情");
+        requestedDetailItemId = itemId;
+        Models.LibraryDetail cached = detailCache.get(itemId);
+        if (cached != null) {
+            renderDetail(cached);
+            refreshDetail(itemId, false);
+            return;
+        }
+
+        showLoading("正在进入详情");
+        refreshDetail(itemId, true);
+    }
+
+    private void refreshDetail(String itemId, boolean showErrors) {
         runAsync(
                 () -> api.getLibraryItemDetail(itemId),
-                this::renderDetail,
-                error -> renderError(error.getMessage(), this::showHome));
+                detail -> {
+                    detailCache.put(itemId, detail);
+                    refreshPlaybackSettingsForDetail(detail);
+                    if (screen == Screen.DETAIL && itemId.equals(requestedDetailItemId)) {
+                        renderDetail(detail);
+                    }
+                },
+                error -> {
+                    if (showErrors) {
+                        renderError(error.getMessage(), this::showHome);
+                    }
+                });
+    }
+
+    private void refreshPlaybackSettingsForDetail(Models.LibraryDetail detail) {
+        runAsync(
+                () -> api.getSettings(),
+                settings -> {
+                    boolean nextShowEpisodeDetails = settings == null || settings.playback == null || settings.playback.showEpisodeDetails;
+                    if (showEpisodeDetails != nextShowEpisodeDetails) {
+                        showEpisodeDetails = nextShowEpisodeDetails;
+                        if (screen == Screen.DETAIL && currentDetail != null && currentDetail.id.equals(detail.id)) {
+                            renderDetail(currentDetail);
+                        }
+                    }
+                },
+                error -> {
+                });
+    }
+
+    private void scheduleDetailPrefetch(String itemId, View focusedView) {
+        if (itemId == null || itemId.isEmpty() || detailCache.containsKey(itemId)) {
+            return;
+        }
+        main.postDelayed(() -> {
+            if (focusedView.hasFocus()) {
+                prefetchDetail(itemId);
+            }
+        }, 220);
+    }
+
+    private void prefetchDetail(String itemId) {
+        if (itemId == null || itemId.isEmpty() || detailCache.containsKey(itemId) || pendingDetailPrefetches.size() >= 2) {
+            return;
+        }
+        if (!pendingDetailPrefetches.add(itemId)) {
+            return;
+        }
+        runAsync(
+                () -> api.getLibraryItemDetail(itemId),
+                detail -> {
+                    pendingDetailPrefetches.remove(itemId);
+                    detailCache.put(itemId, detail);
+                },
+                error -> pendingDetailPrefetches.remove(itemId));
     }
 
     private void renderDetail(Models.LibraryDetail detail) {
@@ -988,82 +1199,133 @@ public final class MainActivity extends Activity {
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(44), dp(28), dp(44), dp(34));
+        page.setPadding(sdp(52), sdp(34), sdp(52), sdp(42));
+        page.setClipChildren(false);
+        page.setClipToPadding(false);
         root.addView(page, match());
 
         ScrollView scroll = new ScrollView(this);
+        scroll.setClipChildren(false);
+        scroll.setClipToPadding(false);
         page.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
+        content.setClipChildren(false);
+        content.setClipToPadding(false);
         scroll.addView(content, matchWidth());
 
         LinearLayout hero = new LinearLayout(this);
         hero.setGravity(Gravity.TOP);
-        content.addView(hero, margin(matchWidth(), 0, 0, 0, dp(34)));
+        hero.setClipChildren(false);
+        hero.setClipToPadding(false);
+        content.addView(hero, margin(matchWidth(), 0, 0, 0, sdp(40)));
 
         FrameLayout posterFrame = new FrameLayout(this);
         posterFrame.setPadding(0, 0, 0, 0);
         posterFrame.setClipToOutline(true);
-        posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), dp(10)));
-        hero.addView(posterFrame, new LinearLayout.LayoutParams(dp(230), dp(342)));
+        posterFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), sdp(12)));
+        int detailPosterWidth = sdp(DETAIL_POSTER_WIDTH_DP);
+        int detailPosterHeight = sdp(DETAIL_POSTER_HEIGHT_DP);
+        hero.addView(posterFrame, new LinearLayout.LayoutParams(detailPosterWidth, detailPosterHeight));
 
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
         poster.setClipToOutline(true);
         posterFrame.addView(poster, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        loadPoster(poster, detail.posterAssetId);
+        loadPoster(poster, detail.posterAssetId, detailPosterWidth, detailPosterHeight);
 
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);
-        hero.addView(info, margin(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f), dp(28), 0, 0, 0));
-        info.addView(text(detail.title, 34, Typeface.BOLD, COLOR_TEXT));
+        info.setClipChildren(false);
+        info.setClipToPadding(false);
+        hero.addView(info, margin(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f), sdp(34), 0, 0, 0));
+        info.addView(text(detail.title, ssp(34), Typeface.BOLD, COLOR_TEXT));
 
         LinearLayout facts = new LinearLayout(this);
         facts.setGravity(Gravity.CENTER_VERTICAL);
-        info.addView(facts, margin(matchWidth(), 0, dp(8), 0, dp(16)));
+        info.addView(facts, margin(matchWidth(), 0, sdp(10), 0, sdp(18)));
         String year = releaseYearText(detail.releaseDate);
         if (year != null) {
             facts.addView(metaPill(year));
         }
         String rating = ratingText(detail.voteAverage);
         if (rating != null) {
-            facts.addView(metaPill("评分 " + rating), margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)), dp(8), 0, 0, 0));
+            facts.addView(metaPill("★ " + rating, Color.rgb(217, 119, 6)), margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(34)), sdp(9), 0, 0, 0));
+        }
+        String doubanRating = ratingText(detail.doubanRating);
+        if (doubanRating != null) {
+            facts.addView(metaPill("★ " + doubanRating, Color.rgb(0, 166, 41)), margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(34)), sdp(9), 0, 0, 0));
+        }
+        for (String part : doubanMetadataParts(detail.douban)) {
+            facts.addView(metaPill(part), margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(34)), sdp(9), 0, 0, 0));
         }
 
-        if (detail.overview != null && !detail.overview.isEmpty()) {
-            TextView overview = text(detail.overview, 17, Typeface.NORMAL, COLOR_TEXT);
-            overview.setLineSpacing(dp(3), 1f);
+        String overviewText = detailOverviewText(detail);
+        if (!overviewText.isEmpty()) {
+            TextView overview = text(overviewText, ssp(17), Typeface.NORMAL, COLOR_TEXT);
+            overview.setLineSpacing(sdp(3), 1f);
             overview.setMaxLines(7);
             overview.setEllipsize(TextUtils.TruncateAt.END);
-            info.addView(overview, margin(matchWidth(), 0, 0, 0, dp(22)));
+            info.addView(overview, margin(matchWidth(), 0, 0, 0, sdp(26)));
         }
 
         Models.VideoFile mainFile = resolveMainFile(detail);
+        Button playButton = null;
         if (mainFile != null) {
             LinearLayout actions = new LinearLayout(this);
             actions.setGravity(Gravity.CENTER_VERTICAL);
-            info.addView(actions, margin(matchWidth(), 0, 0, 0, dp(8)));
+            actions.setClipChildren(false);
+            actions.setClipToPadding(false);
+            info.addView(actions, margin(matchWidth(), 0, 0, 0, sdp(10)));
+
+            LinearLayout playColumn = new LinearLayout(this);
+            playColumn.setOrientation(LinearLayout.VERTICAL);
+            playColumn.setGravity(Gravity.CENTER_HORIZONTAL);
+            playColumn.setClipChildren(false);
+            playColumn.setClipToPadding(false);
+            actions.addView(playColumn, new LinearLayout.LayoutParams(sdp(236), ViewGroup.LayoutParams.WRAP_CONTENT));
 
             Button play = button(playButtonText(mainFile));
-            actions.addView(play, new LinearLayout.LayoutParams(dp(220), dp(54)));
-            play.setOnClickListener(view -> playFile(mainFile));
+            playButton = play;
+            play.setTag(mainFile);
+            playColumn.addView(play, new LinearLayout.LayoutParams(sdp(236), sdp(58)));
+            play.setOnClickListener(view -> {
+                Object file = view.getTag();
+                if (file instanceof Models.VideoFile) {
+                    playFile((Models.VideoFile) file);
+                }
+            });
             play.requestFocus();
 
+            TextView subtitleStatus = subtitleCacheStatusView(mainFile);
+            if (subtitleStatus != null) {
+                subtitleStatus.setGravity(Gravity.CENTER);
+                playColumn.addView(subtitleStatus, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, sdp(34)), 0, sdp(10), 0, 0));
+            }
+
             Button watchStatus = button(watchedStatusLabel(mainFile), isEffectivelyWatched(mainFile));
-            actions.addView(watchStatus, margin(new LinearLayout.LayoutParams(dp(104), dp(44)), dp(14), 0, 0, 0));
+            actions.addView(watchStatus, margin(new LinearLayout.LayoutParams(sdp(116), sdp(48)), sdp(16), 0, 0, 0));
             watchStatus.setOnClickListener(view -> toggleVideoWatched(mainFile));
 
+            LinearLayout timelineColumn = new LinearLayout(this);
+            timelineColumn.setOrientation(LinearLayout.VERTICAL);
+            timelineColumn.setClipChildren(false);
+            timelineColumn.setClipToPadding(false);
+            actions.addView(timelineColumn, margin(new LinearLayout.LayoutParams(sdp(438), ViewGroup.LayoutParams.WRAP_CONTENT), sdp(18), 0, 0, 0));
+
             LinearLayout timeline = timeline(detail, mainFile);
-            actions.addView(timeline, margin(new LinearLayout.LayoutParams(dp(430), dp(44)), dp(14), 0, 0, 0));
+            timelineColumn.addView(timeline, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(48)));
+
+            refreshSubtitleCacheStatus(detail, mainFile);
         }
 
         if ("tv".equals(detail.itemKind) && !detail.seasons.isEmpty()) {
-            renderEpisodes(content, detail, mainFile);
+            renderEpisodes(content, detail, mainFile, playButton);
         }
     }
 
-    private void renderEpisodes(LinearLayout content, Models.LibraryDetail detail, Models.VideoFile mainFile) {
+    private void renderEpisodes(LinearLayout content, Models.LibraryDetail detail, Models.VideoFile mainFile, Button playButton) {
         if (!hasSelectedSeason(detail)) {
             selectedSeasonId = defaultSeasonId(detail, mainFile);
         }
@@ -1075,11 +1337,13 @@ public final class MainActivity extends Activity {
 
         LinearLayout seasonHeader = new LinearLayout(this);
         seasonHeader.setGravity(Gravity.CENTER_VERTICAL);
-        content.addView(seasonHeader, margin(matchWidth(), 0, dp(18), 0, dp(18)));
+        seasonHeader.setClipChildren(false);
+        seasonHeader.setClipToPadding(false);
+        content.addView(seasonHeader, margin(matchWidth(), 0, sdp(20), 0, sdp(20)));
 
         for (Models.Season season : detail.seasons) {
             Button seasonButton = button(seasonDisplayLabel(season), season.id.equals(selectedSeason.id));
-            seasonHeader.addView(seasonButton, margin(new LinearLayout.LayoutParams(dp(120), dp(44)), 0, 0, dp(10), 0));
+            seasonHeader.addView(seasonButton, margin(new LinearLayout.LayoutParams(sdp(132), sdp(48)), 0, 0, sdp(12), 0));
             seasonButton.setOnClickListener(view -> {
                 selectedSeasonId = season.id;
                 renderDetail(detail);
@@ -1087,73 +1351,81 @@ public final class MainActivity extends Activity {
         }
 
         GridLayout episodeGrid = new GridLayout(this);
-        episodeGrid.setColumnCount(4);
+        episodeGrid.setColumnCount(detailEpisodeColumnCount());
+        episodeGrid.setClipChildren(false);
+        episodeGrid.setClipToPadding(false);
         content.addView(episodeGrid);
 
         for (Models.Episode episode : selectedSeason.episodes) {
-            episodeGrid.addView(episodeCard(episode, detail.posterAssetId));
+            episodeGrid.addView(episodeCard(episode, detail.posterAssetId, playButton));
         }
     }
 
-    private View episodeCard(Models.Episode episode, String posterAssetId) {
+    private View episodeCard(Models.Episode episode, String posterAssetId, Button playButton) {
         LinearLayout card = new LinearLayout(this);
         boolean showDetails = showEpisodeDetails;
+        Models.VideoFile playbackFile = episodePlaybackFile(episode);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setFocusable(episode.videoFile != null);
-        card.setClickable(episode.videoFile != null);
-        card.setPadding(0, 0, dp(8), dp(10));
-        card.setBackground(rounded(showDetails ? COLOR_SURFACE : Color.TRANSPARENT, showDetails ? COLOR_BORDER : Color.TRANSPARENT, showDetails ? dp(1) : 0, dp(8)));
+        card.setFocusable(playbackFile != null);
+        card.setClickable(playbackFile != null);
+        card.setClipChildren(false);
+        card.setClipToPadding(false);
+        card.setPadding(0, 0, 0, dp(10));
+        card.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, dp(8)));
         GridLayout.LayoutParams params = new GridLayout.LayoutParams();
-        params.width = dp(286);
+        int episodeCardWidth = sdp(EPISODE_CARD_WIDTH_DP);
+        int episodeStillHeight = sdp(EPISODE_STILL_HEIGHT_DP);
+        params.width = episodeCardWidth;
         params.height = ViewGroup.LayoutParams.WRAP_CONTENT;
-        params.setMargins(0, dp(6), dp(18), dp(20));
+        params.setMargins(0, sdp(8), sdp(22), sdp(24));
         card.setLayoutParams(params);
-        applyCardFocus(card);
 
         FrameLayout stillFrame = new FrameLayout(this);
         stillFrame.setPadding(0, 0, 0, 0);
         stillFrame.setClipToOutline(true);
-        stillFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), dp(10)));
-        card.addView(stillFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(152)));
+        stillFrame.setBackground(rounded(COLOR_SURFACE_ALT, COLOR_BORDER, dp(1), sdp(12)));
+        card.addView(stillFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, episodeStillHeight));
+        applyEpisodeStillFocus(card, stillFrame, showDetails, playButton, playbackFile);
 
         ImageView still = new ImageView(this);
         still.setScaleType(ImageView.ScaleType.CENTER_CROP);
         still.setClipToOutline(true);
         stillFrame.addView(still, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         if (episode.stillAssetId != null) {
-            imageLoader.load(still, api.thumbnailUrl(episode.stillAssetId), api.cookieHeader());
+            imageLoader.load(still, api.thumbnailUrl(episode.stillAssetId), api.cookieHeader(), episodeCardWidth, episodeStillHeight);
         } else {
-            loadPoster(still, posterAssetId);
+            loadPoster(still, posterAssetId, episodeCardWidth, episodeStillHeight);
         }
 
-        TextView title = text(episodeTitleDisplay(episode, showDetails), 15, Typeface.BOLD, COLOR_TEXT);
+        TextView title = text(episodeTitleDisplay(episode, showDetails), ssp(15), Typeface.BOLD, COLOR_TEXT);
         title.setMaxLines(2);
         title.setEllipsize(TextUtils.TruncateAt.END);
-        if (!showDetails) {
-            title.setGravity(Gravity.CENTER);
-        }
-        card.addView(title, margin(matchWidth(), 0, dp(10), 0, 0));
+        title.setGravity(Gravity.CENTER);
+        card.addView(title, margin(matchWidth(), 0, sdp(12), 0, 0));
 
         String facts = episodeFacts(episode);
         if (showDetails && !facts.isEmpty()) {
-            TextView factView = text(facts, 13, Typeface.NORMAL, COLOR_SUBTLE);
+            TextView factView = text(facts, ssp(13), Typeface.NORMAL, COLOR_SUBTLE);
             factView.setSingleLine(true);
             factView.setEllipsize(TextUtils.TruncateAt.END);
-            card.addView(factView, margin(matchWidth(), 0, dp(4), 0, 0));
+            factView.setGravity(Gravity.CENTER);
+            card.addView(factView, margin(matchWidth(), 0, sdp(4), 0, 0));
         }
         if (showDetails && episode.overview != null && !episode.overview.isEmpty()) {
-            TextView overview = text(episode.overview, 13, Typeface.NORMAL, COLOR_SUBTLE);
+            TextView overview = text(episode.overview, ssp(13), Typeface.NORMAL, COLOR_SUBTLE);
             overview.setMaxLines(2);
             overview.setEllipsize(TextUtils.TruncateAt.END);
-            card.addView(overview, margin(matchWidth(), 0, dp(6), 0, 0));
+            overview.setGravity(Gravity.CENTER);
+            card.addView(overview, margin(matchWidth(), 0, sdp(7), 0, 0));
         }
 
-        if (episode.videoFile != null) {
-            int progress = fileProgressPercent(episode.videoFile);
+        if (playbackFile != null) {
+            int progress = fileProgressPercent(playbackFile);
             if (showDetails && progress > 0 && progress < 95) {
-                card.addView(progressBar(progress, dp(258), dp(4)), margin(new LinearLayout.LayoutParams(dp(258), dp(4)), 0, dp(10), 0, 0));
+                int progressWidth = Math.max(dp(1), episodeCardWidth - sdp(28));
+                card.addView(progressBar(progress, progressWidth, sdp(4)), margin(new LinearLayout.LayoutParams(progressWidth, sdp(4)), 0, sdp(12), 0, 0));
             }
-            card.setOnClickListener(view -> playFile(episode.videoFile.withEpisodeLabel(episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber))));
+            card.setOnClickListener(view -> playFile(playbackFile));
         }
 
         return card;
@@ -1178,7 +1450,20 @@ public final class MainActivity extends Activity {
                         handlePlayerKeyDown(keyCode, event));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        activeDirectPlayback = direct4KPlayback && isLikely4K(file);
+        activeDirectPlayback = shouldUseDirectPlayback(file);
+        selectedAudioTrackOrdinal = -1;
+        selectedEmbeddedSubtitleOrdinal = -1;
+        selectedRuntimeAudioId = null;
+        selectedRuntimeSubtitleId = null;
+        selectedExternalSubtitleId = null;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+        activeRuntimeAudioTracks = Collections.emptyList();
+        activeRuntimeSubtitleTracks = Collections.emptyList();
+        subtitleLoadStartedAtMs = 0;
+        lastKnownPlaybackPositionSeconds = 0;
+        lastKnownPlaybackDurationSeconds = 0;
         playerView = new MpvVideoView(this, activeDirectPlayback);
         root.addView(playerView, match());
         playerView.setOnKeyListener((view, keyCode, event) ->
@@ -1190,43 +1475,50 @@ public final class MainActivity extends Activity {
 
         LinearLayout overlay = new LinearLayout(this);
         overlay.setOrientation(LinearLayout.VERTICAL);
-        overlay.setPadding(dp(36), dp(28), dp(36), dp(28));
+        overlay.setPadding(sdp(42), sdp(32), sdp(42), sdp(32));
         overlay.setBackgroundColor(Color.argb(128, 0, 0, 0));
-        overlay.addView(text(file.label(), 22, Typeface.BOLD, COLOR_PLAYER_TEXT));
+        overlay.addView(text(file.label(), ssp(22), Typeface.BOLD, COLOR_PLAYER_TEXT));
         String summary = file.mediaSummary();
         if (!summary.isEmpty()) {
-            overlay.addView(text(summary, 14, Typeface.NORMAL, COLOR_PLAYER_MUTED));
+            overlay.addView(text(summary, ssp(14), Typeface.NORMAL, COLOR_PLAYER_MUTED));
         }
-        TextView status = text(activeDirectPlayback ? "正在准备4K直出硬解播放" : "正在准备安卓端硬解播放", 14, Typeface.BOLD, COLOR_PLAYER_MUTED);
+        TextView status = text(initialPlaybackStatus(file), ssp(14), Typeface.BOLD, COLOR_PLAYER_MUTED);
         playerStatusText = status;
-        overlay.addView(status, margin(matchWidth(), 0, dp(8), 0, 0));
+        overlay.addView(status, margin(matchWidth(), 0, sdp(8), 0, 0));
         FrameLayout.LayoutParams overlayParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP);
         root.addView(overlay, overlayParams);
-        overlay.setElevation(dp(24));
-        overlay.setTranslationZ(dp(24));
+        overlay.setElevation(sdp(24));
+        overlay.setTranslationZ(sdp(24));
         overlay.bringToFront();
         playerTopOverlay = overlay;
 
-        TextView subtitles = text("", 28, Typeface.BOLD, Color.WHITE);
+        TextView subtitles = text("", ssp(28), Typeface.BOLD, Color.WHITE);
         subtitles.setGravity(Gravity.CENTER);
-        subtitles.setShadowLayer(dp(3), 0, dp(1), Color.BLACK);
+        subtitles.setShadowLayer(sdp(3), 0, sdp(1), Color.BLACK);
         subtitles.setMaxLines(3);
         subtitles.setIncludeFontPadding(true);
         subtitles.setVisibility(View.GONE);
         FrameLayout.LayoutParams subtitleParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        subtitleParams.setMargins(dp(96), 0, dp(96), dp(132));
+        subtitleParams.setMargins(sdp(120), 0, sdp(120), sdp(154));
         root.addView(subtitles, subtitleParams);
-        subtitles.setElevation(dp(30));
-        subtitles.setTranslationZ(dp(30));
+        subtitles.setElevation(sdp(30));
+        subtitles.setTranslationZ(sdp(30));
         subtitles.bringToFront();
         playerSubtitleOverlay = subtitles;
 
+        PgsSubtitleView pgsSubtitles = new PgsSubtitleView(this);
+        root.addView(pgsSubtitles, match());
+        pgsSubtitles.setElevation(sdp(30));
+        pgsSubtitles.setTranslationZ(sdp(30));
+        pgsSubtitles.bringToFront();
+        playerPgsSubtitleOverlay = pgsSubtitles;
+
         LinearLayout controls = playerControls(file);
-        FrameLayout.LayoutParams controlParams = new FrameLayout.LayoutParams(dp(920), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        controlParams.setMargins(0, 0, 0, dp(28));
+        FrameLayout.LayoutParams controlParams = new FrameLayout.LayoutParams(sdp(1020), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        controlParams.setMargins(0, 0, 0, sdp(34));
         root.addView(controls, controlParams);
-        controls.setElevation(dp(28));
-        controls.setTranslationZ(dp(28));
+        controls.setElevation(sdp(28));
+        controls.setTranslationZ(sdp(28));
         controls.bringToFront();
         playerControlsPanel = controls;
 
@@ -1235,7 +1527,7 @@ public final class MainActivity extends Activity {
         activePlaybackIndex = Math.max(0, Math.min(queueIndex, activePlaybackQueue.size() - 1));
         advancingPlaybackPart = false;
         runAsync(
-                () -> resolvePlayback(file.id),
+                () -> resolvePlayback(file),
                 playback -> startResolvedPlayback(file, playback, status),
                 error -> renderPlayerError(error.getMessage()));
         if (playerPlayPauseButton != null) {
@@ -1243,7 +1535,8 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private ResolvedPlayback resolvePlayback(String videoFileId) throws Exception {
+    private ResolvedPlayback resolvePlayback(Models.VideoFile file) throws Exception {
+        String videoFileId = file.id;
         Models.AppSettings settings;
         try {
             settings = api.getSettings();
@@ -1251,10 +1544,14 @@ public final class MainActivity extends Activity {
             settings = Models.AppSettings.defaults();
         }
 
+        Models.PlaybackFileStreams streams = resolvePlaybackStreams(videoFileId);
+
         try {
             String ticket = api.createPlaybackTicket(videoFileId);
             if (ticket != null && !ticket.isEmpty()) {
-                return new ResolvedPlayback(api.streamUrl(videoFileId, ticket), ticket, "", settings);
+                String streamUrl = api.streamUrl(videoFileId, ticket);
+                String playbackUrl = isIsoFile(file) ? resolveIsoPlaybackUrl(streamUrl, "") : streamUrl;
+                return new ResolvedPlayback(playbackUrl, ticket, "", settings, streams, "", "", isIsoFile(file) && playbackUrl.equals(streamUrl));
             }
         } catch (IOException error) {
             if (error.getMessage() == null || !error.getMessage().contains("404")) {
@@ -1262,7 +1559,30 @@ public final class MainActivity extends Activity {
             }
         }
 
-        return new ResolvedPlayback(api.streamUrl(videoFileId), "", api.cookieHeader(), settings);
+        String streamUrl = api.streamUrl(videoFileId);
+        String cookieHeader = api.cookieHeader();
+        String playbackUrl = isIsoFile(file) ? resolveIsoPlaybackUrl(streamUrl, cookieHeader) : streamUrl;
+        String playbackCookieHeader = playbackUrl.equals(streamUrl) ? cookieHeader : "";
+        return new ResolvedPlayback(playbackUrl, "", playbackCookieHeader, settings, streams, "", "", isIsoFile(file) && playbackUrl.equals(streamUrl));
+    }
+
+    private String resolveIsoPlaybackUrl(String streamUrl, String cookieHeader) {
+        try {
+            String proxyUrl = RemoteIsoStreamServer.shared().prepare(streamUrl, cookieHeader);
+            if (proxyUrl != null && !proxyUrl.isEmpty()) {
+                return proxyUrl;
+            }
+        } catch (Exception ignored) {
+        }
+        return streamUrl;
+    }
+
+    private Models.PlaybackFileStreams resolvePlaybackStreams(String videoFileId) {
+        try {
+            return api.getPlaybackStreams(videoFileId);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private void startResolvedPlayback(Models.VideoFile file, ResolvedPlayback playback, TextView status) {
@@ -1275,8 +1595,16 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        Models.VideoFile playbackFile = fileWithResolvedStreams(file, playback.streams);
+        activePlaybackFile = playbackFile;
+        replaceActivePlaybackQueueFile(playbackFile);
+        boolean resolvedDirectPlayback = shouldUseDirectPlayback(playbackFile);
+        if (resolvedDirectPlayback != activeDirectPlayback) {
+            replacePlayerViewForPlaybackMode(resolvedDirectPlayback);
+        }
         status.setText("正在开始播放");
         activePlaybackTicket = playback.ticket;
+        activeHlsSessionId = playback.hlsSessionId;
         playerLoadStartedAtMs = System.currentTimeMillis();
         final boolean[] playbackErrorShown = {false};
         playerView.setPlaybackListener(new MpvVideoView.PlaybackListener() {
@@ -1284,46 +1612,104 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onLoaded() {
-                if (didStart || screen != Screen.PLAYER || playerView == null || activePlaybackFile != file) {
+                if (didStart || screen != Screen.PLAYER || playerView == null || activePlaybackFile != playbackFile) {
                     return;
                 }
 
                 didStart = true;
-                scheduleResumeSeek(file);
-                status.setText(activeDirectPlayback ? "4K直出硬解播放" : "安卓端硬解播放");
-                applyDefaultPlaybackTracks(file, playback.settings);
-                startPlayerUiUpdates(file);
-                startProgressUpdates(file);
+                refreshRuntimeTracks();
+                scheduleResumeSeek(playbackFile);
+                status.setText(playbackStatusText(playbackFile, playback));
+                applyDefaultPlaybackTracks(playbackFile, playback.settings);
+                scheduleRuntimeTrackRefresh(playbackFile, playback.settings);
+                scheduleDefaultSubtitleRetries(playbackFile, playback.settings);
+                startPlayerUiUpdates(playbackFile);
+                startProgressUpdates(playbackFile);
                 showPlayerChromeTemporarily();
             }
 
             @Override
             public void onError(String message) {
-                if (screen == Screen.PLAYER && activePlaybackFile == file) {
+                if (screen == Screen.PLAYER && activePlaybackFile == playbackFile) {
                     playbackErrorShown[0] = true;
                     renderPlayerError(message);
                 }
             }
         });
-        boolean accepted = playerView.play(playback.url, playback.cookieHeader, file.positionSeconds);
+        boolean accepted = playerView.play(playback.url, playback.cookieHeader, playbackStartSeconds(playbackFile), playback.isoDevicePlayback);
         if (!accepted && !playbackErrorShown[0]) {
             renderPlayerError(playerView.lastError());
         }
     }
 
+    private void replacePlayerViewForPlaybackMode(boolean directPlaybackMode) {
+        if (playerView == null) {
+            activeDirectPlayback = directPlaybackMode;
+            playerView = new MpvVideoView(this, activeDirectPlayback);
+            root.addView(playerView, 0, match());
+        } else {
+            root.removeView(playerView);
+            playerView.destroyPlayer();
+            activeDirectPlayback = directPlaybackMode;
+            playerView = new MpvVideoView(this, activeDirectPlayback);
+            root.addView(playerView, 0, match());
+        }
+        playerView.setOnKeyListener((view, keyCode, event) ->
+                event.getAction() == KeyEvent.ACTION_DOWN &&
+                        screen == Screen.PLAYER &&
+                        playerView != null &&
+                        handlePlayerKeyDown(keyCode, event));
+    }
+
+    private Models.VideoFile fileWithResolvedStreams(Models.VideoFile file, Models.PlaybackFileStreams streams) {
+        if (streams == null) {
+            return file;
+        }
+
+        boolean hasAudioTracks = !streams.audioTracks.isEmpty();
+        boolean hasSubtitleStreams = !streams.subtitleStreams.isEmpty();
+        if (!hasAudioTracks && !hasSubtitleStreams) {
+            return file;
+        }
+
+        return file.withStreams(
+                hasAudioTracks ? streams.audioTracks : file.audioTracks,
+                hasSubtitleStreams ? streams.subtitleStreams : file.subtitleStreams);
+    }
+
+    private void replaceActivePlaybackQueueFile(Models.VideoFile playbackFile) {
+        if (playbackFile == null || activePlaybackQueue == null || activePlaybackQueue.isEmpty()) {
+            return;
+        }
+
+        ArrayList<Models.VideoFile> queue = new ArrayList<>(activePlaybackQueue);
+        for (int index = 0; index < queue.size(); index++) {
+            Models.VideoFile item = queue.get(index);
+            if (item != null && playbackFile.id.equals(item.id)) {
+                queue.set(index, playbackFile);
+                if (index == activePlaybackIndex) {
+                    activePlaybackIndex = index;
+                }
+                break;
+            }
+        }
+        activePlaybackQueue = queue;
+    }
+
     private void scheduleResumeSeek(Models.VideoFile file) {
-        if (file.positionSeconds <= 5) {
+        double targetSeconds = playbackStartSeconds(file);
+        if (targetSeconds <= 5) {
             return;
         }
 
         main.postDelayed(() -> {
-            if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file) {
-                playerView.seekTo(file.positionSeconds);
+            if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file && playerView.currentTimeSeconds() < Math.max(0, targetSeconds - 3)) {
+                playerView.seekTo(targetSeconds);
             }
         }, 350);
         main.postDelayed(() -> {
-            if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file && playerView.currentTimeSeconds() < Math.max(0, file.positionSeconds - 3)) {
-                playerView.seekTo(file.positionSeconds);
+            if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file && playerView.currentTimeSeconds() < Math.max(0, targetSeconds - 3)) {
+                playerView.seekTo(targetSeconds);
             }
         }, 1600);
     }
@@ -1331,50 +1717,71 @@ public final class MainActivity extends Activity {
     private LinearLayout playerControls(Models.VideoFile file) {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(18), dp(14), dp(18), dp(16));
-        panel.setBackground(rounded(Color.argb(184, 0, 0, 0), Color.argb(90, 255, 255, 255), dp(1), dp(18)));
+        panel.setPadding(sdp(22), sdp(16), sdp(22), sdp(18));
+        panel.setClipChildren(false);
+        panel.setClipToPadding(false);
+        panel.setBackground(rounded(Color.argb(184, 10, 14, 22), Color.argb(96, 255, 255, 255), dp(1), sdp(20)));
 
-        LinearLayout progressRow = new LinearLayout(this);
-        progressRow.setGravity(Gravity.CENTER_VERTICAL);
-        panel.addView(progressRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(34)));
-
-        playerCurrentTime = text("0:00", 13, Typeface.BOLD, COLOR_PLAYER_MUTED);
-        playerCurrentTime.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        progressRow.addView(playerCurrentTime, new LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.MATCH_PARENT));
-
-        playerProgressTrack = new FrameLayout(this);
-        playerProgressTrack.setBackground(rounded(Color.argb(180, 255, 255, 255), Color.TRANSPARENT, 0, dp(3)));
-        playerProgressFill = new View(this);
-        playerProgressFill.setBackground(rounded(COLOR_ACCENT, Color.TRANSPARENT, 0, dp(3)));
-        playerProgressTrack.addView(playerProgressFill, new FrameLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT));
-        progressRow.addView(playerProgressTrack, margin(new LinearLayout.LayoutParams(0, dp(6), 1f), dp(12), 0, dp(12), 0));
-
-        playerTotalTime = text("--:--", 13, Typeface.BOLD, COLOR_PLAYER_MUTED);
-        playerTotalTime.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
-        progressRow.addView(playerTotalTime, new LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.MATCH_PARENT));
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setGravity(Gravity.CENTER);
-        panel.addView(buttons, margin(matchWidth(), 0, dp(12), 0, 0));
+        FrameLayout buttonRow = new FrameLayout(this);
+        buttonRow.setClipChildren(false);
+        buttonRow.setClipToPadding(false);
+        panel.addView(buttonRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(56)));
 
         ImageButton pause = playerIconButton(R.drawable.ic_player_pause);
+        pause.setId(View.generateViewId());
         pause.setContentDescription("播放/暂停");
         playerPlayPauseButton = pause;
-        buttons.addView(pause, new LinearLayout.LayoutParams(dp(64), dp(48)));
+        FrameLayout.LayoutParams pauseParams = new FrameLayout.LayoutParams(sdp(70), sdp(52), Gravity.CENTER);
+        buttonRow.addView(pause, pauseParams);
         pause.setOnClickListener(view -> {
             togglePlayerPaused();
             showPlayerChromeTemporarily();
         });
 
+        LinearLayout tools = new LinearLayout(this);
+        tools.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        tools.setClipChildren(false);
+        tools.setClipToPadding(false);
+        FrameLayout.LayoutParams toolParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        buttonRow.addView(tools, toolParams);
+
         ImageButton audio = playerIconButton(R.drawable.ic_player_audio);
+        audio.setId(View.generateViewId());
         audio.setContentDescription("音轨");
-        buttons.addView(audio, margin(new LinearLayout.LayoutParams(dp(64), dp(48)), dp(18), 0, dp(8), 0));
-        audio.setOnClickListener(view -> showAudioMenu(file, audio));
+        playerAudioButton = audio;
+        tools.addView(audio, new LinearLayout.LayoutParams(sdp(70), sdp(52)));
+        audio.setOnClickListener(view -> showAudioMenu(activePlaybackFile == null ? file : activePlaybackFile, audio));
 
         ImageButton subtitle = playerIconButton(R.drawable.ic_player_subtitle);
+        subtitle.setId(View.generateViewId());
         subtitle.setContentDescription("字幕");
-        buttons.addView(subtitle, margin(new LinearLayout.LayoutParams(dp(64), dp(48)), dp(8), 0, 0, 0));
-        subtitle.setOnClickListener(view -> showSubtitleMenu(file, subtitle));
+        playerSubtitleButton = subtitle;
+        tools.addView(subtitle, margin(new LinearLayout.LayoutParams(sdp(70), sdp(52)), sdp(10), 0, 0, 0));
+        subtitle.setOnClickListener(view -> showSubtitleMenu(activePlaybackFile == null ? file : activePlaybackFile, subtitle));
+
+        pause.setNextFocusRightId(audio.getId());
+        audio.setNextFocusLeftId(pause.getId());
+        audio.setNextFocusRightId(subtitle.getId());
+        subtitle.setNextFocusLeftId(audio.getId());
+
+        LinearLayout progressRow = new LinearLayout(this);
+        progressRow.setGravity(Gravity.CENTER_VERTICAL);
+        panel.addView(progressRow, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(38)), 0, sdp(10), 0, 0));
+
+        playerCurrentTime = text("0:00", ssp(13), Typeface.BOLD, COLOR_PLAYER_MUTED);
+        playerCurrentTime.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        progressRow.addView(playerCurrentTime, new LinearLayout.LayoutParams(sdp(78), ViewGroup.LayoutParams.MATCH_PARENT));
+
+        playerProgressTrack = new FrameLayout(this);
+        playerProgressTrack.setBackground(rounded(Color.argb(118, 255, 255, 255), Color.TRANSPARENT, 0, sdp(4)));
+        playerProgressFill = new View(this);
+        playerProgressFill.setBackground(rounded(COLOR_ACCENT, Color.TRANSPARENT, 0, sdp(4)));
+        playerProgressTrack.addView(playerProgressFill, new FrameLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT));
+        progressRow.addView(playerProgressTrack, margin(new LinearLayout.LayoutParams(0, sdp(8), 1f), sdp(14), 0, sdp(14), 0));
+
+        playerTotalTime = text("--:--", ssp(13), Typeface.BOLD, COLOR_PLAYER_MUTED);
+        playerTotalTime.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
+        progressRow.addView(playerTotalTime, new LinearLayout.LayoutParams(sdp(78), ViewGroup.LayoutParams.MATCH_PARENT));
 
         return panel;
     }
@@ -1409,6 +1816,7 @@ public final class MainActivity extends Activity {
         }
         double position = resolvePlayerPosition(file, duration);
         PlaybackTimeline timeline = livePlaybackTimeline(file, position, duration);
+        rememberPlaybackPosition(file, position, duration);
 
         if (playerCurrentTime != null) {
             playerCurrentTime.setText(formatPlaybackTime(timeline.positionSeconds));
@@ -1429,7 +1837,7 @@ public final class MainActivity extends Activity {
         maybeAdvanceMoviePart(file, position, duration);
         if (playerStatusText != null) {
             if (position > 0 || duration > 0) {
-                playerStatusText.setText(activeDirectPlayback ? "4K直出硬解播放" : "安卓端硬解播放");
+                playerStatusText.setText(activePlaybackStatusText(file));
             } else {
                 long elapsed = playerLoadStartedAtMs <= 0 ? 0 : System.currentTimeMillis() - playerLoadStartedAtMs;
                 playerStatusText.setText(elapsed >= 8000 ? "正在等待视频输出" : "正在打开视频流");
@@ -1438,6 +1846,9 @@ public final class MainActivity extends Activity {
     }
 
     private double resolvePlayerPosition(Models.VideoFile file, double duration) {
+        if (playerSeekLongPressActive && playerSeekPreviewPosition >= 0) {
+            return duration > 0 ? Math.min(duration, playerSeekPreviewPosition) : playerSeekPreviewPosition;
+        }
         double position = playerView == null ? 0 : playerView.currentTimeSeconds();
         if (position > 0) {
             return position;
@@ -1553,7 +1964,9 @@ public final class MainActivity extends Activity {
         stopPlayerUiUpdates();
         stopProgressUpdates();
         stopSubtitleOverlayUpdates();
+        stopSmoothPlayerSeek();
         closePlayerMenu(null);
+        stopActiveHlsSession();
         activePlaybackFile = null;
         if (playerView != null) {
             playerView.destroyPlayer();
@@ -1564,19 +1977,44 @@ public final class MainActivity extends Activity {
 
     private void showAudioMenu(Models.VideoFile file, View returnFocus) {
         showPlayerChromeTemporarily();
+        refreshRuntimeTracks();
         ArrayList<PlayerMenuOption> options = new ArrayList<>();
-        options.add(new PlayerMenuOption("默认音轨", () -> {
-            if (playerView != null) {
-                playerView.setAudioTrack("auto");
+        if (isActiveHlsPlayback()) {
+            options.add(new PlayerMenuOption("默认音轨 · HLS", true, () -> {
+                if (playerView != null) {
+                    playerView.setAudioTrack("auto");
+                    selectedAudioTrackOrdinal = file.audioTracks.isEmpty() ? -1 : 0;
+                }
+            }));
+            showPlayerMenu("音轨", options, returnFocus);
+            return;
+        }
+        if (prefersRuntimeTracks(file) || shouldUseRuntimeAudioTracks(file)) {
+            for (RuntimeTrack track : activeRuntimeAudioTracks) {
+                boolean selected = isRuntimeAudioSelected(track);
+                options.add(new PlayerMenuOption(formatRuntimeAudioTrack(track), selected, () -> selectRuntimeAudioTrack(track)));
             }
-        }));
+            if (options.isEmpty()) {
+                options.add(new PlayerMenuOption("暂无可切换音轨", false, () -> {
+                }));
+            }
+            showPlayerMenu("音轨", options, returnFocus);
+            return;
+        }
         for (int index = 0; index < file.audioTracks.size(); index++) {
             Models.VideoFileStream track = file.audioTracks.get(index);
             int trackOrdinal = index;
-            options.add(new PlayerMenuOption(formatAudioTrack(track, index), () -> {
+            boolean selected = selectedAudioTrackOrdinal == index;
+            options.add(new PlayerMenuOption(formatAudioTrack(track, index), selected, () -> {
                 if (playerView != null) {
                     playerView.setAudioTrack(String.valueOf(trackOrdinal + 1));
+                    selectedAudioTrackOrdinal = trackOrdinal;
+                    selectedRuntimeAudioId = null;
                 }
+            }));
+        }
+        if (options.isEmpty()) {
+            options.add(new PlayerMenuOption("暂无可切换音轨", false, () -> {
             }));
         }
         showPlayerMenu("音轨", options, returnFocus);
@@ -1584,20 +2022,28 @@ public final class MainActivity extends Activity {
 
     private void showSubtitleMenu(Models.VideoFile file, View returnFocus) {
         showPlayerChromeTemporarily();
+        refreshRuntimeTracks();
         ArrayList<PlayerMenuOption> options = new ArrayList<>();
-        options.add(new PlayerMenuOption("关闭字幕", () -> {
-            if (playerView != null) {
-                playerView.setSubtitleTrack("no");
+        if (prefersRuntimeTracks(file) || shouldUseRuntimeSubtitleTracks(file)) {
+            for (RuntimeTrack track : activeRuntimeSubtitleTracks) {
+                boolean selected = isRuntimeSubtitleSelected(track);
+                options.add(new PlayerMenuOption(formatRuntimeSubtitleTrack(track), selected, () -> selectRuntimeSubtitleTrack(file, track)));
             }
-            clearSubtitleOverlay();
-        }));
-        for (int index = 0; index < file.subtitleStreams.size(); index++) {
-            Models.VideoFileStream stream = file.subtitleStreams.get(index);
-            int ordinal = index;
-            options.add(new PlayerMenuOption(formatSubtitleStream(stream, index), () -> selectEmbeddedSubtitle(file, ordinal)));
+        } else {
+            for (int index = 0; index < file.subtitleStreams.size(); index++) {
+                Models.VideoFileStream stream = file.subtitleStreams.get(index);
+                int ordinal = index;
+                boolean selected = isEmbeddedSubtitleSelected(index);
+                options.add(new PlayerMenuOption(formatSubtitleStream(stream, index), selected, () -> selectEmbeddedSubtitle(file, ordinal)));
+            }
         }
         for (Models.SubtitleTrack track : activeExternalSubtitles) {
-            options.add(new PlayerMenuOption(formatExternalSubtitle(track), () -> selectExternalSubtitle(track)));
+            boolean selected = isExternalSubtitleSelected(track);
+            options.add(new PlayerMenuOption(formatExternalSubtitle(track), selected, () -> selectExternalSubtitle(track)));
+        }
+        if (options.isEmpty()) {
+            options.add(new PlayerMenuOption("暂无可切换字幕", false, () -> {
+            }));
         }
         showPlayerMenu("字幕", options, returnFocus);
     }
@@ -1608,15 +2054,18 @@ public final class MainActivity extends Activity {
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(18), dp(16), dp(18), dp(18));
-        panel.setBackground(rounded(Color.argb(232, 0, 0, 0), Color.argb(100, 255, 255, 255), dp(1), dp(12)));
-        panel.setElevation(dp(18));
-        panel.addView(text(title, 18, Typeface.BOLD, COLOR_PLAYER_TEXT), margin(matchWidth(), 0, 0, 0, dp(10)));
+        panel.setPadding(0, 0, 0, 0);
+        panel.setClipChildren(false);
+        panel.setClipToPadding(false);
+        TextView menuTitle = text(title, ssp(18), Typeface.BOLD, COLOR_PLAYER_TEXT);
+        menuTitle.setShadowLayer(sdp(2), 0, sdp(1), Color.BLACK);
+        panel.addView(menuTitle, margin(matchWidth(), 0, 0, 0, sdp(12)));
 
         Button first = null;
+        Button selectedButton = null;
         for (PlayerMenuOption option : options) {
-            Button button = playerMenuButton(option.label);
-            panel.addView(button, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)), 0, dp(6), 0, 0));
+            Button button = playerMenuButton(option.displayLabel(), option.selected);
+            panel.addView(button, margin(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sdp(48)), 0, sdp(7), 0, 0));
             button.setOnClickListener(view -> {
                 option.action.run();
                 closePlayerMenu(returnFocus);
@@ -1625,16 +2074,21 @@ public final class MainActivity extends Activity {
             if (first == null) {
                 first = button;
             }
+            if (selectedButton == null && option.selected) {
+                selectedButton = button;
+            }
         }
 
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(560), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.RIGHT | Gravity.BOTTOM);
-        params.setMargins(0, 0, dp(44), dp(126));
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(sdp(340), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.RIGHT | Gravity.BOTTOM);
+        params.setMargins(0, 0, sdp(58), sdp(248));
         root.addView(panel, params);
         playerMenuPanel = panel;
-        panel.setElevation(dp(34));
-        panel.setTranslationZ(dp(34));
+        panel.setElevation(sdp(34));
+        panel.setTranslationZ(sdp(34));
         panel.bringToFront();
-        if (first != null) {
+        if (selectedButton != null) {
+            selectedButton.requestFocus();
+        } else if (first != null) {
             first.requestFocus();
         }
     }
@@ -1653,57 +2107,284 @@ public final class MainActivity extends Activity {
     }
 
     private void selectEmbeddedSubtitle(Models.VideoFile file, int ordinal) {
+        selectEmbeddedSubtitle(file, ordinal, null);
+    }
+
+    private void selectEmbeddedSubtitle(Models.VideoFile file, int ordinal, Runnable onFailure) {
         if (playerView == null || ordinal < 0 || ordinal >= file.subtitleStreams.size()) {
+            runSubtitleFallback(onFailure);
             return;
         }
         String ticket = activePlaybackTicket;
-        String subtitleUrl = api.embeddedSubtitleUrl(file.id, ordinal + 1, ticket);
-        if (activeDirectPlayback && !subtitleUrl.isEmpty()) {
-            loadSubtitleOverlay(subtitleUrl, ticket == null || ticket.isEmpty() ? api.cookieHeader() : "");
+        Models.VideoFileStream stream = file.subtitleStreams.get(ordinal);
+        boolean useAndroidSubtitleOverlay = usesAndroidSubtitleOverlay();
+        clearSubtitleSelection();
+        int loadGeneration = beginSubtitleLoad();
+        markPendingEmbeddedSubtitle(ordinal);
+        Runnable onLoaded = () -> markSelectedEmbeddedSubtitle(ordinal);
+        Runnable onLoadFailed = () -> {
+            if (!isSubtitleLoadCurrent(loadGeneration)) {
+                return;
+            }
+            if (tryUseNativeEmbeddedSubtitle(ordinal)) {
+                markSelectedEmbeddedSubtitle(ordinal);
+                return;
+            }
+            clearSubtitleSelection();
+            runSubtitleFallback(onFailure);
+        };
+        if (useAndroidSubtitleOverlay && isPgsSubtitle(stream)) {
+            String subtitleUrl = api.embeddedPgsSubtitleUrl(file.id, ordinal, ticket);
+            if (!subtitleUrl.isEmpty()) {
+                loadPgsSubtitleOverlay(subtitleUrl, ticket == null || ticket.isEmpty() ? api.cookieHeader() : "", loadGeneration, onLoaded, onLoadFailed);
+            } else {
+                clearSubtitleOverlayIfCurrent(loadGeneration);
+                onLoadFailed.run();
+            }
             playerView.setSubtitleTrack("no");
             return;
         }
+        if (useAndroidSubtitleOverlay && canUseEmbeddedSubtitleAsWebTrack(stream)) {
+            String subtitleUrl = api.embeddedSubtitleUrl(file.id, ordinal, ticket);
+            if (!subtitleUrl.isEmpty()) {
+                loadSubtitleOverlay(subtitleUrl, ticket == null || ticket.isEmpty() ? api.cookieHeader() : "", loadGeneration, onLoaded, onLoadFailed);
+            } else {
+                clearSubtitleOverlayIfCurrent(loadGeneration);
+                onLoadFailed.run();
+            }
+            playerView.setSubtitleTrack("no");
+            return;
+        }
+        if (useAndroidSubtitleOverlay) {
+            clearSubtitleOverlay();
+            playerView.setSubtitleTrack("no");
+            runSubtitleFallback(onFailure);
+            return;
+        }
+        if (isActiveHlsPlayback()) {
+            clearSubtitleOverlay();
+            playerView.setSubtitleTrack("no");
+            runSubtitleFallback(onFailure);
+            return;
+        }
+        clearSubtitleOverlay();
+        markSelectedEmbeddedSubtitle(ordinal);
         playerView.setSubtitleTrack(String.valueOf(ordinal + 1));
     }
 
+    private void selectRuntimeAudioTrack(RuntimeTrack track) {
+        if (playerView == null || track == null) {
+            return;
+        }
+        playerView.setAudioTrack(track.mpvId);
+        selectedAudioTrackOrdinal = track.ordinal;
+        selectedRuntimeAudioId = runtimeTrackKey(track);
+    }
+
+    private void selectRuntimeSubtitleTrack(Models.VideoFile file, RuntimeTrack track) {
+        selectRuntimeSubtitleTrack(file, track, null);
+    }
+
+    private void selectRuntimeSubtitleTrack(Models.VideoFile file, RuntimeTrack track, Runnable onFailure) {
+        if (playerView == null || track == null) {
+            runSubtitleFallback(onFailure);
+            return;
+        }
+        boolean useAndroidSubtitleOverlay = usesAndroidSubtitleOverlay() && !isIsoFile(file);
+        clearSubtitleSelection();
+        int loadGeneration = beginSubtitleLoad();
+        markPendingRuntimeSubtitle(track);
+        Runnable onLoaded = () -> markSelectedRuntimeSubtitle(track);
+        Runnable onLoadFailed = () -> {
+            if (!isSubtitleLoadCurrent(loadGeneration)) {
+                return;
+            }
+            if (tryUseNativeRuntimeSubtitle(track)) {
+                markSelectedRuntimeSubtitle(track);
+                return;
+            }
+            clearSubtitleSelection();
+            runSubtitleFallback(onFailure);
+        };
+        if (useAndroidSubtitleOverlay && isPgsSubtitle(track)) {
+            String subtitleUrl = api.embeddedPgsSubtitleUrl(file.id, track.ordinal, activePlaybackTicket);
+            if (!subtitleUrl.isEmpty()) {
+                loadPgsSubtitleOverlay(subtitleUrl, activePlaybackTicket == null || activePlaybackTicket.isEmpty() ? api.cookieHeader() : "", loadGeneration, onLoaded, onLoadFailed);
+            } else {
+                clearSubtitleOverlayIfCurrent(loadGeneration);
+                onLoadFailed.run();
+            }
+            playerView.setSubtitleTrack("no");
+            return;
+        }
+        if (useAndroidSubtitleOverlay && canUseEmbeddedSubtitleAsWebTrack(track)) {
+            String subtitleUrl = api.embeddedSubtitleUrl(file.id, track.ordinal, activePlaybackTicket);
+            if (!subtitleUrl.isEmpty()) {
+                loadSubtitleOverlay(subtitleUrl, activePlaybackTicket == null || activePlaybackTicket.isEmpty() ? api.cookieHeader() : "", loadGeneration, onLoaded, onLoadFailed);
+            } else {
+                clearSubtitleOverlayIfCurrent(loadGeneration);
+                onLoadFailed.run();
+            }
+            playerView.setSubtitleTrack("no");
+            return;
+        }
+        if (useAndroidSubtitleOverlay) {
+            clearSubtitleOverlay();
+            playerView.setSubtitleTrack("no");
+            runSubtitleFallback(onFailure);
+            return;
+        }
+        if (isActiveHlsPlayback()) {
+            clearSubtitleOverlay();
+            playerView.setSubtitleTrack("no");
+            runSubtitleFallback(onFailure);
+            return;
+        }
+        clearSubtitleOverlay();
+        markSelectedRuntimeSubtitle(track);
+        playerView.setSubtitleTrack(track.mpvId);
+    }
+
     private void selectExternalSubtitle(Models.SubtitleTrack track) {
+        selectExternalSubtitle(track, null);
+    }
+
+    private void selectExternalSubtitle(Models.SubtitleTrack track, Runnable onFailure) {
         if (playerView == null) {
+            runSubtitleFallback(onFailure);
             return;
         }
         String ticket = activePlaybackTicket;
         String cookieHeader = ticket == null || ticket.isEmpty() ? api.cookieHeader() : "";
         String subtitleUrl = api.subtitleUrl(track, ticket);
         if (!subtitleUrl.isEmpty()) {
-            if (activeDirectPlayback) {
-                loadSubtitleOverlay(subtitleUrl, cookieHeader);
+            String trackKey = subtitleTrackKey(track);
+            if (usesAndroidSubtitleOverlay()) {
+                clearSubtitleSelection();
+                int loadGeneration = beginSubtitleLoad();
+                markPendingExternalSubtitle(trackKey);
+                loadSubtitleOverlay(
+                        subtitleUrl,
+                        cookieHeader,
+                        loadGeneration,
+                        () -> markSelectedExternalSubtitle(trackKey),
+                        () -> {
+                            if (!isSubtitleLoadCurrent(loadGeneration)) {
+                                return;
+                            }
+                            if (playerView != null && playerView.addSubtitle(subtitleUrl, cookieHeader)) {
+                                markSelectedExternalSubtitle(trackKey);
+                                clearSubtitleOverlayViews();
+                                return;
+                            }
+                            clearSubtitleSelection();
+                            runSubtitleFallback(onFailure);
+                        });
                 playerView.setSubtitleTrack("no");
                 return;
             }
+            clearSubtitleOverlay();
+            markSelectedExternalSubtitle(trackKey);
             playerView.addSubtitle(subtitleUrl, cookieHeader);
+        } else {
+            runSubtitleFallback(onFailure);
         }
     }
 
-    private void loadSubtitleOverlay(String url, String cookieHeader) {
+    private void loadSubtitleOverlay(String url, String cookieHeader, int loadGeneration) {
+        loadSubtitleOverlay(url, cookieHeader, loadGeneration, null, null);
+    }
+
+    private void loadSubtitleOverlay(String url, String cookieHeader, int loadGeneration, Runnable onLoaded, Runnable onFailed) {
         if (url == null || url.isEmpty()) {
-            clearSubtitleOverlay();
+            clearSubtitleOverlayIfCurrent(loadGeneration);
+            runSubtitleFallback(onFailed);
             return;
         }
         runAsync(
                 () -> parseSubtitleCues(fetchText(url, cookieHeader)),
                 cues -> {
-                    if (screen != Screen.PLAYER || playerView == null || cues.isEmpty()) {
+                    if (screen != Screen.PLAYER || playerView == null || !isSubtitleLoadCurrent(loadGeneration)) {
                         return;
+                    }
+                    if (cues.isEmpty()) {
+                        clearSubtitleOverlayIfCurrent(loadGeneration);
+                        runSubtitleFallback(onFailed);
+                        return;
+                    }
+                    activePgsSubtitleCues = Collections.emptyList();
+                    if (playerPgsSubtitleOverlay != null) {
+                        playerPgsSubtitleOverlay.clear();
                     }
                     activeSubtitleCues = cues;
                     startSubtitleOverlayUpdates();
+                    runSubtitleLoaded(onLoaded);
                 },
-                ignored -> clearSubtitleOverlay());
+                ignored -> {
+                    clearSubtitleOverlayIfCurrent(loadGeneration);
+                    runSubtitleFallback(onFailed);
+                });
+    }
+
+    private void loadPgsSubtitleOverlay(String url, String cookieHeader, int loadGeneration) {
+        loadPgsSubtitleOverlay(url, cookieHeader, loadGeneration, null, null);
+    }
+
+    private void loadPgsSubtitleOverlay(String url, String cookieHeader, int loadGeneration, Runnable onLoaded, Runnable onFailed) {
+        if (url == null || url.isEmpty()) {
+            clearSubtitleOverlayIfCurrent(loadGeneration);
+            runSubtitleFallback(onFailed);
+            return;
+        }
+        runAsync(
+                () -> fetchPgsSubtitleCues(url, cookieHeader),
+                cues -> {
+                    if (screen != Screen.PLAYER || playerView == null || !isSubtitleLoadCurrent(loadGeneration)) {
+                        return;
+                    }
+                    if (cues.isEmpty()) {
+                        clearSubtitleOverlayIfCurrent(loadGeneration);
+                        runSubtitleFallback(onFailed);
+                        return;
+                    }
+                    activeSubtitleCues = Collections.emptyList();
+                    if (playerSubtitleOverlay != null) {
+                        playerSubtitleOverlay.setText("");
+                        playerSubtitleOverlay.setVisibility(View.GONE);
+                    }
+                    activePgsSubtitleCues = cues;
+                    if (playerPgsSubtitleOverlay != null) {
+                        playerPgsSubtitleOverlay.setCues(cues);
+                        playerPgsSubtitleOverlay.bringToFront();
+                    }
+                    startSubtitleOverlayUpdates();
+                    runSubtitleLoaded(onLoaded);
+                },
+                ignored -> {
+                    clearSubtitleOverlayIfCurrent(loadGeneration);
+                    runSubtitleFallback(onFailed);
+                });
+    }
+
+    private List<PgsSubtitleCue> fetchPgsSubtitleCues(String url, String cookieHeader) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(8000);
+        connection.setReadTimeout(120000);
+        connection.setRequestProperty("User-Agent", "OmniPlay-Android/0.1");
+        if (cookieHeader != null && !cookieHeader.isEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader);
+        }
+        try (InputStream input = new BufferedInputStream(connection.getInputStream())) {
+            return PgsSubtitleParser.parse(input);
+        } finally {
+            connection.disconnect();
+        }
     }
 
     private String fetchText(String url, String cookieHeader) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(8000);
-        connection.setReadTimeout(20000);
+        connection.setReadTimeout(90000);
         connection.setRequestProperty("User-Agent", "OmniPlay-Android/0.1");
         if (cookieHeader != null && !cookieHeader.isEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader);
@@ -1727,10 +2408,20 @@ public final class MainActivity extends Activity {
             return cues;
         }
 
-        String[] lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\n");
+        String[] lines = text
+                .replace("\uFEFF", "")
+                .replace("\r\n", "\n")
+                .replace('\r', '\n')
+                .split("\n", -1);
         for (int index = 0; index < lines.length; index++) {
             String line = lines[index].trim();
-            if (line.isEmpty() || line.equalsIgnoreCase("WEBVTT") || line.startsWith("NOTE")) {
+            if (line.isEmpty() || line.equalsIgnoreCase("WEBVTT")) {
+                continue;
+            }
+            if (line.startsWith("NOTE") || line.equals("STYLE") || line.equals("REGION")) {
+                while (index + 1 < lines.length && !lines[index + 1].trim().isEmpty()) {
+                    index++;
+                }
                 continue;
             }
             if (!line.contains("-->") && index + 1 < lines.length && lines[index + 1].contains("-->")) {
@@ -1741,17 +2432,24 @@ public final class MainActivity extends Activity {
                 continue;
             }
 
-            String[] parts = line.split("-->", 2);
-            double start = parseSubtitleTime(parts[0]);
-            double end = parseSubtitleTime(parts[1].trim().split("\\s+", 2)[0]);
+            Matcher matcher = SUBTITLE_TIME_LINE.matcher(line);
+            if (!matcher.matches()) {
+                continue;
+            }
+            double start = parseSubtitleTime(matcher.group(1));
+            double end = parseSubtitleTime(matcher.group(2));
             StringBuilder body = new StringBuilder();
             while (index + 1 < lines.length && !lines[index + 1].trim().isEmpty()) {
                 String bodyLine = lines[++index].trim();
-                if (!bodyLine.isEmpty()) {
+                if (!bodyLine.isEmpty() && !bodyLine.contains("-->")) {
+                    String cleanLine = cleanSubtitleTextLine(bodyLine);
+                    if (cleanLine.isEmpty()) {
+                        continue;
+                    }
                     if (body.length() > 0) {
                         body.append('\n');
                     }
-                    body.append(bodyLine.replaceAll("<[^>]+>", ""));
+                    body.append(cleanLine);
                 }
             }
             if (end > start && body.length() > 0) {
@@ -1759,6 +2457,22 @@ public final class MainActivity extends Activity {
             }
         }
         return cues;
+    }
+
+    private String cleanSubtitleTextLine(String line) {
+        if (line == null) {
+            return "";
+        }
+        String withoutTags = line
+                .replaceAll("</?c(?:\\.[^>]+)?>", "")
+                .replaceAll("</?v(?:\\s+[^>]+)?>", "")
+                .replaceAll("</?lang(?:\\s+[^>]+)?>", "")
+                .replaceAll("<\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{1,3}>", "")
+                .replaceAll("<[^>]+>", "");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            return Html.fromHtml(withoutTags, Html.FROM_HTML_MODE_LEGACY).toString().trim();
+        }
+        return Html.fromHtml(withoutTags).toString().trim();
     }
 
     private double parseSubtitleTime(String value) {
@@ -1791,30 +2505,219 @@ public final class MainActivity extends Activity {
     }
 
     private void updateSubtitleOverlay() {
-        if (playerSubtitleOverlay == null || activeSubtitleCues.isEmpty() || playerView == null) {
+        if (playerView == null) {
             return;
         }
         double position = playerView.currentTimeSeconds();
-        String subtitle = "";
-        for (SubtitleCue cue : activeSubtitleCues) {
-            if (position >= cue.startSeconds && position <= cue.endSeconds) {
-                subtitle = cue.text;
-                break;
+        if (playerSubtitleOverlay != null) {
+            String subtitle = "";
+            for (SubtitleCue cue : activeSubtitleCues) {
+                if (position >= cue.startSeconds && position <= cue.endSeconds) {
+                    subtitle = cue.text;
+                    break;
+                }
+            }
+            playerSubtitleOverlay.setText(subtitle);
+            playerSubtitleOverlay.setVisibility(subtitle.isEmpty() ? View.GONE : View.VISIBLE);
+            if (!subtitle.isEmpty()) {
+                playerSubtitleOverlay.bringToFront();
             }
         }
-        playerSubtitleOverlay.setText(subtitle);
-        playerSubtitleOverlay.setVisibility(subtitle.isEmpty() ? View.GONE : View.VISIBLE);
-        if (!subtitle.isEmpty()) {
-            playerSubtitleOverlay.bringToFront();
+        if (playerPgsSubtitleOverlay != null && !activePgsSubtitleCues.isEmpty()) {
+            playerPgsSubtitleOverlay.setPlaybackPosition(position);
+            if (playerPgsSubtitleOverlay.getVisibility() == View.VISIBLE) {
+                playerPgsSubtitleOverlay.bringToFront();
+            }
         }
     }
 
     private void clearSubtitleOverlay() {
+        subtitleLoadGeneration++;
+        clearSubtitleSelection();
+        clearSubtitleOverlayViews();
+    }
+
+    private int beginSubtitleLoad() {
+        subtitleLoadGeneration++;
+        subtitleLoadStartedAtMs = System.currentTimeMillis();
+        clearSubtitleOverlayViews();
+        return subtitleLoadGeneration;
+    }
+
+    private boolean isSubtitleLoadCurrent(int loadGeneration) {
+        return loadGeneration == subtitleLoadGeneration;
+    }
+
+    private void clearSubtitleOverlayIfCurrent(int loadGeneration) {
+        if (isSubtitleLoadCurrent(loadGeneration)) {
+            clearSubtitleOverlayViews();
+        }
+    }
+
+    private void clearSubtitleSelection() {
+        selectedEmbeddedSubtitleOrdinal = -1;
+        selectedRuntimeSubtitleId = null;
+        selectedExternalSubtitleId = null;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+    }
+
+    private void markPendingEmbeddedSubtitle(int ordinal) {
+        pendingEmbeddedSubtitleOrdinal = ordinal;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+    }
+
+    private void markSelectedEmbeddedSubtitle(int ordinal) {
+        selectedEmbeddedSubtitleOrdinal = ordinal;
+        selectedRuntimeSubtitleId = null;
+        selectedExternalSubtitleId = null;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+    }
+
+    private void markPendingRuntimeSubtitle(RuntimeTrack track) {
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = runtimeTrackKey(track);
+        pendingExternalSubtitleId = null;
+    }
+
+    private void markSelectedRuntimeSubtitle(RuntimeTrack track) {
+        selectedEmbeddedSubtitleOrdinal = -1;
+        selectedRuntimeSubtitleId = runtimeTrackKey(track);
+        selectedExternalSubtitleId = null;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+    }
+
+    private void markPendingExternalSubtitle(String trackKey) {
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = trackKey;
+    }
+
+    private void markSelectedExternalSubtitle(String trackKey) {
+        selectedEmbeddedSubtitleOrdinal = -1;
+        selectedRuntimeSubtitleId = null;
+        selectedExternalSubtitleId = trackKey;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+    }
+
+    private boolean isEmbeddedSubtitleSelected(int ordinal) {
+        return selectedExternalSubtitleId == null &&
+                pendingExternalSubtitleId == null &&
+                selectedRuntimeSubtitleId == null &&
+                pendingRuntimeSubtitleId == null &&
+                (selectedEmbeddedSubtitleOrdinal == ordinal || pendingEmbeddedSubtitleOrdinal == ordinal);
+    }
+
+    private boolean isRuntimeAudioSelected(RuntimeTrack track) {
+        if (track == null) {
+            return false;
+        }
+        String key = runtimeTrackKey(track);
+        return key.equals(selectedRuntimeAudioId) ||
+                (selectedRuntimeAudioId == null && selectedAudioTrackOrdinal == track.ordinal && track.selected);
+    }
+
+    private boolean isRuntimeSubtitleSelected(RuntimeTrack track) {
+        String key = runtimeTrackKey(track);
+        return key.equals(selectedRuntimeSubtitleId) || key.equals(pendingRuntimeSubtitleId);
+    }
+
+    private boolean isExternalSubtitleSelected(Models.SubtitleTrack track) {
+        String key = subtitleTrackKey(track);
+        return key.equals(selectedExternalSubtitleId) || key.equals(pendingExternalSubtitleId);
+    }
+
+    private boolean hasSubtitleSelection() {
+        return selectedEmbeddedSubtitleOrdinal >= 0 ||
+                selectedRuntimeSubtitleId != null ||
+                selectedExternalSubtitleId != null ||
+                pendingEmbeddedSubtitleOrdinal >= 0 ||
+                pendingRuntimeSubtitleId != null ||
+                pendingExternalSubtitleId != null;
+    }
+
+    private boolean hasPendingSubtitleSelection() {
+        return pendingEmbeddedSubtitleOrdinal >= 0 ||
+                pendingRuntimeSubtitleId != null ||
+                pendingExternalSubtitleId != null;
+    }
+
+    private boolean hasRuntimeSubtitleSelection() {
+        return selectedRuntimeSubtitleId != null || pendingRuntimeSubtitleId != null;
+    }
+
+    private boolean isSubtitleLoadStale() {
+        return subtitleLoadStartedAtMs > 0 && System.currentTimeMillis() - subtitleLoadStartedAtMs > 8000;
+    }
+
+    private boolean hasRenderableSubtitleSelection(Models.VideoFile file) {
+        if (!hasSubtitleSelection()) {
+            return false;
+        }
+        if (usesAndroidSubtitleOverlay() && !isIsoFile(file)) {
+            return !activeSubtitleCues.isEmpty() || !activePgsSubtitleCues.isEmpty();
+        }
+        return !hasPendingSubtitleSelection();
+    }
+
+    private boolean tryUseNativeEmbeddedSubtitle(int ordinal) {
+        if (playerView == null || isActiveHlsPlayback() || ordinal < 0) {
+            return false;
+        }
+        if (activeDirectPlayback && !isIsoFile(activePlaybackFile)) {
+            return false;
+        }
+        playerView.setSubtitleTrack(String.valueOf(ordinal + 1));
+        return true;
+    }
+
+    private boolean tryUseNativeRuntimeSubtitle(RuntimeTrack track) {
+        if (playerView == null || isActiveHlsPlayback() || track == null) {
+            return false;
+        }
+        if (activeDirectPlayback && !isIsoFile(activePlaybackFile)) {
+            return false;
+        }
+        playerView.setSubtitleTrack(track.mpvId);
+        return true;
+    }
+
+    private void runSubtitleLoaded(Runnable onLoaded) {
+        if (onLoaded != null) {
+            onLoaded.run();
+        }
+    }
+
+    private void runSubtitleFallback(Runnable onFailure) {
+        if (onFailure != null) {
+            onFailure.run();
+        }
+    }
+
+    private void runSubtitleFallbackIfCurrent(int loadGeneration, Runnable onFailure) {
+        if (isSubtitleLoadCurrent(loadGeneration)) {
+            runSubtitleFallback(onFailure);
+        }
+    }
+
+    private void clearSubtitleOverlayViews() {
         activeSubtitleCues = Collections.emptyList();
+        activePgsSubtitleCues = Collections.emptyList();
         stopSubtitleOverlayUpdates();
         if (playerSubtitleOverlay != null) {
             playerSubtitleOverlay.setText("");
             playerSubtitleOverlay.setVisibility(View.GONE);
+        }
+        if (playerPgsSubtitleOverlay != null) {
+            playerPgsSubtitleOverlay.clear();
         }
     }
 
@@ -1827,11 +2730,114 @@ public final class MainActivity extends Activity {
 
     private void applyDefaultPlaybackTracks(Models.VideoFile file, Models.AppSettings settings) {
         Models.PlaybackSettings playback = settings == null ? Models.PlaybackSettings.defaults() : settings.playback;
+        if (isActiveHlsPlayback()) {
+            selectedAudioTrackOrdinal = file.audioTracks.isEmpty() ? -1 : 0;
+            selectedRuntimeAudioId = null;
+            if (playerView != null) {
+                playerView.setAudioTrack("auto");
+            }
+            loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+            return;
+        }
+        refreshRuntimeTracks();
+        if (shouldUseRuntimeAudioTracks(file)) {
+            RuntimeTrack audioTrack = resolvePreferredRuntimeAudioTrack(file, playback.defaultAudioLanguage);
+            selectedAudioTrackOrdinal = audioTrack == null ? -1 : audioTrack.ordinal;
+            selectedRuntimeAudioId = audioTrack == null ? null : runtimeTrackKey(audioTrack);
+            if (playerView != null) {
+                playerView.setAudioTrack(audioTrack == null ? "auto" : audioTrack.mpvId);
+            }
+            loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+            return;
+        }
+        if (prefersRuntimeTracks(file)) {
+            selectedAudioTrackOrdinal = -1;
+            selectedRuntimeAudioId = null;
+            if (playerView != null) {
+                playerView.setAudioTrack("auto");
+            }
+            loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+            return;
+        }
         Models.VideoFileStream audioTrack = resolvePreferredAudioTrack(file, playback.defaultAudioLanguage);
+        selectedAudioTrackOrdinal = audioTrack == null ? -1 : audioTrackOrdinal(file, audioTrack);
+        selectedRuntimeAudioId = null;
         if (playerView != null) {
             playerView.setAudioTrack(audioTrack == null ? "auto" : mpvAudioTrackId(file, audioTrack));
         }
         loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+    }
+
+    private void scheduleRuntimeTrackRefresh(Models.VideoFile file, Models.AppSettings settings) {
+        scheduleRuntimeTrackRefresh(file, settings, 350);
+        scheduleRuntimeTrackRefresh(file, settings, 1200);
+        scheduleRuntimeTrackRefresh(file, settings, 2600);
+    }
+
+    private void scheduleRuntimeTrackRefresh(Models.VideoFile file, Models.AppSettings settings, long delayMs) {
+        main.postDelayed(() -> {
+            if (screen != Screen.PLAYER || playerView == null || activePlaybackFile != file) {
+                return;
+            }
+            int previousAudioCount = activeRuntimeAudioTracks.size();
+            int previousSubtitleCount = activeRuntimeSubtitleTracks.size();
+            refreshRuntimeTracks();
+            if (activeRuntimeAudioTracks.size() != previousAudioCount && shouldUseRuntimeAudioTracks(file) && selectedAudioTrackOrdinal < 0) {
+                Models.PlaybackSettings playback = settings == null ? Models.PlaybackSettings.defaults() : settings.playback;
+                RuntimeTrack audioTrack = resolvePreferredRuntimeAudioTrack(file, playback.defaultAudioLanguage);
+                selectedAudioTrackOrdinal = audioTrack == null ? -1 : audioTrack.ordinal;
+                selectedRuntimeAudioId = audioTrack == null ? null : runtimeTrackKey(audioTrack);
+                if (playerView != null) {
+                    playerView.setAudioTrack(audioTrack == null ? "auto" : audioTrack.mpvId);
+                }
+            }
+            if (activeRuntimeSubtitleTracks.size() != previousSubtitleCount && !hasSubtitleSelection()) {
+                Models.PlaybackSettings playback = settings == null ? Models.PlaybackSettings.defaults() : settings.playback;
+                loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+            } else if (activeRuntimeSubtitleTracks.size() != previousSubtitleCount &&
+                    shouldUseRuntimeSubtitleTracks(file) &&
+                    !hasRuntimeSubtitleSelection() &&
+                    selectedExternalSubtitleId == null &&
+                    pendingExternalSubtitleId == null) {
+                clearSubtitleSelection();
+                Models.PlaybackSettings playback = settings == null ? Models.PlaybackSettings.defaults() : settings.playback;
+                loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+            }
+        }, delayMs);
+    }
+
+    private void scheduleDefaultSubtitleRetries(Models.VideoFile file, Models.AppSettings settings) {
+        scheduleDefaultSubtitleRetry(file, settings, 700);
+        scheduleDefaultSubtitleRetry(file, settings, 1800);
+        scheduleDefaultSubtitleRetry(file, settings, 4200);
+        scheduleDefaultSubtitleRetry(file, settings, 8500);
+    }
+
+    private void scheduleDefaultSubtitleRetry(Models.VideoFile file, Models.AppSettings settings, long delayMs) {
+        main.postDelayed(() -> {
+            if (screen != Screen.PLAYER || playerView == null || activePlaybackFile != file) {
+                return;
+            }
+            if (hasRenderableSubtitleSelection(file)) {
+                return;
+            }
+            if (hasPendingSubtitleSelection() && !isSubtitleLoadStale()) {
+                return;
+            }
+            clearSubtitleSelection();
+            Models.PlaybackSettings playback = settings == null ? Models.PlaybackSettings.defaults() : settings.playback;
+            refreshRuntimeTracks();
+            loadDefaultSubtitle(file, playback.defaultSubtitleLanguage);
+        }, delayMs);
+    }
+
+    private int audioTrackOrdinal(Models.VideoFile file, Models.VideoFileStream audioTrack) {
+        for (int index = 0; index < file.audioTracks.size(); index++) {
+            if (file.audioTracks.get(index) == audioTrack) {
+                return index;
+            }
+        }
+        return -1;
     }
 
     private String mpvAudioTrackId(Models.VideoFile file, Models.VideoFileStream audioTrack) {
@@ -1843,40 +2849,232 @@ public final class MainActivity extends Activity {
         return String.valueOf(audioTrack.index);
     }
 
+    private void refreshRuntimeTracks() {
+        if (playerView == null) {
+            activeRuntimeAudioTracks = Collections.emptyList();
+            activeRuntimeSubtitleTracks = Collections.emptyList();
+            return;
+        }
+
+        int count = (int) Math.round(playerView.getDoubleProperty("track-list/count", 0));
+        if (count <= 0) {
+            return;
+        }
+
+        ArrayList<RuntimeTrack> audioTracks = new ArrayList<>();
+        ArrayList<RuntimeTrack> subtitleTracks = new ArrayList<>();
+        int audioOrdinal = 0;
+        int subtitleOrdinal = 0;
+        for (int index = 0; index < Math.min(count, 128); index++) {
+            String prefix = "track-list/" + index + "/";
+            String type = runtimePropertyString(prefix + "type", "");
+            if ("audio".equals(type)) {
+                audioTracks.add(readRuntimeTrack(prefix, audioOrdinal++, type));
+            } else if ("sub".equals(type) || "subtitle".equals(type)) {
+                subtitleTracks.add(readRuntimeTrack(prefix, subtitleOrdinal++, "sub"));
+            }
+        }
+        activeRuntimeAudioTracks = audioTracks;
+        activeRuntimeSubtitleTracks = subtitleTracks;
+    }
+
+    private RuntimeTrack readRuntimeTrack(String prefix, int ordinal, String type) {
+        String mpvId = runtimePropertyString(prefix + "id", "");
+        if (mpvId.isEmpty()) {
+            double idValue = playerView == null ? -1 : playerView.getDoubleProperty(prefix + "id", -1);
+            if (Double.isFinite(idValue) && idValue > 0) {
+                mpvId = formatRuntimeTrackId(idValue);
+            }
+        }
+        if (mpvId.isEmpty()) {
+            mpvId = String.valueOf(ordinal + 1);
+        }
+        String codec = runtimePropertyString(prefix + "codec", "");
+        String language = runtimePropertyString(prefix + "lang", "");
+        String title = runtimePropertyString(prefix + "title", "");
+        Integer channels = runtimePropertyInteger(prefix + "demux-channel-count");
+        String channelLayout = runtimePropertyString(prefix + "demux-channels", "");
+        boolean selected = runtimePropertyBoolean(prefix + "selected");
+        boolean isDefault = runtimePropertyBoolean(prefix + "default");
+        boolean isForced = runtimePropertyBoolean(prefix + "forced");
+        return new RuntimeTrack(ordinal, mpvId, type, codec, language, title, channels, channelLayout, selected, isDefault, isForced);
+    }
+
+    private String runtimePropertyString(String property, String fallback) {
+        if (playerView == null) {
+            return fallback == null ? "" : fallback;
+        }
+        String value = playerView.getStringProperty(property, fallback == null ? "" : fallback);
+        return value == null ? "" : value.trim();
+    }
+
+    private Integer runtimePropertyInteger(String property) {
+        if (playerView == null) {
+            return null;
+        }
+        double value = playerView.getDoubleProperty(property, -1);
+        return Double.isFinite(value) && value > 0 ? (int) Math.round(value) : null;
+    }
+
+    private boolean runtimePropertyBoolean(String property) {
+        if (playerView == null) {
+            return false;
+        }
+        String value = playerView.getStringProperty(property, "").trim().toLowerCase(Locale.ROOT);
+        if (value.equals("yes") || value.equals("true") || value.equals("1")) {
+            return true;
+        }
+        if (value.equals("no") || value.equals("false") || value.equals("0")) {
+            return false;
+        }
+        double numeric = playerView.getDoubleProperty(property, 0);
+        return Double.isFinite(numeric) && numeric > 0.5d;
+    }
+
+    private String formatRuntimeTrackId(double value) {
+        if (Math.abs(value - Math.rint(value)) < 0.001d) {
+            return String.valueOf((int) Math.round(value));
+        }
+        return String.format(Locale.US, "%.3f", value);
+    }
+
+    private boolean shouldUseRuntimeAudioTracks(Models.VideoFile file) {
+        return !isActiveHlsPlayback() && !activeRuntimeAudioTracks.isEmpty();
+    }
+
+    private boolean shouldUseRuntimeSubtitleTracks(Models.VideoFile file) {
+        return !isActiveHlsPlayback() && !activeRuntimeSubtitleTracks.isEmpty();
+    }
+
+    private boolean prefersRuntimeTracks(Models.VideoFile file) {
+        return shouldUseRuntimeSubtitleTracks(file);
+    }
+
+    private String runtimeTrackKey(RuntimeTrack track) {
+        if (track == null) {
+            return "";
+        }
+        return track.type + "|" + track.mpvId + "|" + track.ordinal;
+    }
+
     private void loadDefaultSubtitle(Models.VideoFile file, String languagePreference) {
+        if (!hasSubtitleSelection()) {
+            List<SubtitleCandidate> embeddedCandidates = defaultSubtitleCandidates(file, Collections.emptyList(), languagePreference);
+            selectDefaultSubtitleCandidate(file, embeddedCandidates, 0);
+        }
+        int requestGeneration = subtitleLoadGeneration;
         runAsync(
                 () -> api.getSubtitles(file.id),
                 tracks -> {
-                    if (screen != Screen.PLAYER || playerView == null || activePlaybackFile != file) {
+                    if (screen != Screen.PLAYER || playerView == null || activePlaybackFile != file || requestGeneration != subtitleLoadGeneration) {
                         return;
                     }
                     activeExternalSubtitles = new ArrayList<>(tracks);
-
-                    Models.SubtitleTrack externalTrack = matchingExternalSubtitle(tracks, languagePreference);
-                    if (externalTrack != null) {
-                        selectExternalSubtitle(externalTrack);
-                        return;
-                    }
-
-                    int embeddedOrdinal = preferredEmbeddedSubtitleOrdinal(file, languagePreference);
-                    if (embeddedOrdinal >= 0) {
-                        selectEmbeddedSubtitle(file, embeddedOrdinal);
-                        return;
-                    }
-
-                    Models.SubtitleTrack fallbackExternalTrack = firstPlayableExternalSubtitle(tracks);
-                    if (fallbackExternalTrack != null) {
-                        selectExternalSubtitle(fallbackExternalTrack);
-                    }
+                    selectDefaultSubtitleCandidate(file, defaultSubtitleCandidates(file, tracks, languagePreference), 0);
                 },
                 ignored -> {
-                    if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file) {
-                        int embeddedOrdinal = preferredEmbeddedSubtitleOrdinal(file, languagePreference);
-                        if (embeddedOrdinal >= 0) {
-                            selectEmbeddedSubtitle(file, embeddedOrdinal);
-                        }
+                    if (screen == Screen.PLAYER && playerView != null && activePlaybackFile == file && requestGeneration == subtitleLoadGeneration) {
+                        selectDefaultSubtitleCandidate(file, defaultSubtitleCandidates(file, Collections.emptyList(), languagePreference), 0);
                     }
                 });
+    }
+
+    private List<SubtitleCandidate> defaultSubtitleCandidates(Models.VideoFile file, List<Models.SubtitleTrack> tracks, String languagePreference) {
+        ArrayList<SubtitleCandidate> candidates = new ArrayList<>();
+        Models.SubtitleTrack preferredExternal = matchingExternalSubtitle(tracks, languagePreference);
+        if (preferredExternal != null) {
+            addSubtitleCandidate(candidates, SubtitleCandidate.external(preferredExternal));
+        }
+
+        RuntimeTrack preferredRuntime = matchingRuntimeSubtitleTrack(file, languagePreference);
+        if (preferredRuntime != null) {
+            addSubtitleCandidate(candidates, SubtitleCandidate.runtime(preferredRuntime));
+        }
+
+        if (!prefersRuntimeTracks(file)) {
+            int preferredEmbeddedOrdinal = matchingEmbeddedSubtitleOrdinal(file, languagePreference);
+            if (preferredEmbeddedOrdinal >= 0) {
+                addSubtitleCandidate(candidates, SubtitleCandidate.embedded(preferredEmbeddedOrdinal));
+            }
+        }
+
+        Models.SubtitleTrack fallbackExternal = lastPlayableExternalSubtitle(tracks);
+        if (fallbackExternal != null) {
+            addSubtitleCandidate(candidates, SubtitleCandidate.external(fallbackExternal));
+        }
+
+        RuntimeTrack fallbackRuntime = lastPlayableRuntimeSubtitleTrack(file);
+        if (fallbackRuntime != null) {
+            addSubtitleCandidate(candidates, SubtitleCandidate.runtime(fallbackRuntime));
+        }
+
+        if (!prefersRuntimeTracks(file)) {
+            int fallbackEmbeddedOrdinal = lastPlayableEmbeddedSubtitleOrdinal(file);
+            if (fallbackEmbeddedOrdinal >= 0) {
+                addSubtitleCandidate(candidates, SubtitleCandidate.embedded(fallbackEmbeddedOrdinal));
+            }
+        }
+
+        if (shouldUseRuntimeSubtitleTracks(file)) {
+            for (int index = activeRuntimeSubtitleTracks.size() - 1; index >= 0; index--) {
+                RuntimeTrack track = activeRuntimeSubtitleTracks.get(index);
+                if (isPlayableRuntimeSubtitleForDefault(file, track)) {
+                    addSubtitleCandidate(candidates, SubtitleCandidate.runtime(track));
+                }
+            }
+        }
+
+        if (!prefersRuntimeTracks(file)) {
+            for (int index = file.subtitleStreams.size() - 1; index >= 0; index--) {
+                Models.VideoFileStream stream = file.subtitleStreams.get(index);
+                if (!isPlayableEmbeddedSubtitleForDefault(stream)) {
+                    continue;
+                }
+                addSubtitleCandidate(candidates, SubtitleCandidate.embedded(index));
+            }
+        }
+
+        for (int index = tracks.size() - 1; index >= 0; index--) {
+            Models.SubtitleTrack track = tracks.get(index);
+            if (!api.subtitleUrl(track, activePlaybackTicket).isEmpty()) {
+                addSubtitleCandidate(candidates, SubtitleCandidate.external(track));
+            }
+        }
+        return candidates;
+    }
+
+    private void addSubtitleCandidate(List<SubtitleCandidate> candidates, SubtitleCandidate candidate) {
+        for (SubtitleCandidate existing : candidates) {
+            if (existing.sameAs(candidate)) {
+                return;
+            }
+        }
+        candidates.add(candidate);
+    }
+
+    private void selectDefaultSubtitleCandidate(Models.VideoFile file, List<SubtitleCandidate> candidates, int index) {
+        if (screen != Screen.PLAYER || playerView == null || activePlaybackFile != file || index < 0 || index >= candidates.size()) {
+            return;
+        }
+
+        SubtitleCandidate candidate = candidates.get(index);
+        if (candidate.externalTrack != null && isExternalSubtitleSelected(candidate.externalTrack)) {
+            return;
+        }
+        if (candidate.runtimeTrack != null && isRuntimeSubtitleSelected(candidate.runtimeTrack)) {
+            return;
+        }
+        if (candidate.externalTrack == null && candidate.runtimeTrack == null && isEmbeddedSubtitleSelected(candidate.embeddedOrdinal)) {
+            return;
+        }
+        Runnable fallback = () -> selectDefaultSubtitleCandidate(file, candidates, index + 1);
+        if (candidate.externalTrack != null) {
+            selectExternalSubtitle(candidate.externalTrack, fallback);
+        } else if (candidate.runtimeTrack != null) {
+            selectRuntimeSubtitleTrack(file, candidate.runtimeTrack, fallback);
+        } else {
+            selectEmbeddedSubtitle(file, candidate.embeddedOrdinal, fallback);
+        }
     }
 
     private void startProgressUpdates(Models.VideoFile file) {
@@ -1908,6 +3106,7 @@ public final class MainActivity extends Activity {
         }
         activePlaybackFile = null;
         activePlaybackTicket = null;
+        activeHlsSessionId = null;
         playerLoadStartedAtMs = 0;
     }
 
@@ -1917,20 +3116,38 @@ public final class MainActivity extends Activity {
             duration = file.durationSeconds;
         }
         double position = resolvePlayerPosition(file, duration);
+        if (duration <= 0 && lastKnownPlaybackDurationSeconds > 0) {
+            duration = lastKnownPlaybackDurationSeconds;
+        }
+        if (position <= 0 && lastKnownPlaybackPositionSeconds > 0) {
+            position = lastKnownPlaybackPositionSeconds;
+        }
         if (position <= 0 || duration <= 0) {
             return;
         }
 
         double finalDuration = duration;
+        double finalPosition = position;
+        rememberPlaybackPosition(file, finalPosition, finalDuration);
         runAsync(
                 () -> {
-                    api.updatePlaybackProgress(file.id, position, finalDuration);
+                    api.updatePlaybackProgress(file.id, finalPosition, finalDuration);
                     return null;
                 },
                 ignored -> {
                 },
                 ignored -> {
                 });
+    }
+
+    private void rememberPlaybackPosition(Models.VideoFile file, double position, double duration) {
+        if (file == null || position <= 0 || !Double.isFinite(position)) {
+            return;
+        }
+        double safeDuration = duration > 0 && Double.isFinite(duration) ? duration : file.durationSeconds;
+        lastKnownPlaybackPositionSeconds = Math.max(0, position);
+        lastKnownPlaybackDurationSeconds = Math.max(0, safeDuration);
+        localPlaybackProgress.put(file.id, new PlaybackTimeline(lastKnownPlaybackPositionSeconds, lastKnownPlaybackDurationSeconds));
     }
 
     private void toggleLibraryItemWatched(Models.LibraryItem item) {
@@ -1996,10 +3213,13 @@ public final class MainActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        if (event.getAction() == KeyEvent.ACTION_DOWN && screen == Screen.PLAYER && playerView != null) {
-            if (handlePlayerKeyDown(event.getKeyCode(), event)) {
+        if (screen == Screen.PLAYER && playerView != null) {
+            if (handlePlayerKeyEvent(event)) {
                 return true;
             }
+        }
+        if (screen == Screen.HOME && !isSettingsOpen && handleHomeDpadKeyEvent(event)) {
+            return true;
         }
         return super.dispatchKeyEvent(event);
     }
@@ -2079,6 +3299,63 @@ public final class MainActivity extends Activity {
                 keyCode == KeyEvent.KEYCODE_ENTER;
     }
 
+    private boolean isDpadArrowKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+                keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
+                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT;
+    }
+
+    private int focusDirectionForKey(int keyCode) {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+            return View.FOCUS_UP;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+            return View.FOCUS_DOWN;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+            return View.FOCUS_LEFT;
+        }
+        return View.FOCUS_RIGHT;
+    }
+
+    private boolean handleHomeDpadKeyEvent(KeyEvent event) {
+        if (event == null || event.getAction() != KeyEvent.ACTION_DOWN || !isDpadArrowKey(event.getKeyCode())) {
+            return false;
+        }
+
+        View current = getCurrentFocus();
+        if (current instanceof EditText) {
+            return false;
+        }
+
+        if (current == null || !isDescendant(root, current)) {
+            requestFirstHomeFocus();
+            return true;
+        }
+
+        View next = current.focusSearch(focusDirectionForKey(event.getKeyCode()));
+        if (next == null || !isDescendant(root, next) || !next.isFocusable()) {
+            return true;
+        }
+
+        next.requestFocus();
+        return true;
+    }
+
+    private void requestFirstHomeFocus() {
+        ArrayList<View> focusables = root == null ? new ArrayList<>() : root.getFocusables(View.FOCUS_FORWARD);
+        for (View focusable : focusables) {
+            if (focusable != null && focusable.isShown() && focusable.isFocusable()) {
+                focusable.requestFocus();
+                return;
+            }
+        }
+        if (root != null) {
+            root.requestFocus();
+        }
+    }
+
     private boolean isDescendant(View parent, View child) {
         View current = child;
         while (current != null) {
@@ -2091,23 +3368,36 @@ public final class MainActivity extends Activity {
         return false;
     }
 
+    private boolean handlePlayerKeyEvent(KeyEvent event) {
+        if (event == null) {
+            return false;
+        }
+        int keyCode = event.getKeyCode();
+        if (event.getAction() == KeyEvent.ACTION_UP && isPlayerHorizontalSeekKey(keyCode)) {
+            return handlePlayerHorizontalKeyUp(keyCode);
+        }
+        if (event.getAction() != KeyEvent.ACTION_DOWN) {
+            return false;
+        }
+        return handlePlayerKeyDown(keyCode, event);
+    }
+
     private boolean handlePlayerKeyDown(int keyCode, KeyEvent event) {
+        if (playerMenuPanel != null) {
+            return false;
+        }
         boolean wasChromeHidden = playerChromeHidden;
         showPlayerChromeTemporarily();
-        if (isPlayerSeekKey(keyCode)) {
-            if (keyCode == KeyEvent.KEYCODE_MEDIA_REWIND ||
-                    keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ||
-                    event.getRepeatCount() > 0) {
+        if (isPlayerHorizontalSeekKey(keyCode)) {
+            return handlePlayerHorizontalKeyDown(keyCode, event, wasChromeHidden);
+        }
+        if (isPlayerMediaSeekKey(keyCode)) {
+            if (event.getRepeatCount() > 0) {
                 playerView.seek(playerSeekSeconds(keyCode));
                 return true;
             }
-            if (wasChromeHidden) {
-                if (playerPlayPauseButton != null) {
-                    playerPlayPauseButton.requestFocus();
-                }
-                return true;
-            }
-            return false;
+            playerView.seek(playerSeekSeconds(keyCode));
+            return true;
         }
         if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_SPACE) {
             togglePlayerPaused();
@@ -2130,10 +3420,133 @@ public final class MainActivity extends Activity {
         return false;
     }
 
-    private boolean isPlayerSeekKey(int keyCode) {
+    private boolean handlePlayerHorizontalKeyDown(int keyCode, KeyEvent event, boolean wasChromeHidden) {
+        int direction = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 1;
+        if (!playerHorizontalKeyDown || playerHorizontalKeyCode != keyCode) {
+            cancelPlayerSeekStarter();
+            playerHorizontalKeyDown = true;
+            playerHorizontalKeyCode = keyCode;
+            playerHorizontalKeyWasChromeHidden = wasChromeHidden;
+            playerSeekDirection = direction;
+            playerSeekStarter = () -> beginSmoothPlayerSeek(direction);
+            main.postDelayed(playerSeekStarter, ViewConfiguration.getLongPressTimeout());
+        }
+        if (event.getRepeatCount() > 0) {
+            beginSmoothPlayerSeek(direction);
+        }
+        return true;
+    }
+
+    private boolean handlePlayerHorizontalKeyUp(int keyCode) {
+        if (!playerHorizontalKeyDown || playerHorizontalKeyCode != keyCode) {
+            return false;
+        }
+
+        boolean wasLongPress = playerSeekLongPressActive;
+        boolean wasChromeHidden = playerHorizontalKeyWasChromeHidden;
+        stopSmoothPlayerSeek();
+        playerHorizontalKeyDown = false;
+        playerHorizontalKeyCode = 0;
+        playerSeekDirection = 0;
+        if (!wasLongPress) {
+            if (wasChromeHidden || !isDescendant(playerControlsPanel, getCurrentFocus())) {
+                if (playerPlayPauseButton != null) {
+                    playerPlayPauseButton.requestFocus();
+                }
+            } else {
+                movePlayerControlFocus(keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
+            }
+        }
+        return true;
+    }
+
+    private void beginSmoothPlayerSeek(int direction) {
+        cancelPlayerSeekStarter();
+        if (playerView == null || activePlaybackFile == null) {
+            return;
+        }
+        if (playerSeekLongPressActive) {
+            playerSeekDirection = direction < 0 ? -1 : 1;
+            return;
+        }
+        playerSeekLongPressActive = true;
+        playerSeekDirection = direction < 0 ? -1 : 1;
+        if (playerSeekPreviewPosition < 0) {
+            double duration = playerView.durationSeconds();
+            if (duration <= 0) {
+                duration = activePlaybackFile.durationSeconds;
+            }
+            playerSeekPreviewPosition = resolvePlayerPosition(activePlaybackFile, duration);
+        }
+        runSmoothPlayerSeekStep();
+    }
+
+    private void runSmoothPlayerSeekStep() {
+        if (!playerSeekLongPressActive || playerView == null || activePlaybackFile == null || playerSeekDirection == 0) {
+            return;
+        }
+        double duration = playerView.durationSeconds();
+        if (duration <= 0) {
+            duration = activePlaybackFile.durationSeconds;
+        }
+        double upperBound = duration > 0 ? duration : Math.max(0, playerSeekPreviewPosition + PLAYER_SEEK_STEP_SECONDS);
+        playerSeekPreviewPosition = Math.max(0, Math.min(upperBound, playerSeekPreviewPosition + playerSeekDirection * PLAYER_SEEK_STEP_SECONDS));
+        playerView.seekTo(playerSeekPreviewPosition);
+        updatePlayerUi(activePlaybackFile);
+        if (playerSeekRepeater != null) {
+            main.removeCallbacks(playerSeekRepeater);
+        }
+        playerSeekRepeater = this::runSmoothPlayerSeekStep;
+        main.postDelayed(playerSeekRepeater, PLAYER_SEEK_REPEAT_MS);
+    }
+
+    private void stopSmoothPlayerSeek() {
+        cancelPlayerSeekStarter();
+        if (playerSeekRepeater != null) {
+            main.removeCallbacks(playerSeekRepeater);
+            playerSeekRepeater = null;
+        }
+        playerSeekLongPressActive = false;
+        playerSeekPreviewPosition = -1;
+    }
+
+    private void cancelPlayerSeekStarter() {
+        if (playerSeekStarter != null) {
+            main.removeCallbacks(playerSeekStarter);
+            playerSeekStarter = null;
+        }
+    }
+
+    private void movePlayerControlFocus(int direction) {
+        View current = getCurrentFocus();
+        View next = null;
+        if (current == playerPlayPauseButton && direction == View.FOCUS_RIGHT) {
+            next = playerAudioButton;
+        } else if (current == playerAudioButton) {
+            next = direction == View.FOCUS_LEFT ? playerPlayPauseButton : playerSubtitleButton;
+        } else if (current == playerSubtitleButton && direction == View.FOCUS_LEFT) {
+            next = playerAudioButton;
+        }
+        if (next == null && current != null) {
+            next = current.focusSearch(direction);
+            if (!isDescendant(playerControlsPanel, next)) {
+                next = null;
+            }
+        }
+        if (next != null) {
+            next.requestFocus();
+        } else if (playerPlayPauseButton != null) {
+            playerPlayPauseButton.requestFocus();
+        }
+    }
+
+    private boolean isPlayerHorizontalSeekKey(int keyCode) {
         return keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
-                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
-                keyCode == KeyEvent.KEYCODE_MEDIA_REWIND ||
+                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT;
+    }
+
+    private boolean isPlayerMediaSeekKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_MEDIA_REWIND ||
                 keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD;
     }
 
@@ -2153,6 +3566,115 @@ public final class MainActivity extends Activity {
                 name.contains("4k") ||
                 name.contains("uhd") ||
                 name.contains("ultra hd");
+    }
+
+    private boolean shouldUseDirectPlayback(Models.VideoFile file) {
+        if (isIsoFile(file)) {
+            return false;
+        }
+        return highPerformanceDirectPlayback && (needsManagedColorPlayback(file) || isLikely4K(file));
+    }
+
+    private String initialPlaybackStatus(Models.VideoFile file) {
+        if (isIsoFile(file)) {
+            return "正在准备 ISO TV端解码";
+        }
+        if (shouldUseDirectPlayback(file)) {
+            return "正在准备高性能直出";
+        }
+        if (needsManagedColorPlayback(file) || isLikely4K(file)) {
+            return "正在准备兼容字幕播放";
+        }
+        return "正在准备安卓端色彩管理播放";
+    }
+
+    private String playbackStatusText(Models.VideoFile file, ResolvedPlayback playback) {
+        if (playback != null && playback.hlsSessionId != null && !playback.hlsSessionId.isEmpty()) {
+            return isIsoFile(file) ? "ISO TV端解码" : "服务端 HLS 兼容播放";
+        }
+        return activePlaybackStatusText(file);
+    }
+
+    private String activePlaybackStatusText(Models.VideoFile file) {
+        if (isActiveHlsPlayback()) {
+            return isIsoFile(file) ? "ISO TV端解码" : "服务端 HLS 兼容播放";
+        }
+        if (isIsoFile(file)) {
+            return "ISO TV端解码";
+        }
+        if (shouldUseDirectPlayback(file)) {
+            return "高性能直出";
+        }
+        if (needsManagedColorPlayback(file) || isLikely4K(file)) {
+            return "兼容字幕播放";
+        }
+        return "安卓端色彩管理播放";
+    }
+
+    private boolean needsManagedColorPlayback(Models.VideoFile file) {
+        return hasDolbyVisionHint(file) || hasHdrHint(file);
+    }
+
+    private boolean needsServerToneMappedPlayback(Models.VideoFile file) {
+        return false;
+    }
+
+    private boolean isActiveHlsPlayback() {
+        return activeHlsSessionId != null && !activeHlsSessionId.isEmpty();
+    }
+
+    private boolean usesAndroidSubtitleOverlay() {
+        return isActiveHlsPlayback() || (activeDirectPlayback && !isIsoFile(activePlaybackFile));
+    }
+
+    private boolean isIsoFile(Models.VideoFile file) {
+        if (file == null) {
+            return false;
+        }
+        return hasFileExtension(file.fileName, ".iso") ||
+                hasFileExtension(file.relativePath, ".iso") ||
+                "iso".equalsIgnoreCase(file.container == null ? "" : file.container.trim());
+    }
+
+    private boolean hasFileExtension(String value, String extension) {
+        return value != null && value.trim().toLowerCase(Locale.ROOT).endsWith(extension);
+    }
+
+    private boolean hasDolbyVisionHint(Models.VideoFile file) {
+        String value = playbackHintText(file);
+        Set<String> tokens = tokenizeSearchText(value);
+        String compact = value.replaceAll("[^a-z0-9]+", "");
+        return value.contains("dolby vision") ||
+                compact.contains("dolbyvision") ||
+                tokens.contains("dovi") ||
+                tokens.contains("dv") ||
+                tokens.contains("dvhe");
+    }
+
+    private boolean hasHdrHint(Models.VideoFile file) {
+        String value = playbackHintText(file);
+        Set<String> tokens = tokenizeSearchText(value);
+        return tokens.contains("hdr") ||
+                tokens.contains("hdr10") ||
+                tokens.contains("hdr10plus") ||
+                tokens.contains("hdr10+") ||
+                tokens.contains("hlg") ||
+                tokens.contains("pq") ||
+                tokens.contains("bt2020") ||
+                value.contains("bt.2020");
+    }
+
+    private String playbackHintText(Models.VideoFile file) {
+        if (file == null) {
+            return "";
+        }
+        return normalizeSearchText(Collections.singletonList(joinNonEmptyValues(
+                " ",
+                file.fileName,
+                file.relativePath,
+                file.label(),
+                file.videoCodec,
+                file.container)));
     }
 
     private void togglePlayerPaused() {
@@ -2254,6 +3776,9 @@ public final class MainActivity extends Activity {
     private void destroyPlayer() {
         stopPlayerChromeHide();
         stopSubtitleOverlayUpdates();
+        stopSmoothPlayerSeek();
+        stopActiveHlsSession();
+        RemoteIsoStreamServer.shared().clear();
         if (playerView != null) {
             closePlayerMenu(null);
             stopPlayerUiUpdates();
@@ -2266,7 +3791,10 @@ public final class MainActivity extends Activity {
         playerTotalTime = null;
         playerStatusText = null;
         playerSubtitleOverlay = null;
+        playerPgsSubtitleOverlay = null;
         playerPlayPauseButton = null;
+        playerAudioButton = null;
+        playerSubtitleButton = null;
         playerTopOverlay = null;
         playerControlsPanel = null;
         playerProgressFill = null;
@@ -2274,15 +3802,50 @@ public final class MainActivity extends Activity {
         playerProgressSegmentViews.clear();
         playerChromeHidden = false;
         playerPaused = false;
+        playerHorizontalKeyDown = false;
+        playerHorizontalKeyWasChromeHidden = false;
+        playerSeekLongPressActive = false;
+        playerHorizontalKeyCode = 0;
+        playerSeekDirection = 0;
+        playerSeekPreviewPosition = -1;
         activeDirectPlayback = false;
         activePlaybackQueue = Collections.emptyList();
         activePlaybackIndex = 0;
         advancingPlaybackPart = false;
         activeExternalSubtitles = Collections.emptyList();
+        activeRuntimeAudioTracks = Collections.emptyList();
+        activeRuntimeSubtitleTracks = Collections.emptyList();
         activeSubtitleCues = Collections.emptyList();
+        activePgsSubtitleCues = Collections.emptyList();
+        selectedAudioTrackOrdinal = -1;
+        selectedEmbeddedSubtitleOrdinal = -1;
+        selectedRuntimeAudioId = null;
+        selectedRuntimeSubtitleId = null;
+        selectedExternalSubtitleId = null;
+        pendingEmbeddedSubtitleOrdinal = -1;
+        pendingRuntimeSubtitleId = null;
+        pendingExternalSubtitleId = null;
+        subtitleLoadStartedAtMs = 0;
+        lastKnownPlaybackPositionSeconds = 0;
+        lastKnownPlaybackDurationSeconds = 0;
         root.setOnKeyListener(null);
         root.setFocusable(false);
         root.setFocusableInTouchMode(false);
+    }
+
+    private void stopActiveHlsSession() {
+        String sessionId = activeHlsSessionId;
+        activeHlsSessionId = null;
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+
+        io.execute(() -> {
+            try {
+                api.stopHlsSession(sessionId);
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     @Override
@@ -2349,8 +3912,8 @@ public final class MainActivity extends Activity {
         return Double.compare(a, b) * direction;
     }
 
-    private Double ratingValue(double value) {
-        return value > 0 && Double.isFinite(value) ? value : null;
+    private Double ratingValue(Double value) {
+        return value != null && value > 0 && Double.isFinite(value) ? value : null;
     }
 
     private Double yearValue(String releaseDate) {
@@ -2568,19 +4131,43 @@ public final class MainActivity extends Activity {
         ArrayList<Models.VideoFile> files = new ArrayList<>();
         for (Models.Season season : detail.seasons) {
             for (Models.Episode episode : season.episodes) {
-                if (episode.videoFile != null) {
-                    files.add(episode.videoFile.withEpisodeLabel(episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber)));
+                Models.VideoFile file = episodePlaybackFile(episode);
+                if (file != null) {
+                    files.add(file);
                 }
             }
         }
         return files;
     }
 
+    private Models.VideoFile episodePlaybackFile(Models.Episode episode) {
+        if (episode.videoFile == null) {
+            return null;
+        }
+        return episode.videoFile.withEpisodeLabel(episodeDisplayLabel(episode.seasonNumber, episode.episodeNumber));
+    }
+
     private boolean hasUnfinishedProgress(Models.VideoFile file) {
-        if (file == null || file.positionSeconds <= 5) {
+        double position = rememberedPositionSeconds(file);
+        if (file == null || position <= 5) {
             return false;
         }
-        return file.durationSeconds <= 0 || fileProgressPercent(file) < 95;
+        return rememberedDurationSeconds(file) <= 0 || fileProgressPercent(file) < 95;
+    }
+
+    private double playbackStartSeconds(Models.VideoFile file) {
+        double position = rememberedPositionSeconds(file);
+        double duration = rememberedDurationSeconds(file);
+        if (file == null || position <= 5) {
+            return 0;
+        }
+        if (isEffectivelyWatched(file)) {
+            return 0;
+        }
+        if (duration > 0 && position >= Math.max(0, duration - 10)) {
+            return 0;
+        }
+        return Math.max(0, position);
     }
 
     private boolean isEffectivelyWatched(Models.VideoFile file) {
@@ -2588,10 +4175,28 @@ public final class MainActivity extends Activity {
     }
 
     private int fileProgressPercent(Models.VideoFile file) {
-        if (file == null || file.durationSeconds <= 0 || file.positionSeconds <= 0) {
+        double duration = rememberedDurationSeconds(file);
+        double position = rememberedPositionSeconds(file);
+        if (file == null || duration <= 0 || position <= 0) {
             return 0;
         }
-        return Math.max(0, Math.min(100, (int) Math.round(Math.min(file.positionSeconds, file.durationSeconds) / file.durationSeconds * 100)));
+        return Math.max(0, Math.min(100, (int) Math.round(Math.min(position, duration) / duration * 100)));
+    }
+
+    private double rememberedPositionSeconds(Models.VideoFile file) {
+        if (file == null) {
+            return 0;
+        }
+        PlaybackTimeline remembered = localPlaybackProgress.get(file.id);
+        return remembered == null ? Math.max(0, file.positionSeconds) : Math.max(file.positionSeconds, remembered.positionSeconds);
+    }
+
+    private double rememberedDurationSeconds(Models.VideoFile file) {
+        if (file == null) {
+            return 0;
+        }
+        PlaybackTimeline remembered = localPlaybackProgress.get(file.id);
+        return remembered == null ? Math.max(0, file.durationSeconds) : Math.max(file.durationSeconds, remembered.durationSeconds);
     }
 
     private String watchedStatusLabel(Models.VideoFile file) {
@@ -2605,7 +4210,7 @@ public final class MainActivity extends Activity {
     }
 
     private String playButtonText(Models.VideoFile file) {
-        String action = file.positionSeconds > 5 ? "继续播放" : "开始播放";
+        String action = isEffectivelyWatched(file) ? "重新播放" : (file.positionSeconds > 5 ? "继续播放" : "开始播放");
         if (file.seasonNumber != null && file.episodeNumber != null) {
             return action + " " + episodeDisplayLabel(file.seasonNumber, file.episodeNumber);
         }
@@ -2682,37 +4287,44 @@ public final class MainActivity extends Activity {
 
     private String formatAudioTrack(Models.VideoFileStream track, int ordinal) {
         ArrayList<String> parts = new ArrayList<>();
-        parts.add("音轨 " + (ordinal + 1));
+        parts.add("音轨" + (ordinal + 1));
         parts.add(displayLanguage(track.language, track.title));
         String audioFormat = displayAudioFormat(track);
         if (!audioFormat.isEmpty()) {
             parts.add(audioFormat);
         }
-        if (track.title != null && !track.title.isEmpty()) {
-            parts.add(track.title);
-        }
-        if (track.isDefault) {
-            parts.add("默认");
+        return joinNonEmpty(parts, " · ");
+    }
+
+    private String formatRuntimeAudioTrack(RuntimeTrack track) {
+        ArrayList<String> parts = new ArrayList<>();
+        parts.add("音轨" + (track.ordinal + 1));
+        parts.add(displayLanguage(track.language, track.title));
+        String audioFormat = displayRuntimeAudioFormat(track);
+        if (!audioFormat.isEmpty()) {
+            parts.add(audioFormat);
         }
         return joinNonEmpty(parts, " · ");
     }
 
     private String formatSubtitleStream(Models.VideoFileStream stream, int ordinal) {
         ArrayList<String> parts = new ArrayList<>();
-        parts.add("内嵌字幕 " + (ordinal + 1));
-        parts.add(displayLanguage(stream.language, stream.title));
+        parts.add("字幕" + (ordinal + 1));
+        parts.add(displaySubtitleLanguage(stream));
         String subtitleFormat = displaySubtitleFormat(stream.codec);
         if (!subtitleFormat.isEmpty()) {
             parts.add(subtitleFormat);
         }
-        if (stream.title != null && !stream.title.isEmpty()) {
-            parts.add(stream.title);
-        }
-        if (stream.isDefault) {
-            parts.add("默认");
-        }
-        if (stream.isForced) {
-            parts.add("强制");
+        return joinNonEmpty(parts, " · ");
+    }
+
+    private String formatRuntimeSubtitleTrack(RuntimeTrack track) {
+        ArrayList<String> parts = new ArrayList<>();
+        parts.add("字幕" + (track.ordinal + 1));
+        parts.add(displayRuntimeSubtitleLanguage(track));
+        String subtitleFormat = displaySubtitleFormat(track.codec);
+        if (!subtitleFormat.isEmpty()) {
+            parts.add(subtitleFormat);
         }
         return joinNonEmpty(parts, " · ");
     }
@@ -2763,6 +4375,38 @@ public final class MainActivity extends Activity {
         return defaultTrack == null ? file.audioTracks.get(0) : defaultTrack;
     }
 
+    private RuntimeTrack resolvePreferredRuntimeAudioTrack(Models.VideoFile file, String preference) {
+        if (activeRuntimeAudioTracks.isEmpty()) {
+            return null;
+        }
+
+        RuntimeTrack defaultTrack = null;
+        for (RuntimeTrack track : activeRuntimeAudioTracks) {
+            if (defaultTrack == null && track.isDefault) {
+                defaultTrack = track;
+            }
+        }
+
+        String requestedLanguage = "smart".equalsIgnoreCase(preference)
+                ? resolveSmartAudioLanguage(file)
+                : preference;
+        if (requestedLanguage != null && !requestedLanguage.isEmpty()) {
+            for (RuntimeTrack track : activeRuntimeAudioTracks) {
+                ArrayList<String> values = new ArrayList<>();
+                values.add(track.language);
+                values.add(track.title);
+                values.add(track.codec);
+                values.add(track.channelLayout);
+                values.add(track.channels == null ? null : track.channels + "ch");
+                if (matchesLanguagePreference(values, requestedLanguage)) {
+                    return track;
+                }
+            }
+        }
+
+        return defaultTrack == null ? activeRuntimeAudioTracks.get(0) : defaultTrack;
+    }
+
     private Models.SubtitleTrack matchingExternalSubtitle(List<Models.SubtitleTrack> tracks, String preference) {
         for (Models.SubtitleTrack track : tracks) {
             if (api.subtitleUrl(track, activePlaybackTicket).isEmpty()) {
@@ -2779,8 +4423,9 @@ public final class MainActivity extends Activity {
         return null;
     }
 
-    private Models.SubtitleTrack firstPlayableExternalSubtitle(List<Models.SubtitleTrack> tracks) {
-        for (Models.SubtitleTrack track : tracks) {
+    private Models.SubtitleTrack lastPlayableExternalSubtitle(List<Models.SubtitleTrack> tracks) {
+        for (int index = tracks.size() - 1; index >= 0; index--) {
+            Models.SubtitleTrack track = tracks.get(index);
             if (!api.subtitleUrl(track, activePlaybackTicket).isEmpty()) {
                 return track;
             }
@@ -2788,34 +4433,90 @@ public final class MainActivity extends Activity {
         return null;
     }
 
-    private int preferredEmbeddedSubtitleOrdinal(Models.VideoFile file, String preference) {
-        int firstSubtitle = -1;
-        int firstDefaultSubtitle = -1;
-        int firstLanguageSubtitle = -1;
+    private RuntimeTrack matchingRuntimeSubtitleTrack(Models.VideoFile file, String preference) {
+        if (!shouldUseRuntimeSubtitleTracks(file)) {
+            return null;
+        }
+        for (RuntimeTrack track : activeRuntimeSubtitleTracks) {
+            if (!isPlayableRuntimeSubtitleForDefault(file, track)) {
+                continue;
+            }
+            ArrayList<String> values = new ArrayList<>();
+            values.add(track.language);
+            values.add(track.title);
+            values.add(track.codec);
+            if (matchesLanguagePreference(values, preference)) {
+                return track;
+            }
+        }
+        return null;
+    }
+
+    private RuntimeTrack lastPlayableRuntimeSubtitleTrack(Models.VideoFile file) {
+        if (!shouldUseRuntimeSubtitleTracks(file)) {
+            return null;
+        }
+        for (int index = activeRuntimeSubtitleTracks.size() - 1; index >= 0; index--) {
+            RuntimeTrack track = activeRuntimeSubtitleTracks.get(index);
+            if (isPlayableRuntimeSubtitleForDefault(file, track)) {
+                return track;
+            }
+        }
+        return null;
+    }
+
+    private String subtitleTrackKey(Models.SubtitleTrack track) {
+        if (track == null) {
+            return "";
+        }
+        String id = track.id == null ? "" : track.id;
+        if (!id.isEmpty()) {
+            return id;
+        }
+        return joinNonEmptyValues("|", track.fileName, track.webVttUrl, track.language, track.format);
+    }
+
+    private int matchingEmbeddedSubtitleOrdinal(Models.VideoFile file, String preference) {
         for (int index = 0; index < file.subtitleStreams.size(); index++) {
             Models.VideoFileStream stream = file.subtitleStreams.get(index);
-            if (firstSubtitle < 0) {
-                firstSubtitle = index;
-            }
-            if (firstDefaultSubtitle < 0 && stream.isDefault) {
-                firstDefaultSubtitle = index;
+            if (!isPlayableEmbeddedSubtitleForDefault(stream)) {
+                continue;
             }
             ArrayList<String> values = new ArrayList<>();
             values.add(stream.language);
             values.add(stream.title);
             values.add(stream.codec);
-            if (firstLanguageSubtitle < 0 && matchesLanguagePreference(values, preference)) {
-                firstLanguageSubtitle = index;
+            if (matchesLanguagePreference(values, preference)) {
+                return index;
             }
         }
+        return -1;
+    }
 
-        if (firstLanguageSubtitle >= 0) {
-            return firstLanguageSubtitle;
+    private int lastPlayableEmbeddedSubtitleOrdinal(Models.VideoFile file) {
+        for (int index = file.subtitleStreams.size() - 1; index >= 0; index--) {
+            if (isPlayableEmbeddedSubtitleForDefault(file.subtitleStreams.get(index))) {
+                return index;
+            }
         }
-        if (firstDefaultSubtitle >= 0) {
-            return firstDefaultSubtitle;
+        return -1;
+    }
+
+    private boolean isPlayableEmbeddedSubtitleForDefault(Models.VideoFileStream stream) {
+        if (activeDirectPlayback && !isIsoFile(activePlaybackFile)) {
+            return canUseEmbeddedSubtitleAsWebTrack(stream) || isPgsSubtitle(stream);
         }
-        return firstSubtitle;
+        return !(isActiveHlsPlayback() && !canUseEmbeddedSubtitleAsWebTrack(stream) && !isPgsSubtitle(stream));
+    }
+
+    private boolean isPlayableRuntimeSubtitleForDefault(Models.VideoFile file, RuntimeTrack track) {
+        if (track == null || isActiveHlsPlayback()) {
+            return false;
+        }
+        if (activeDirectPlayback && !isIsoFile(file)) {
+            return canUseEmbeddedSubtitleAsWebTrack(track) || isPgsSubtitle(track);
+        }
+        return true;
     }
 
     private String resolveSmartAudioLanguage(Models.VideoFile file) {
@@ -2983,7 +4684,95 @@ public final class MainActivity extends Activity {
         return language;
     }
 
+    private String displaySubtitleLanguage(Models.VideoFileStream stream) {
+        ArrayList<String> values = new ArrayList<>();
+        values.add(stream.language);
+        values.add(stream.title);
+        String text = normalizeSearchText(values);
+        Set<String> tokens = tokenizeSearchText(text);
+        boolean chinese = hasChineseLanguageHint(text, tokens);
+        boolean japanese = hasJapaneseLanguageHint(text, tokens);
+        if (chinese && japanese) {
+            return "中日";
+        }
+        if (chinese) {
+            return "中文";
+        }
+        if (japanese) {
+            return "日语";
+        }
+        return displayLanguage(stream.language, stream.title);
+    }
+
+    private String displayRuntimeSubtitleLanguage(RuntimeTrack track) {
+        ArrayList<String> values = new ArrayList<>();
+        values.add(track.language);
+        values.add(track.title);
+        String text = normalizeSearchText(values);
+        Set<String> tokens = tokenizeSearchText(text);
+        boolean chinese = hasChineseLanguageHint(text, tokens);
+        boolean japanese = hasJapaneseLanguageHint(text, tokens);
+        if (chinese && japanese) {
+            return "中日";
+        }
+        if (chinese) {
+            return "中文";
+        }
+        if (japanese) {
+            return "日语";
+        }
+        return displayLanguage(track.language, track.title);
+    }
+
+    private boolean hasChineseLanguageHint(String text, Set<String> tokens) {
+        return tokens.contains("zh") ||
+                tokens.contains("zho") ||
+                tokens.contains("chi") ||
+                tokens.contains("chs") ||
+                tokens.contains("cht") ||
+                tokens.contains("cmn") ||
+                tokens.contains("yue") ||
+                tokens.contains("cn") ||
+                tokens.contains("chinese") ||
+                text.contains("中文") ||
+                text.contains("国语") ||
+                text.contains("國語") ||
+                text.contains("普通话") ||
+                text.contains("普通話") ||
+                text.contains("粤语") ||
+                text.contains("粵語") ||
+                text.contains("简体") ||
+                text.contains("簡體") ||
+                text.contains("繁体") ||
+                text.contains("繁體");
+    }
+
+    private boolean hasJapaneseLanguageHint(String text, Set<String> tokens) {
+        return tokens.contains("ja") ||
+                tokens.contains("jp") ||
+                tokens.contains("jpn") ||
+                tokens.contains("japanese") ||
+                text.contains("日本語") ||
+                text.contains("日语") ||
+                text.contains("日語") ||
+                text.contains("日文") ||
+                containsJapaneseKana(text);
+    }
+
     private String displayAudioFormat(Models.VideoFileStream track) {
+        ArrayList<String> parts = new ArrayList<>();
+        String codec = displayAudioCodec(track.codec);
+        if (!codec.isEmpty()) {
+            parts.add(codec);
+        }
+        String channels = displayChannels(track);
+        if (!channels.isEmpty()) {
+            parts.add(channels);
+        }
+        return joinNonEmpty(parts, " ");
+    }
+
+    private String displayRuntimeAudioFormat(RuntimeTrack track) {
         ArrayList<String> parts = new ArrayList<>();
         String codec = displayAudioCodec(track.codec);
         if (!codec.isEmpty()) {
@@ -3065,6 +4854,40 @@ public final class MainActivity extends Activity {
         return track.channels + "ch";
     }
 
+    private String displayChannels(RuntimeTrack track) {
+        if (track.channelLayout != null && !track.channelLayout.isEmpty()) {
+            String layout = track.channelLayout.trim().toLowerCase(Locale.ROOT);
+            if (layout.equals("7.1") || layout.contains("7.1")) {
+                return "7.1";
+            }
+            if (layout.equals("5.1") || layout.contains("5.1")) {
+                return "5.1";
+            }
+            if (layout.equals("stereo")) {
+                return "2.0";
+            }
+            if (layout.equals("mono")) {
+                return "1.0";
+            }
+        }
+        if (track.channels == null || track.channels <= 0) {
+            return "";
+        }
+        if (track.channels == 8) {
+            return "7.1";
+        }
+        if (track.channels == 6) {
+            return "5.1";
+        }
+        if (track.channels == 2) {
+            return "2.0";
+        }
+        if (track.channels == 1) {
+            return "1.0";
+        }
+        return track.channels + "ch";
+    }
+
     private String displaySubtitleFormat(String format) {
         String value = format == null ? "" : format.trim().toLowerCase(Locale.ROOT).replace('_', '-');
         if (value.isEmpty()) {
@@ -3102,6 +4925,34 @@ public final class MainActivity extends Activity {
                 codec.equals("text");
     }
 
+    private boolean canUseEmbeddedSubtitleAsWebTrack(RuntimeTrack track) {
+        String codec = track.codec == null ? "" : track.codec.trim().toLowerCase(Locale.ROOT);
+        return codec.equals("ass") ||
+                codec.equals("ssa") ||
+                codec.equals("subrip") ||
+                codec.equals("srt") ||
+                codec.equals("webvtt") ||
+                codec.equals("mov_text") ||
+                codec.equals("mov-text") ||
+                codec.equals("text");
+    }
+
+    private boolean isPgsSubtitle(Models.VideoFileStream stream) {
+        String codec = stream.codec == null ? "" : stream.codec.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        return codec.equals("hdmv-pgs-subtitle") ||
+                codec.equals("pgssub") ||
+                codec.equals("pgs") ||
+                codec.equals("sup");
+    }
+
+    private boolean isPgsSubtitle(RuntimeTrack track) {
+        String codec = track.codec == null ? "" : track.codec.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        return codec.equals("hdmv-pgs-subtitle") ||
+                codec.equals("pgssub") ||
+                codec.equals("pgs") ||
+                codec.equals("sup");
+    }
+
     private boolean isChineseSubtitle(Models.VideoFileStream stream) {
         String value = ((stream.language == null ? "" : stream.language) + " " + (stream.title == null ? "" : stream.title)).toLowerCase(Locale.ROOT);
         return value.contains("zh") ||
@@ -3122,8 +4973,140 @@ public final class MainActivity extends Activity {
         return releaseDate == null || releaseDate.length() < 4 ? null : releaseDate.substring(0, 4);
     }
 
-    private String ratingText(double voteAverage) {
-        return voteAverage > 0 && Double.isFinite(voteAverage) ? String.format(Locale.CHINA, "%.1f", voteAverage) : null;
+    private String ratingText(Double voteAverage) {
+        return voteAverage != null && voteAverage > 0 && Double.isFinite(voteAverage) ? String.format(Locale.CHINA, "%.1f", voteAverage) : null;
+    }
+
+    private String detailOverviewText(Models.LibraryDetail detail) {
+        if (detail == null) {
+            return "";
+        }
+        if (detail.overview != null && !detail.overview.trim().isEmpty()) {
+            return detail.overview.trim();
+        }
+        if (detail.douban != null && detail.douban.summary != null && !detail.douban.summary.trim().isEmpty()) {
+            return detail.douban.summary.trim();
+        }
+        return "";
+    }
+
+    private List<String> doubanMetadataParts(Models.DoubanMetadata douban) {
+        if (douban == null) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> parts = new ArrayList<>();
+        for (String item : parseDoubanMetadataList(douban.genres)) {
+            if (parts.size() >= 3) {
+                break;
+            }
+            parts.add(item);
+        }
+        for (String item : parseDoubanMetadataList(douban.countries)) {
+            if (parts.size() >= 5) {
+                break;
+            }
+            parts.add(item);
+        }
+        return parts;
+    }
+
+    private List<String> parseDoubanMetadataList(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        String normalized = value.trim();
+        if (normalized.startsWith("[") && normalized.endsWith("]")) {
+            normalized = normalized.substring(1, normalized.length() - 1);
+        }
+        normalized = normalized
+                .replace("\"", "")
+                .replace("'", "")
+                .replace("，", ",")
+                .replace("/", ",")
+                .replace("、", ",");
+        ArrayList<String> result = new ArrayList<>();
+        for (String raw : normalized.split(",")) {
+            String part = raw.trim();
+            if (!part.isEmpty() && !result.contains(part)) {
+                result.add(part);
+            }
+        }
+        return result;
+    }
+
+    private TextView subtitleCacheStatusView(Models.VideoFile file) {
+        Models.SubtitleCacheStatus status = file == null ? null : subtitleCacheStatusCache.get(file.id);
+        String label;
+        int color;
+        if (status == null) {
+            if (!hasPrewarmableSubtitle(file)) {
+                return null;
+            }
+            label = "字幕缓存 检测中";
+            color = COLOR_SUBTLE;
+        } else if (status.subtitleTotal <= 0) {
+            return null;
+        } else if (status.subtitleCached >= status.subtitleTotal) {
+            label = "字幕已缓存 " + status.subtitleCached + "/" + status.subtitleTotal;
+            color = Color.rgb(0, 166, 41);
+        } else {
+            label = "字幕未全缓存 " + status.subtitleCached + "/" + status.subtitleTotal;
+            color = Color.rgb(217, 119, 6);
+        }
+        return metaPill(label, color);
+    }
+
+    private void refreshSubtitleCacheStatus(Models.LibraryDetail detail, Models.VideoFile file) {
+        if (detail == null || file == null || file.id == null || file.id.isEmpty()) {
+            return;
+        }
+        if (subtitleCacheStatusCache.containsKey(file.id)) {
+            return;
+        }
+        runAsync(
+                () -> api.getSubtitleCacheStatus(file.id),
+                status -> {
+                    subtitleCacheStatusCache.put(file.id, status);
+                    if (screen == Screen.DETAIL && currentDetail != null && currentDetail.id.equals(detail.id)) {
+                        renderDetail(currentDetail);
+                    }
+                },
+                error -> {
+                });
+    }
+
+    private boolean hasPrewarmableSubtitle(Models.VideoFile file) {
+        if (file == null) {
+            return false;
+        }
+        for (Models.VideoFileStream stream : file.subtitleStreams) {
+            if (isPrewarmableSubtitleCodec(stream.codec)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isPrewarmableSubtitleCodec(String codec) {
+        if (codec == null) {
+            return false;
+        }
+        String normalized = codec.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        return isPgsSubtitleCodec(codec) ||
+                normalized.equals("subrip") ||
+                normalized.equals("srt") ||
+                normalized.equals("webvtt") ||
+                normalized.equals("vtt") ||
+                normalized.equals("ass") ||
+                normalized.equals("ssa");
+    }
+
+    private boolean isPgsSubtitleCodec(String codec) {
+        if (codec == null) {
+            return false;
+        }
+        String normalized = codec.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        return normalized.equals("hdmv-pgs-subtitle") || normalized.equals("pgs") || normalized.equals("pgssub") || normalized.equals("sup");
     }
 
     private String formatPlaybackTime(double seconds) {
@@ -3143,16 +5126,16 @@ public final class MainActivity extends Activity {
                 : new PlaybackTimeline(file == null ? 0 : Math.max(0, file.positionSeconds), file == null ? 0 : Math.max(0, file.durationSeconds));
         LinearLayout timeline = new LinearLayout(this);
         timeline.setGravity(Gravity.CENTER_VERTICAL);
-        TextView elapsed = text(formatPlaybackTime(summary.positionSeconds), 12, Typeface.BOLD, COLOR_MUTED);
+        TextView elapsed = text(formatPlaybackTime(summary.positionSeconds), ssp(12), Typeface.BOLD, COLOR_MUTED);
         elapsed.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        timeline.addView(elapsed, new LinearLayout.LayoutParams(dp(58), ViewGroup.LayoutParams.MATCH_PARENT));
+        timeline.addView(elapsed, new LinearLayout.LayoutParams(sdp(64), ViewGroup.LayoutParams.MATCH_PARENT));
         int percent = summary.durationSeconds > 0
                 ? Math.max(0, Math.min(100, (int) Math.round(Math.min(summary.positionSeconds, summary.durationSeconds) / summary.durationSeconds * 100)))
                 : fileProgressPercent(file);
-        timeline.addView(progressBar(percent, dp(278), dp(6)), margin(new LinearLayout.LayoutParams(dp(278), dp(6)), dp(8), 0, dp(8), 0));
-        TextView total = text(summary.durationSeconds > 0 ? formatPlaybackTime(summary.durationSeconds) : "--:--", 12, Typeface.BOLD, COLOR_MUTED);
+        timeline.addView(progressBar(percent, sdp(308), sdp(6)), margin(new LinearLayout.LayoutParams(sdp(308), sdp(6)), sdp(10), 0, sdp(10), 0));
+        TextView total = text(summary.durationSeconds > 0 ? formatPlaybackTime(summary.durationSeconds) : "--:--", ssp(12), Typeface.BOLD, COLOR_MUTED);
         total.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
-        timeline.addView(total, new LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.MATCH_PARENT));
+        timeline.addView(total, new LinearLayout.LayoutParams(sdp(78), ViewGroup.LayoutParams.MATCH_PARENT));
         return timeline;
     }
 
@@ -3182,15 +5165,46 @@ public final class MainActivity extends Activity {
 
     private GridLayout posterGrid() {
         GridLayout grid = new GridLayout(this);
-        grid.setColumnCount(5);
+        grid.setColumnCount(HOME_POSTER_COLUMNS);
+        grid.setClipChildren(false);
+        grid.setClipToPadding(false);
+        int sideInset = homePosterGridSideInsetPx();
+        int contentWidth = Math.max(1, getResources().getDisplayMetrics().widthPixels - sdp(HOME_PAGE_HORIZONTAL_PADDING_DP) * 2);
+        int rowWidth = HOME_POSTER_COLUMNS * (homePosterCardWidthPx() + sdp(HOME_POSTER_CARD_MARGIN_DP) * 2);
+        grid.setPadding(sideInset, 0, Math.max(0, contentWidth - rowWidth - sideInset), 0);
+        grid.setLayoutParams(matchWidth());
         return grid;
     }
 
+    private int homePosterCardWidthPx() {
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int contentWidth = Math.max(1, screenWidth - sdp(HOME_PAGE_HORIZONTAL_PADDING_DP) * 2);
+        int totalHorizontalMargins = HOME_POSTER_COLUMNS * sdp(HOME_POSTER_CARD_MARGIN_DP) * 2;
+        return Math.max(1, (contentWidth - totalHorizontalMargins) / HOME_POSTER_COLUMNS);
+    }
+
+    private int homePosterGridSideInsetPx() {
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int contentWidth = Math.max(1, screenWidth - sdp(HOME_PAGE_HORIZONTAL_PADDING_DP) * 2);
+        int rowWidth = HOME_POSTER_COLUMNS * (homePosterCardWidthPx() + sdp(HOME_POSTER_CARD_MARGIN_DP) * 2);
+        return Math.max(0, (contentWidth - rowWidth) / 2);
+    }
+
+    private int detailEpisodeColumnCount() {
+        int availableWidth = Math.max(1, getResources().getDisplayMetrics().widthPixels - sdp(104));
+        int itemWidth = sdp(EPISODE_CARD_WIDTH_DP) + sdp(22);
+        return Math.max(4, Math.min(6, availableWidth / Math.max(1, itemWidth)));
+    }
+
     private void loadPoster(ImageView image, String posterAssetId) {
+        loadPoster(image, posterAssetId, 0, 0);
+    }
+
+    private void loadPoster(ImageView image, String posterAssetId, int targetWidth, int targetHeight) {
         if (posterAssetId != null) {
-            imageLoader.load(image, api.posterUrl(posterAssetId), api.cookieHeader());
+            imageLoader.load(image, api.posterUrl(posterAssetId), api.cookieHeader(), targetWidth, targetHeight);
         } else {
-            imageLoader.load(image, null, api.cookieHeader());
+            imageLoader.load(image, null, api.cookieHeader(), targetWidth, targetHeight);
         }
     }
 
@@ -3225,18 +5239,18 @@ public final class MainActivity extends Activity {
 
     private Button compactButton(String label) {
         Button button = button(label);
-        button.setTextSize(15);
+        button.setTextSize(ssp(15));
         return button;
     }
 
     private Button playerButton(String label) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(14);
+        button.setTextSize(ssp(14));
         button.setAllCaps(false);
         button.setTextColor(Color.WHITE);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setPadding(sdp(10), 0, sdp(10), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -3245,13 +5259,13 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.argb(96, 255, 255, 255), Color.argb(90, 255, 255, 255), dp(2), dp(24)));
+        button.setBackground(rounded(Color.argb(96, 255, 255, 255), Color.argb(90, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.04f : 1f).scaleY(hasFocus ? 1.04f : 1f).setDuration(90).start();
+            animateFocusScale(focusedView, hasFocus);
             button.setTextColor(hasFocus ? COLOR_FOCUS : Color.WHITE);
-            focusedView.setBackground(rounded(Color.argb(hasFocus ? 126 : 96, 255, 255, 255), Color.argb(90, 255, 255, 255), dp(2), dp(24)));
+            focusedView.setBackground(rounded(Color.argb(hasFocus ? 126 : 96, 255, 255, 255), Color.argb(90, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
             focusedView.setElevation(0);
         });
         return button;
@@ -3262,30 +5276,30 @@ public final class MainActivity extends Activity {
         button.setImageResource(iconResId);
         button.setColorFilter(Color.WHITE);
         button.setScaleType(ImageView.ScaleType.CENTER);
-        button.setPadding(dp(12), dp(10), dp(12), dp(10));
+        button.setPadding(sdp(12), sdp(10), sdp(12), sdp(10));
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.argb(96, 255, 255, 255), Color.argb(90, 255, 255, 255), dp(2), dp(24)));
+        button.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.04f : 1f).scaleY(hasFocus ? 1.04f : 1f).setDuration(90).start();
+            animateFocusScale(focusedView, hasFocus);
             button.setColorFilter(hasFocus ? COLOR_FOCUS : Color.WHITE);
-            focusedView.setBackground(rounded(Color.argb(hasFocus ? 126 : 96, 255, 255, 255), Color.argb(90, 255, 255, 255), dp(2), dp(24)));
+            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(24)));
             focusedView.setElevation(0);
         });
         return button;
     }
 
-    private Button playerMenuButton(String label) {
+    private Button playerMenuButton(String label, boolean selected) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(14);
+        button.setTextSize(ssp(14));
         button.setAllCaps(false);
-        button.setTextColor(Color.WHITE);
+        button.setTextColor(selected ? COLOR_ACCENT : Color.WHITE);
         button.setGravity(Gravity.CENTER_VERTICAL);
-        button.setPadding(dp(14), 0, dp(14), 0);
+        button.setPadding(sdp(14), 0, sdp(14), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -3296,12 +5310,13 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(Color.argb(72, 255, 255, 255), Color.argb(80, 255, 255, 255), dp(1), dp(10)));
+        button.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            button.setTextColor(hasFocus ? COLOR_FOCUS : Color.WHITE);
-            focusedView.setBackground(rounded(Color.argb(hasFocus ? 126 : 72, 255, 255, 255), Color.argb(90, 255, 255, 255), dp(1), dp(10)));
+            animateFocusScale(focusedView, hasFocus);
+            button.setTextColor(hasFocus ? COLOR_FOCUS : (selected ? COLOR_ACCENT : Color.WHITE));
+            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.argb(180, 255, 255, 255), FOCUS_STROKE_PX, sdp(10)));
             focusedView.setElevation(0);
         });
         return button;
@@ -3314,11 +5329,11 @@ public final class MainActivity extends Activity {
     private Button button(String label, boolean active) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(17);
+        button.setTextSize(ssp(17));
         button.setAllCaps(false);
         button.setTextColor(active ? COLOR_FOCUS : COLOR_TEXT);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(dp(12), 0, dp(12), 0);
+        button.setPadding(sdp(12), 0, sdp(12), 0);
         button.setMinWidth(0);
         button.setMinHeight(0);
         button.setMinimumWidth(0);
@@ -3327,50 +5342,66 @@ public final class MainActivity extends Activity {
         button.setBackgroundTintList(null);
         button.setStateListAnimator(null);
         button.setClipToOutline(true);
-        button.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), dp(10)));
+        button.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
         button.setFocusable(true);
         button.setFocusableInTouchMode(false);
         applyButtonFocus(button, active);
         return button;
     }
 
+    private Button settingsOptionButton(String label, boolean selected) {
+        Button button = button((selected ? "✓ " : "  ") + label, false);
+        button.setGravity(Gravity.CENTER_VERTICAL);
+        button.setTextColor(COLOR_TEXT);
+        applySettingsOptionFocus(button);
+        return button;
+    }
+
     private TextView title(String value) {
-        return text(value, 32, Typeface.BOLD, COLOR_TEXT);
+        return text(value, ssp(32), Typeface.BOLD, COLOR_TEXT);
     }
 
     private TextView sectionTitle(String value) {
-        TextView title = text(value, 24, Typeface.BOLD, COLOR_TEXT);
-        title.setPadding(0, dp(10), 0, dp(14));
+        TextView title = text(value, ssp(24), Typeface.BOLD, COLOR_TEXT);
+        title.setPadding(0, sdp(10), 0, sdp(16));
         return title;
     }
 
     private TextView body(String value) {
-        TextView text = text(value, 16, Typeface.NORMAL, COLOR_MUTED);
-        text.setPadding(0, dp(8), 0, dp(18));
+        TextView text = text(value, ssp(16), Typeface.NORMAL, COLOR_MUTED);
+        text.setPadding(0, sdp(8), 0, sdp(18));
         return text;
     }
 
     private TextView emptyText(String value) {
-        TextView text = text(value, 16, Typeface.NORMAL, COLOR_SUBTLE);
-        text.setPadding(0, 0, 0, dp(24));
+        TextView text = text(value, ssp(16), Typeface.NORMAL, COLOR_SUBTLE);
+        text.setPadding(0, 0, 0, sdp(28));
         return text;
     }
 
     private TextView metaPill(String value) {
-        TextView pill = text(value, 14, Typeface.BOLD, COLOR_MUTED);
+        return metaPill(value, COLOR_MUTED);
+    }
+
+    private TextView metaPill(String value, int textColor) {
+        TextView pill = text(value, ssp(14), Typeface.BOLD, textColor);
         pill.setGravity(Gravity.CENTER);
-        pill.setPadding(dp(12), 0, dp(12), 0);
-        pill.setBackground(rounded(Color.argb(184, 255, 255, 255), COLOR_BORDER, dp(1), dp(999)));
-        pill.setMinHeight(dp(32));
+        pill.setPadding(sdp(13), 0, sdp(13), 0);
+        pill.setBackground(rounded(Color.argb(184, 255, 255, 255), COLOR_BORDER, dp(1), sdp(999)));
+        pill.setMinHeight(sdp(32));
         return pill;
     }
 
     private TextView badge(String value) {
-        TextView badge = text(value, 13, Typeface.BOLD, COLOR_TEXT);
+        return badge(value, COLOR_TEXT);
+    }
+
+    private TextView badge(String value, int textColor) {
+        TextView badge = text(value, ssp(13), Typeface.BOLD, textColor);
         badge.setGravity(Gravity.CENTER);
-        badge.setPadding(dp(8), 0, dp(8), 0);
-        badge.setMinHeight(dp(30));
-        badge.setBackground(rounded(Color.argb(230, 255, 255, 255), Color.TRANSPARENT, 0, dp(6)));
+        badge.setPadding(sdp(8), 0, sdp(8), 0);
+        badge.setMinHeight(sdp(30));
+        badge.setBackground(rounded(Color.argb(230, 255, 255, 255), Color.TRANSPARENT, 0, sdp(7)));
         return badge;
     }
 
@@ -3386,43 +5417,82 @@ public final class MainActivity extends Activity {
 
     private void applyButtonFocus(Button button, boolean active) {
         button.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.035f : 1f).scaleY(hasFocus ? 1.035f : 1f).setDuration(90).start();
+            animateFocusScale(focusedView, hasFocus);
             button.setTextColor(hasFocus || active ? COLOR_FOCUS : COLOR_TEXT);
-            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), dp(10)));
+            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
+            focusedView.setElevation(0);
+        });
+    }
+
+    private void applySettingsOptionFocus(Button button) {
+        button.setOnFocusChangeListener((focusedView, hasFocus) -> {
+            animateFocusScale(focusedView, hasFocus);
+            button.setTextColor(COLOR_TEXT);
+            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, FOCUS_STROKE_PX, sdp(10)));
             focusedView.setElevation(0);
         });
     }
 
     private void applyInputFocus(EditText editText) {
         editText.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), dp(8)));
+            focusedView.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, dp(2), sdp(8)));
             focusedView.setElevation(0);
         });
     }
 
     private void applyCardFocus(View view) {
+        applyCardFocus(view, null);
+    }
+
+    private void applyCardFocus(View view, Runnable onFocused) {
         view.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.035f : 1f).scaleY(hasFocus ? 1.035f : 1f).setDuration(90).start();
-            focusedView.setBackground(rounded(hasFocus ? COLOR_SURFACE : Color.TRANSPARENT, hasFocus ? COLOR_FOCUS : Color.TRANSPARENT, hasFocus ? dp(2) : 0, dp(8)));
-            focusedView.setElevation(hasFocus ? dp(10) : 0);
+            animateFocusScale(focusedView, hasFocus);
+            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, sdp(8)));
+            focusedView.setElevation(hasFocus ? sdp(10) : 0);
+            if (hasFocus && onFocused != null) {
+                onFocused.run();
+            }
+        });
+    }
+
+    private void applyEpisodeStillFocus(View card, FrameLayout stillFrame, boolean showDetails, Button playButton, Models.VideoFile playbackFile) {
+        card.setOnFocusChangeListener((focusedView, hasFocus) -> {
+            focusedView.animate().scaleX(1f).scaleY(1f).setDuration(0).start();
+            animateFocusScale(stillFrame, hasFocus);
+            focusedView.setBackground(rounded(Color.TRANSPARENT, Color.TRANSPARENT, 0, sdp(8)));
+            focusedView.setElevation(hasFocus ? sdp(10) : 0);
+            stillFrame.setBackground(rounded(COLOR_SURFACE_ALT, hasFocus ? COLOR_FOCUS : COLOR_BORDER, FOCUS_STROKE_PX, sdp(12)));
+            stillFrame.setElevation(hasFocus ? sdp(10) : 0);
+            if (hasFocus && playButton != null && playbackFile != null) {
+                playButton.setText(playButtonText(playbackFile));
+                playButton.setTag(playbackFile);
+            }
         });
     }
 
     private void applyBadgeFocus(TextView badge) {
         badge.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.08f : 1f).scaleY(hasFocus ? 1.08f : 1f).setDuration(90).start();
-            focusedView.setBackground(rounded(Color.argb(235, 255, 255, 255), hasFocus ? COLOR_FOCUS : Color.TRANSPARENT, hasFocus ? dp(2) : 0, dp(6)));
-            focusedView.setElevation(hasFocus ? dp(8) : 0);
+            animateFocusScale(focusedView, hasFocus);
+            focusedView.setBackground(rounded(Color.argb(235, 255, 255, 255), Color.TRANSPARENT, 0, sdp(7)));
+            focusedView.setElevation(hasFocus ? sdp(8) : 0);
         });
     }
 
     private void applyWatchedIconFocus(TextView icon, boolean watched) {
         icon.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            focusedView.animate().scaleX(hasFocus ? 1.18f : 1f).scaleY(hasFocus ? 1.18f : 1f).setDuration(90).start();
+            animateFocusScale(focusedView, hasFocus);
             icon.setTextColor(hasFocus || watched ? COLOR_FOCUS : COLOR_SUBTLE);
             focusedView.setBackgroundColor(Color.TRANSPARENT);
             focusedView.setElevation(0);
         });
+    }
+
+    private void animateFocusScale(View view, boolean hasFocus) {
+        view.animate()
+                .scaleX(hasFocus ? FOCUS_SCALE : 1f)
+                .scaleY(hasFocus ? FOCUS_SCALE : 1f)
+                .setDuration(FOCUS_ANIMATION_MS)
+                .start();
     }
 
     private void applyAppBackground() {
@@ -3469,6 +5539,36 @@ public final class MainActivity extends Activity {
 
     private int dp(float value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private int sdp(float value) {
+        return Math.round(dp(value) * tvScale());
+    }
+
+    private int ssp(int value) {
+        return Math.round(value * textScale());
+    }
+
+    private float tvScale() {
+        int width = getResources().getDisplayMetrics().widthPixels;
+        if (width >= 3600) {
+            return 1.18f;
+        }
+        if (width >= 2500) {
+            return 1.10f;
+        }
+        return 1f;
+    }
+
+    private float textScale() {
+        int width = getResources().getDisplayMetrics().widthPixels;
+        if (width >= 3600) {
+            return 1.12f;
+        }
+        if (width >= 2500) {
+            return 1.06f;
+        }
+        return 1f;
     }
 
     private String join(List<String> values, String separator) {
@@ -3522,22 +5622,138 @@ public final class MainActivity extends Activity {
         final String ticket;
         final String cookieHeader;
         final Models.AppSettings settings;
+        final Models.PlaybackFileStreams streams;
+        final String hlsSessionId;
+        final String reason;
+        final boolean isoDevicePlayback;
 
-        ResolvedPlayback(String url, String ticket, String cookieHeader, Models.AppSettings settings) {
+        ResolvedPlayback(String url, String ticket, String cookieHeader, Models.AppSettings settings, Models.PlaybackFileStreams streams, String hlsSessionId, String reason) {
+            this(url, ticket, cookieHeader, settings, streams, hlsSessionId, reason, false);
+        }
+
+        ResolvedPlayback(String url, String ticket, String cookieHeader, Models.AppSettings settings, Models.PlaybackFileStreams streams, String hlsSessionId, String reason, boolean isoDevicePlayback) {
             this.url = url;
             this.ticket = ticket == null ? "" : ticket;
             this.cookieHeader = cookieHeader == null ? "" : cookieHeader;
             this.settings = settings == null ? Models.AppSettings.defaults() : settings;
+            this.streams = streams;
+            this.hlsSessionId = hlsSessionId == null ? "" : hlsSessionId;
+            this.reason = reason == null ? "" : reason;
+            this.isoDevicePlayback = isoDevicePlayback;
+        }
+    }
+
+    private static final class SubtitleCandidate {
+        final Models.SubtitleTrack externalTrack;
+        final RuntimeTrack runtimeTrack;
+        final int embeddedOrdinal;
+        final String externalKey;
+        final String runtimeKey;
+
+        private SubtitleCandidate(Models.SubtitleTrack externalTrack, RuntimeTrack runtimeTrack, int embeddedOrdinal) {
+            this.externalTrack = externalTrack;
+            this.runtimeTrack = runtimeTrack;
+            this.embeddedOrdinal = embeddedOrdinal;
+            this.externalKey = externalTrack == null ? "" : joinStatic("|", externalTrack.id, externalTrack.fileName, externalTrack.webVttUrl, externalTrack.language, externalTrack.format);
+            this.runtimeKey = runtimeTrack == null ? "" : joinStatic("|", runtimeTrack.type, runtimeTrack.mpvId, String.valueOf(runtimeTrack.ordinal));
+        }
+
+        static SubtitleCandidate external(Models.SubtitleTrack track) {
+            return new SubtitleCandidate(track, null, -1);
+        }
+
+        static SubtitleCandidate runtime(RuntimeTrack track) {
+            return new SubtitleCandidate(null, track, -1);
+        }
+
+        static SubtitleCandidate embedded(int ordinal) {
+            return new SubtitleCandidate(null, null, ordinal);
+        }
+
+        boolean sameAs(SubtitleCandidate other) {
+            if (other == null) {
+                return false;
+            }
+            if (externalTrack != null || other.externalTrack != null) {
+                return externalTrack != null && other.externalTrack != null && externalKey.equals(other.externalKey);
+            }
+            if (runtimeTrack != null || other.runtimeTrack != null) {
+                return runtimeTrack != null && other.runtimeTrack != null && runtimeKey.equals(other.runtimeKey);
+            }
+            return embeddedOrdinal == other.embeddedOrdinal;
+        }
+
+        private static String joinStatic(String separator, String... values) {
+            StringBuilder builder = new StringBuilder();
+            for (String value : values) {
+                if (value == null || value.isEmpty()) {
+                    continue;
+                }
+                if (builder.length() > 0) {
+                    builder.append(separator);
+                }
+                builder.append(value);
+            }
+            return builder.toString();
+        }
+    }
+
+    private static final class RuntimeTrack {
+        final int ordinal;
+        final String mpvId;
+        final String type;
+        final String codec;
+        final String language;
+        final String title;
+        final Integer channels;
+        final String channelLayout;
+        final boolean selected;
+        final boolean isDefault;
+        final boolean isForced;
+
+        RuntimeTrack(
+                int ordinal,
+                String mpvId,
+                String type,
+                String codec,
+                String language,
+                String title,
+                Integer channels,
+                String channelLayout,
+                boolean selected,
+                boolean isDefault,
+                boolean isForced) {
+            this.ordinal = Math.max(0, ordinal);
+            this.mpvId = mpvId == null || mpvId.isEmpty() ? String.valueOf(this.ordinal + 1) : mpvId;
+            this.type = type == null ? "" : type;
+            this.codec = codec == null ? "" : codec;
+            this.language = language == null ? "" : language;
+            this.title = title == null ? "" : title;
+            this.channels = channels;
+            this.channelLayout = channelLayout == null ? "" : channelLayout;
+            this.selected = selected;
+            this.isDefault = isDefault;
+            this.isForced = isForced;
         }
     }
 
     private static final class PlayerMenuOption {
         final String label;
+        final boolean selected;
         final Runnable action;
 
         PlayerMenuOption(String label, Runnable action) {
+            this(label, false, action);
+        }
+
+        PlayerMenuOption(String label, boolean selected, Runnable action) {
             this.label = label;
+            this.selected = selected;
             this.action = action;
+        }
+
+        String displayLabel() {
+            return selected ? "✓ " + label : "  " + label;
         }
     }
 

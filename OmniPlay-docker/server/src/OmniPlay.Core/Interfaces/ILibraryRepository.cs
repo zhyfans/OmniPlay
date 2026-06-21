@@ -14,6 +14,10 @@ public interface ILibraryRepository
         string videoFileId,
         CancellationToken cancellationToken = default);
 
+    Task<string?> GetLibraryItemIdForVideoFileAsync(
+        string videoFileId,
+        CancellationToken cancellationToken = default);
+
     Task<bool> UpdateVideoFileProbeAsync(
         VideoFileProbeUpdate request,
         CancellationToken cancellationToken = default);
@@ -24,6 +28,10 @@ public interface ILibraryRepository
 
     Task<bool> UpdateCustomMetadataAsync(
         LibraryItemCustomMetadataUpdateRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> SaveDoubanMetadataAsync(
+        DoubanMetadata metadata,
         CancellationToken cancellationToken = default);
 
     Task<bool> SetLibraryItemLockedAsync(

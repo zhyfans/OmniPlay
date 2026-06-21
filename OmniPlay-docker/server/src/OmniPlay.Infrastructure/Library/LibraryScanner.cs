@@ -161,7 +161,7 @@ public sealed class LibraryScanner : ILibraryScanner
                 completedSourceCount,
                 source.Name,
                 cancellationToken);
-            shouldProbe = !hideNewItemsUntilScraped;
+            shouldProbe = true;
         }
         else if (string.Equals(source.Kind, "webdav", StringComparison.OrdinalIgnoreCase))
         {
@@ -608,7 +608,16 @@ public sealed class LibraryScanner : ILibraryScanner
             yield break;
         }
 
-        var candidates = files
+        var streamFiles = files
+            .Where(static file => TryGetBdmvPathInfo(file.RelativePath, out _, out var section)
+                                  && section == BdmvPathSection.Stream)
+            .ToArray();
+        if (streamFiles.Length == 0)
+        {
+            yield break;
+        }
+
+        var candidates = streamFiles
             .Select(static file => new MediaNameParser.BluRayStreamCandidate(
                 file.FileName,
                 file.FileSizeBytes ?? 0,
@@ -620,33 +629,59 @@ public sealed class LibraryScanner : ILibraryScanner
 
         foreach (var index in selectedIndexes)
         {
-            if (index >= 0 && index < files.Count)
+            if (index >= 0 && index < streamFiles.Length)
             {
-                yield return files[index];
+                yield return streamFiles[index];
             }
         }
     }
 
     private static bool TryGetBdmvGroupKey(string relativePath, out string groupKey)
     {
-        var normalized = MediaNameParser.NormalizeRelativePath(relativePath);
-        const string nestedMarker = "/BDMV/STREAM/";
-        var index = normalized.IndexOf(nestedMarker, StringComparison.OrdinalIgnoreCase);
-        if (index >= 0)
-        {
-            groupKey = normalized[..index];
-            return true;
-        }
+        return TryGetBdmvPathInfo(relativePath, out groupKey, out _);
+    }
 
-        if (normalized.StartsWith("BDMV/STREAM/", StringComparison.OrdinalIgnoreCase))
+    private static bool TryGetBdmvPathInfo(
+        string relativePath,
+        out string groupKey,
+        out BdmvPathSection section)
+    {
+        var normalized = MediaNameParser.NormalizeRelativePath(relativePath);
+        foreach (var marker in BdmvPathMarkers)
         {
-            groupKey = string.Empty;
-            return true;
+            var index = normalized.IndexOf(marker.NestedMarker, StringComparison.OrdinalIgnoreCase);
+            if (index >= 0)
+            {
+                groupKey = normalized[..index];
+                section = marker.Section;
+                return true;
+            }
+
+            if (normalized.StartsWith(marker.RootMarker, StringComparison.OrdinalIgnoreCase))
+            {
+                groupKey = string.Empty;
+                section = marker.Section;
+                return true;
+            }
         }
 
         groupKey = string.Empty;
+        section = BdmvPathSection.Unknown;
         return false;
     }
+
+    private enum BdmvPathSection
+    {
+        Unknown,
+        Stream,
+        Playlist
+    }
+
+    private static readonly (string NestedMarker, string RootMarker, BdmvPathSection Section)[] BdmvPathMarkers =
+    [
+        ("/BDMV/STREAM/", "BDMV/STREAM/", BdmvPathSection.Stream),
+        ("/BDMV/PLAYLIST/", "BDMV/PLAYLIST/", BdmvPathSection.Playlist)
+    ];
 
     private static async Task<Dictionary<string, ExistingVideoFile>> GetExistingVideoFilesAsync(
         SqliteConnection connection,

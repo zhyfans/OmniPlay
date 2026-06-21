@@ -939,7 +939,7 @@ class MPVPlayerManager: ObservableObject {
         }
         return normalized.replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
     }
-    private func formatCodec(_ codec: String) -> String { let c = codec.lowercased(); if c.contains("truehd") { return "TrueHD Atmos" }; if c.contains("dts-hd") || c.contains("dtshd") { return "DTS-HD MA" }; if c.contains("dts") { return "DTS" }; if c.contains("eac3") { return "E-AC3" }; if c.contains("ac3") { return "Dolby AC3" }; if c.contains("aac") { return "AAC" }; if c.contains("flac") { return "FLAC" }; if c.contains("pgs") { return "PGS 图形字幕" }; if c.contains("srt") || c.contains("subrip") { return "SRT" }; if c.contains("ass") { return "ASS" }; return c.uppercased() }
+    private func formatCodec(_ codec: String) -> String { let c = codec.lowercased(); if c.contains("truehd") { return "TrueHD Atmos" }; if c.contains("dts-hd") || c.contains("dtshd") { return "DTS-HD MA" }; if c.contains("dts") { return "DTS" }; if c.contains("eac3") { return "E-AC3" }; if c.contains("ac3") { return "Dolby AC3" }; if c.contains("aac") { return "AAC" }; if c.contains("flac") { return "FLAC" }; if c.contains("pgs") { return "PGS" }; if c.contains("srt") || c.contains("subrip") { return "SRT" }; if c.contains("ass") { return "ASS" }; return c.uppercased() }
     private func getMpvStringProperty(_ name: String) -> String? { if let cString = mpv_get_property_string(mpv, name) { let result = String(cString: cString); mpv_free(UnsafeMutableRawPointer(mutating: cString)); return result }; return nil }
     func setAudioTrack(at index: Int) {
         guard index >= 0 && index < audioTrackIds.count else { return }

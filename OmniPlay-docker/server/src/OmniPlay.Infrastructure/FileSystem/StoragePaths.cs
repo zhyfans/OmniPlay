@@ -10,11 +10,11 @@ public sealed class StoragePaths : IStoragePaths
     {
     }
 
-    public StoragePaths(string? rootDirectory)
+    public StoragePaths(string? rootDirectory, string? cacheDirectory = null)
     {
         RootDirectory = ResolveRootDirectory(rootDirectory);
         DataDirectory = Path.Combine(RootDirectory, "data");
-        CacheDirectory = Path.Combine(RootDirectory, "cache");
+        CacheDirectory = ResolveCacheDirectory(RootDirectory, cacheDirectory);
         SettingsDirectory = Path.Combine(RootDirectory, "settings");
         PostersDirectory = Path.Combine(CacheDirectory, "posters");
         ThumbnailsDirectory = Path.Combine(CacheDirectory, "thumbnails");
@@ -64,5 +64,23 @@ public sealed class StoragePaths : IStoragePaths
 
         return Path.Combine(home, ".local", "share", "OmniPlay");
     }
-}
 
+    private static string ResolveCacheDirectory(string rootDirectory, string? cacheDirectory)
+    {
+        var explicitCache = cacheDirectory;
+        if (string.IsNullOrWhiteSpace(explicitCache))
+        {
+            explicitCache = Environment.GetEnvironmentVariable(AppRuntime.CacheRootEnvironmentVariable);
+        }
+
+        if (string.IsNullOrWhiteSpace(explicitCache))
+        {
+            return Path.Combine(rootDirectory, "cache");
+        }
+
+        var expanded = Environment.ExpandEnvironmentVariables(explicitCache);
+        return Path.GetFullPath(Path.IsPathRooted(expanded)
+            ? expanded
+            : Path.Combine(rootDirectory, expanded));
+    }
+}

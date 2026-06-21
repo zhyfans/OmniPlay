@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
+using OmniPlay.Core.Runtime;
 
 namespace OmniPlay.Media;
 
@@ -14,22 +15,25 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
     private const int MinimumPlayableSegmentCount = 1;
     private readonly ConcurrentDictionary<string, HlsSessionState> sessions = new(StringComparer.Ordinal);
     private readonly IStoragePaths storagePaths;
+    private readonly IAppSettingsRepository? appSettingsRepository;
     private readonly string ffmpegPath;
     private readonly TimeSpan manifestWaitTimeout;
     private readonly SemaphoreSlim capabilitiesLock = new(1, 1);
     private FfmpegTranscodeCapabilities? cachedCapabilities;
 
-    public FfmpegHlsSessionService(IStoragePaths storagePaths)
-        : this(storagePaths, ResolveFfmpegPath(), TimeSpan.FromSeconds(8))
+    public FfmpegHlsSessionService(IStoragePaths storagePaths, IAppSettingsRepository? appSettingsRepository = null)
+        : this(storagePaths, ResolveFfmpegPath(), TimeSpan.FromSeconds(8), appSettingsRepository)
     {
     }
 
     public FfmpegHlsSessionService(
         IStoragePaths storagePaths,
         string ffmpegPath,
-        TimeSpan? manifestWaitTimeout = null)
+        TimeSpan? manifestWaitTimeout = null,
+        IAppSettingsRepository? appSettingsRepository = null)
     {
         this.storagePaths = storagePaths;
+        this.appSettingsRepository = appSettingsRepository;
         this.ffmpegPath = string.IsNullOrWhiteSpace(ffmpegPath) ? "ffmpeg" : ffmpegPath;
         this.manifestWaitTimeout = manifestWaitTimeout ?? TimeSpan.FromSeconds(8);
     }
@@ -40,7 +44,7 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         CancellationToken cancellationToken = default)
     {
         var sessionId = NormalizeSessionId($"{file.Id}_{profile.CacheKey}");
-        var outputDirectory = Path.Combine(storagePaths.TranscodeDirectory, sessionId);
+        var outputDirectory = Path.Combine(ResolveHlsCacheRoot(), sessionId);
         var manifestPath = Path.Combine(outputDirectory, ManifestFileName);
         Directory.CreateDirectory(outputDirectory);
 
@@ -71,6 +75,100 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         }
 
         await WaitForManifestAsync(manifestPath, state, cancellationToken);
+        return CreateSession(sessionId, outputDirectory, manifestPath, state);
+    }
+
+    public async Task<HlsPlaybackSession> EnsureCompletedSessionAsync(
+        PlayableVideoFile file,
+        HlsPlaybackProfile profile,
+        IProgress<BackgroundTaskProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var session = await EnsureSessionAsync(file, profile, cancellationToken);
+        if (!sessions.TryGetValue(session.SessionId, out var state)
+            || !string.IsNullOrWhiteSpace(session.ErrorMessage))
+        {
+            return session;
+        }
+
+        var lastProgressReport = DateTimeOffset.MinValue;
+        while (!IsCompleteManifest(session.ManifestPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            Process? process;
+            string? errorMessage;
+            lock (state.SyncRoot)
+            {
+                process = state.Process;
+                errorMessage = state.ErrorMessage;
+            }
+
+            if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                break;
+            }
+
+            if (DateTimeOffset.UtcNow - lastProgressReport >= TimeSpan.FromSeconds(2))
+            {
+                var cachedSeconds = EstimateCachedDurationSeconds(session.ManifestPath);
+                var percent = file.DurationSeconds > 0
+                    ? Math.Clamp(cachedSeconds * 100d / file.DurationSeconds, 0, 99)
+                    : (double?)null;
+                var durationText = file.DurationSeconds > 0
+                    ? $" {FormatDuration(cachedSeconds)}/{FormatDuration(file.DurationSeconds)}"
+                    : string.Empty;
+                progress?.Report(new BackgroundTaskProgress(
+                    "hls-cache",
+                    $"正在生成 HLS 缓存{durationText}",
+                    percent,
+                    file.FileName));
+                lastProgressReport = DateTimeOffset.UtcNow;
+            }
+
+            if (process is null || process.HasExited)
+            {
+                if (!IsCompleteManifest(session.ManifestPath))
+                {
+                    lock (state.SyncRoot)
+                    {
+                        state.ErrorMessage ??= "FFmpeg 已退出，但 HLS 清单没有完整生成。";
+                    }
+                }
+
+                break;
+            }
+
+            await Task.Delay(1000, cancellationToken);
+        }
+
+        if (IsCompleteManifest(session.ManifestPath))
+        {
+            progress?.Report(new BackgroundTaskProgress("hls-cache", "HLS 缓存已生成", 100, file.FileName));
+        }
+
+        return CreateSession(session.SessionId, session.OutputDirectory, session.ManifestPath, state);
+    }
+
+    public HlsPlaybackSession? GetCompletedSession(
+        PlayableVideoFile file,
+        HlsPlaybackProfile profile)
+    {
+        var sessionId = NormalizeSessionId($"{file.Id}_{profile.CacheKey}");
+        var outputDirectory = sessions.TryGetValue(sessionId, out var state)
+            ? state.OutputDirectory
+            : Path.Combine(ResolveHlsCacheRoot(), sessionId);
+        var manifestPath = Path.Combine(outputDirectory, ManifestFileName);
+        if (!IsCompleteManifest(manifestPath))
+        {
+            return null;
+        }
+
+        if (state is null)
+        {
+            state = sessions.GetOrAdd(sessionId, static (_, directory) => new HlsSessionState(directory), outputDirectory);
+        }
+
         return CreateSession(sessionId, outputDirectory, manifestPath, state);
     }
 
@@ -107,13 +205,16 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
             return null;
         }
 
-        var sessionDirectory = Path.Combine(storagePaths.TranscodeDirectory, normalizedSessionId);
+        var sessionDirectory = sessions.TryGetValue(normalizedSessionId, out var state)
+            ? state.OutputDirectory
+            : Path.Combine(ResolveHlsCacheRoot(), normalizedSessionId);
         var fullPath = Path.GetFullPath(Path.Combine(sessionDirectory, assetName));
         if (!IsPathInsideRoot(sessionDirectory, fullPath) || !File.Exists(fullPath))
         {
             return null;
         }
 
+        TouchSessionDirectory(sessionDirectory);
         return new HlsPlaybackAsset(fullPath, contentType, extension is ".ts" or ".mp4" or ".m4s");
     }
 
@@ -149,7 +250,7 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         }
 
         var sessionId = NormalizeSessionId($"{file.Id}_{profile.CacheKey}");
-        var outputDirectory = Path.Combine(storagePaths.TranscodeDirectory, sessionId);
+        var outputDirectory = Path.Combine(ResolveHlsCacheRoot(), sessionId);
         var manifestPath = Path.Combine(outputDirectory, ManifestFileName);
         var arguments = BuildFfmpegArguments(file.AbsolutePath, profile, manifestPath, outputDirectory);
         return string.Join(' ', new[] { QuoteShellArgument(ffmpegPath) }.Concat(arguments.Select(QuoteShellArgument)));
@@ -173,18 +274,21 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         return true;
     }
 
-    public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge)
+    public HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge, long? maxBytes = null)
     {
         var threshold = DateTimeOffset.UtcNow - maxAge;
         var removedSessions = 0;
         long removedBytes = 0;
+        long totalBytes = 0;
+        List<HlsCacheCandidate> retainedCandidates = [];
+        var cacheRoot = ResolveHlsCacheRoot();
 
-        if (!Directory.Exists(storagePaths.TranscodeDirectory))
+        if (!Directory.Exists(cacheRoot))
         {
             return new HlsCacheCleanupSummary(0, 0);
         }
 
-        foreach (var directory in Directory.EnumerateDirectories(storagePaths.TranscodeDirectory))
+        foreach (var directory in Directory.EnumerateDirectories(cacheRoot))
         {
             var sessionId = Path.GetFileName(directory);
             if (sessions.TryGetValue(sessionId, out var state) && state.Process is { HasExited: false })
@@ -193,18 +297,61 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
             }
 
             var info = new DirectoryInfo(directory);
-            if (info.LastWriteTimeUtc > threshold.UtcDateTime)
+            var size = DirectorySize(info);
+            totalBytes += size;
+            var lastUsedAt = LastUsedAtUtc(info);
+            if (lastUsedAt > threshold.UtcDateTime)
             {
+                retainedCandidates.Add(new HlsCacheCandidate(sessionId, directory, size, lastUsedAt));
                 continue;
             }
 
-            removedBytes += DirectorySize(info);
-            Directory.Delete(directory, recursive: true);
-            sessions.TryRemove(sessionId, out _);
-            removedSessions++;
+            if (TryDeleteCacheDirectory(sessionId, directory))
+            {
+                totalBytes -= size;
+                removedBytes += size;
+                removedSessions++;
+            }
+        }
+
+        if (maxBytes is > 0 && totalBytes > maxBytes.Value)
+        {
+            foreach (var candidate in retainedCandidates.OrderBy(static candidate => candidate.LastUsedAtUtc))
+            {
+                if (totalBytes <= maxBytes.Value)
+                {
+                    break;
+                }
+
+                if (TryDeleteCacheDirectory(candidate.SessionId, candidate.Directory))
+                {
+                    totalBytes -= candidate.Bytes;
+                    removedBytes += candidate.Bytes;
+                    removedSessions++;
+                }
+            }
         }
 
         return new HlsCacheCleanupSummary(removedSessions, removedBytes);
+    }
+
+    private string ResolveHlsCacheRoot()
+    {
+        if (appSettingsRepository is null)
+        {
+            return storagePaths.TranscodeDirectory;
+        }
+
+        try
+        {
+            return HlsCachePathResolver.ResolveRoot(
+                storagePaths,
+                appSettingsRepository.GetAsync().GetAwaiter().GetResult().Cache);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return storagePaths.TranscodeDirectory;
+        }
     }
 
     private Process? TryStartFfmpeg(
@@ -365,7 +512,12 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
                 arguments.AddRange(["-c:v", profile.HardwareEncoder]);
                 if (profile.VideoBitrateKbps.HasValue)
                 {
-                    arguments.AddRange(["-b:v", $"{profile.VideoBitrateKbps.Value}k"]);
+                    var videoBitrate = profile.VideoBitrateKbps.Value;
+                    arguments.AddRange([
+                        "-b:v", $"{videoBitrate}k",
+                        "-maxrate", $"{videoBitrate}k",
+                        "-bufsize", $"{videoBitrate * 2}k"
+                    ]);
                 }
 
                 if (profile.ToneMapToSdr)
@@ -507,6 +659,50 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         {
             return false;
         }
+    }
+
+    private static double EstimateCachedDurationSeconds(string manifestPath)
+    {
+        try
+        {
+            var durationSeconds = 0d;
+            foreach (var line in File.ReadLines(manifestPath))
+            {
+                var trimmed = line.Trim();
+                if (!trimmed.StartsWith("#EXTINF:", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var value = trimmed["#EXTINF:".Length..].TrimEnd(',');
+                if (double.TryParse(
+                        value,
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out var duration))
+                {
+                    durationSeconds += Math.Max(0, duration);
+                }
+            }
+
+            return durationSeconds;
+        }
+        catch (IOException)
+        {
+            return 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 0;
+        }
+    }
+
+    private static string FormatDuration(double seconds)
+    {
+        var time = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        return time.TotalHours >= 1
+            ? $"{(int)time.TotalHours:D2}:{time.Minutes:D2}:{time.Seconds:D2}"
+            : $"{time.Minutes:D2}:{time.Seconds:D2}";
     }
 
     private static bool IsManifestReadyForPlayback(string manifestPath)
@@ -1276,7 +1472,7 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
     {
         if (string.Equals(toneMapMode, "dolby-vision", StringComparison.OrdinalIgnoreCase))
         {
-            filters.Add("zscale=matrixin=ictcp:transferin=smpte2084:primariesin=bt2020:rangein=tv:matrix=gbr:transfer=linear:primaries=bt2020:npl=100");
+            filters.Add("zscale=matrixin=ictcp:transferin=smpte2084:primariesin=bt2020:rangein=pc:matrix=gbr:transfer=linear:primaries=bt2020:npl=100");
             filters.Add("format=gbrpf32le");
             filters.Add("tonemap=tonemap=hable:desat=0");
             filters.Add("zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=tv");
@@ -1404,6 +1600,50 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
         return directory.EnumerateFiles("*", SearchOption.AllDirectories).Sum(static file => file.Length);
     }
 
+    private bool TryDeleteCacheDirectory(string sessionId, string directory)
+    {
+        if (sessions.TryGetValue(sessionId, out var state) && state.Process is { HasExited: false })
+        {
+            return false;
+        }
+
+        try
+        {
+            Directory.Delete(directory, recursive: true);
+            sessions.TryRemove(sessionId, out _);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static DateTime LastUsedAtUtc(DirectoryInfo directory)
+    {
+        var lastWrite = directory.LastWriteTimeUtc;
+        var lastAccess = directory.LastAccessTimeUtc;
+        return lastAccess > lastWrite ? lastAccess : lastWrite;
+    }
+
+    private static void TouchSessionDirectory(string sessionDirectory)
+    {
+        try
+        {
+            Directory.SetLastAccessTimeUtc(sessionDirectory, DateTime.UtcNow);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
     private static string ResolveFfmpegPath()
     {
         return MediaToolPathResolver.ResolveFfmpegPath();
@@ -1440,6 +1680,12 @@ public sealed partial class FfmpegHlsSessionService : IHlsSessionService
 
     [GeneratedRegex("[^A-Za-z0-9_.-]")]
     private static partial Regex SessionIdRegex();
+
+    private sealed record HlsCacheCandidate(
+        string SessionId,
+        string Directory,
+        long Bytes,
+        DateTime LastUsedAtUtc);
 
     private sealed class HlsSessionState
     {

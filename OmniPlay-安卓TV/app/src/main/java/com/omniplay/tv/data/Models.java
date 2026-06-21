@@ -83,7 +83,8 @@ public final class Models {
         public final String releaseDate;
         public final String overview;
         public final String posterAssetId;
-        public final double voteAverage;
+        public final Double voteAverage;
+        public final Double doubanRating;
         public final boolean isWatched;
         public final int videoFileCount;
         public final double maxProgressSeconds;
@@ -96,7 +97,8 @@ public final class Models {
             releaseDate = optString(json, "releaseDate");
             overview = optString(json, "overview");
             posterAssetId = optString(json, "posterAssetId");
-            voteAverage = json.optDouble("voteAverage", 0);
+            voteAverage = optDouble(json, "voteAverage");
+            doubanRating = optDouble(json, "doubanRating");
             isWatched = json.optBoolean("isWatched");
             videoFileCount = json.optInt("videoFileCount");
             maxProgressSeconds = json.optDouble("maxProgressSeconds", 0);
@@ -115,11 +117,14 @@ public final class Models {
     public static final class LibraryDetail extends LibraryItem {
         public final List<VideoFile> videoFiles;
         public final List<Season> seasons;
+        public final DoubanMetadata douban;
 
         private LibraryDetail(JSONObject json) {
             super(json);
             videoFiles = parseVideoFiles(json.optJSONArray("videoFiles"));
             seasons = parseSeasons(json.optJSONArray("seasons"));
+            JSONObject doubanJson = json.optJSONObject("douban");
+            douban = doubanJson == null ? null : new DoubanMetadata(doubanJson);
         }
 
         public static LibraryDetail fromJson(JSONObject json) {
@@ -141,6 +146,34 @@ public final class Models {
             }
 
             return videoFiles;
+        }
+    }
+
+    public static final class DoubanMetadata {
+        public final String subjectId;
+        public final String subjectUrl;
+        public final String title;
+        public final String originalTitle;
+        public final String year;
+        public final Double rating;
+        public final Integer ratingCount;
+        public final String summary;
+        public final String genres;
+        public final String countries;
+        public final String posterUrl;
+
+        private DoubanMetadata(JSONObject json) {
+            subjectId = optString(json, "subjectId");
+            subjectUrl = optString(json, "subjectUrl");
+            title = optString(json, "title");
+            originalTitle = optString(json, "originalTitle");
+            year = optString(json, "year");
+            rating = optDouble(json, "rating");
+            ratingCount = optInt(json, "ratingCount");
+            summary = optString(json, "summary");
+            genres = optString(json, "genres");
+            countries = optString(json, "countries");
+            posterUrl = optString(json, "posterUrl");
         }
     }
 
@@ -296,6 +329,29 @@ public final class Models {
                     label);
         }
 
+        public VideoFile withStreams(List<VideoFileStream> audioTracks, List<VideoFileStream> subtitleStreams) {
+            return new VideoFile(
+                    id,
+                    relativePath,
+                    fileName,
+                    mediaKind,
+                    durationSeconds,
+                    positionSeconds,
+                    isWatched,
+                    seasonNumber,
+                    episodeNumber,
+                    episodeTitle,
+                    container,
+                    videoCodec,
+                    videoWidth,
+                    videoHeight,
+                    audioCodec,
+                    subtitleSummary,
+                    audioTracks == null ? this.audioTracks : audioTracks,
+                    subtitleStreams == null ? this.subtitleStreams : subtitleStreams,
+                    displayLabel);
+        }
+
         public String label() {
             if (displayLabel != null && !displayLabel.isEmpty()) {
                 return displayLabel;
@@ -351,6 +407,66 @@ public final class Models {
         }
     }
 
+    public static final class PlaybackFileStreams {
+        public final List<VideoFileStream> audioTracks;
+        public final List<VideoFileStream> subtitleStreams;
+
+        private PlaybackFileStreams(JSONObject json) {
+            audioTracks = parseStreams(json == null ? null : json.optJSONArray("audioTracks"));
+            subtitleStreams = parseStreams(json == null ? null : json.optJSONArray("subtitleStreams"));
+        }
+
+        public static PlaybackFileStreams fromJson(JSONObject json) {
+            return new PlaybackFileStreams(json);
+        }
+    }
+
+    public static final class PlaybackDecision {
+        public final String fileId;
+        public final String mode;
+        public final String streamUrl;
+        public final String manifestUrl;
+        public final String sessionId;
+        public final boolean isReady;
+        public final String reason;
+        public final double durationSeconds;
+
+        private PlaybackDecision(JSONObject json) {
+            this(
+                    json.optString("fileId"),
+                    optString(json, "mode"),
+                    optString(json, "streamUrl"),
+                    optString(json, "manifestUrl"),
+                    optString(json, "sessionId"),
+                    json.optBoolean("isReady"),
+                    optString(json, "reason"),
+                    json.optDouble("durationSeconds", 0));
+        }
+
+        public PlaybackDecision(
+                String fileId,
+                String mode,
+                String streamUrl,
+                String manifestUrl,
+                String sessionId,
+                boolean isReady,
+                String reason,
+                double durationSeconds) {
+            this.fileId = fileId;
+            this.mode = mode;
+            this.streamUrl = streamUrl;
+            this.manifestUrl = manifestUrl;
+            this.sessionId = sessionId;
+            this.isReady = isReady;
+            this.reason = reason;
+            this.durationSeconds = durationSeconds;
+        }
+
+        public static PlaybackDecision fromJson(JSONObject json) {
+            return new PlaybackDecision(json);
+        }
+    }
+
     public static final class SubtitleTrack {
         public final String id;
         public final String fileName;
@@ -366,6 +482,26 @@ public final class Models {
             language = optString(json, "language");
             webVttUrl = optString(json, "webVttUrl");
             canBurn = json.optBoolean("canBurn");
+        }
+    }
+
+    public static final class SubtitleCacheStatus {
+        public final int pgsTotal;
+        public final int pgsCached;
+        public final int subtitleTotal;
+        public final int subtitleCached;
+        public final long cachedBytes;
+
+        private SubtitleCacheStatus(JSONObject json) {
+            pgsTotal = json == null ? 0 : json.optInt("pgsTotal", 0);
+            pgsCached = json == null ? 0 : json.optInt("pgsCached", 0);
+            subtitleTotal = json == null ? 0 : json.optInt("subtitleTotal", pgsTotal);
+            subtitleCached = json == null ? 0 : json.optInt("subtitleCached", pgsCached);
+            cachedBytes = json == null ? 0 : json.optLong("cachedBytes", 0);
+        }
+
+        public static SubtitleCacheStatus fromJson(JSONObject json) {
+            return new SubtitleCacheStatus(json);
         }
     }
 
@@ -465,6 +601,14 @@ public final class Models {
 
     private static Integer optInt(JSONObject json, String key) {
         return json.has(key) && !json.isNull(key) ? json.optInt(key) : null;
+    }
+
+    private static Double optDouble(JSONObject json, String key) {
+        if (!json.has(key) || json.isNull(key)) {
+            return null;
+        }
+        double value = json.optDouble(key, Double.NaN);
+        return Double.isFinite(value) ? value : null;
     }
 
     private static int optDimension(JSONObject json, String primaryKey, String fallbackKey) {

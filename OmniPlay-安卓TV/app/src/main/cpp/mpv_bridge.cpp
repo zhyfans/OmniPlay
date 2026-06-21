@@ -486,6 +486,10 @@ Java_com_omniplay_tv_player_MpvBridge_nativeInitialize(JNIEnv *, jclass, jlong h
 
     set_option(bridge, "terminal", "no");
     set_option(bridge, "msg-level", "all=warn");
+    set_option(bridge, "cache", "yes");
+    set_option(bridge, "demuxer-max-bytes", "128MiB");
+    set_option(bridge, "demuxer-max-back-bytes", "32MiB");
+    set_option(bridge, "demuxer-readahead-secs", "20");
     if (bridge->direct_playback_mode) {
         set_option(bridge, "vo", "mediacodec_embed");
         set_option(bridge, "hwdec", "mediacodec");
@@ -497,6 +501,17 @@ Java_com_omniplay_tv_player_MpvBridge_nativeInitialize(JNIEnv *, jclass, jlong h
         set_option(bridge, "opengl-es", "yes");
         set_option(bridge, "hwdec", "mediacodec-copy");
         set_option(bridge, "vd-lavc-dr", "no");
+        set_option(bridge, "hwdec-codecs", "all");
+        set_option(bridge, "scale", "bilinear");
+        set_option(bridge, "cscale", "bilinear");
+        set_option(bridge, "dscale", "bilinear");
+        set_option(bridge, "correct-downscaling", "no");
+        set_option(bridge, "sigmoid-upscaling", "no");
+        set_option(bridge, "deband", "no");
+        set_option(bridge, "target-prim", "bt.709");
+        set_option(bridge, "target-trc", "bt.1886");
+        set_option(bridge, "tone-mapping", "bt.2446a");
+        set_option(bridge, "hdr-compute-peak", "yes");
     }
     set_option(bridge, "ao", "audiotrack");
     set_option(bridge, "osc", "no");
@@ -639,7 +654,8 @@ Java_com_omniplay_tv_player_MpvBridge_nativeLoad(
         jstring url,
         jstring cookieHeader,
         jstring userAgent,
-        jdouble startSeconds) {
+        jdouble startSeconds,
+        jboolean isoPlayback) {
     auto *bridge = reinterpret_cast<Bridge *>(handle);
     if (bridge == nullptr || bridge->mpv == nullptr) {
         return JNI_FALSE;
@@ -661,7 +677,32 @@ Java_com_omniplay_tv_player_MpvBridge_nativeLoad(
         std::string header = "Cookie: " + nativeCookie;
         set_string(bridge, "http-header-fields", header.c_str());
     }
-    (void) startSeconds;
+    char startValue[64];
+    std::snprintf(
+            startValue,
+            sizeof(startValue),
+            "%.3f",
+            startSeconds > 0.5 ? static_cast<double>(startSeconds) : 0.0);
+    set_string(bridge, "start", startValue);
+
+    if (isoPlayback == JNI_TRUE) {
+        set_string(bridge, "bluray-device", nativeUrl.c_str());
+        const char *bdLongestArgs[] = {"loadfile", "bd://longest", "replace", nullptr};
+        if (command(bridge, bdLongestArgs)) {
+            return JNI_TRUE;
+        }
+
+        const char *bdArgs[] = {"loadfile", "bd://", "replace", nullptr};
+        if (command(bridge, bdArgs)) {
+            return JNI_TRUE;
+        }
+
+        set_string(bridge, "dvd-device", nativeUrl.c_str());
+        const char *dvdArgs[] = {"loadfile", "dvd://", "replace", nullptr};
+        if (command(bridge, dvdArgs)) {
+            return JNI_TRUE;
+        }
+    }
 
     const char *args[] = {"loadfile", nativeUrl.c_str(), "replace", nullptr};
     return command(bridge, args) ? JNI_TRUE : JNI_FALSE;
@@ -745,6 +786,37 @@ Java_com_omniplay_tv_player_MpvBridge_nativeSetString(
 
     const char *args[] = {"set", nativeProperty.c_str(), nativeValue.c_str(), nullptr};
     command(bridge, args);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_omniplay_tv_player_MpvBridge_nativeGetString(
+        JNIEnv *env,
+        jclass,
+        jlong handle,
+        jstring property,
+        jstring fallback) {
+    auto *bridge = reinterpret_cast<Bridge *>(handle);
+    std::string fallbackValue = to_string(env, fallback);
+    if (bridge == nullptr || bridge->mpv == nullptr || bridge->mpv_get_property == nullptr) {
+        return env->NewStringUTF(fallbackValue.c_str());
+    }
+
+    std::string nativeProperty = to_string(env, property);
+    if (nativeProperty.empty()) {
+        return env->NewStringUTF(fallbackValue.c_str());
+    }
+
+    char *value = nullptr;
+    int result = bridge->mpv_get_property(bridge->mpv, nativeProperty.c_str(), MPV_FORMAT_STRING, &value);
+    if (result < 0 || value == nullptr) {
+        return env->NewStringUTF(fallbackValue.c_str());
+    }
+
+    jstring output = env->NewStringUTF(value);
+    if (bridge->mpv_free != nullptr) {
+        bridge->mpv_free(value);
+    }
+    return output;
 }
 
 extern "C" JNIEXPORT jdouble JNICALL

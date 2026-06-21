@@ -37,6 +37,7 @@ struct MovieDetailView: View {
     @State private var displayMovieTitle: String
     @State private var playbackAlertMessage = ""
     @State private var showPlaybackAlert = false
+    @State private var doubanMetadata: DoubanMetadata? = nil
     
     init(movie: Movie) {
         self.movie = movie
@@ -117,12 +118,35 @@ struct MovieDetailView: View {
                             Text(displayMovieTitle).font(.system(size: 46, weight: .heavy)).foregroundColor(theme.textPrimary).lineLimit(2)
                             
                             HStack(spacing: 16) {
-                                if let date = movie.releaseDate, date.count >= 4 { Text(String(date.prefix(4))) }
-                                if let vote = movie.voteAverage, vote > 0 { HStack(spacing: 4) { Image(systemName: "star.fill"); Text(String(format: "%.1f", vote)) }.foregroundColor(Color(hex: "FFAC00")) }
-                                Text("TV-14").padding(.horizontal, 6).padding(.vertical, 2).background(theme.surface).cornerRadius(4)
-                            }.font(.title3.bold()).foregroundColor(theme.textSecondary)
+                                if let year = preferredYear { Text(year) }
+                                if let vote = movie.voteAverage, vote > 0 {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "star.fill")
+                                        Text(String(format: "%.1f", vote))
+                                    }
+                                        .foregroundColor(Color(hex: "FFAC00"))
+                                }
+                                if let rating = doubanMetadata?.rating, rating > 0 {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "star.fill")
+                                        Text(String(format: "%.1f", rating))
+                                    }
+                                        .foregroundColor(Color(hex: "00B51D"))
+                                }
+                                ForEach(fusedTextMetadataParts, id: \.self) { part in
+                                    Text(part)
+                                }
+                            }
+                            .font(.title3.bold())
+                            .foregroundColor(theme.textSecondary)
                             
-                            Text(movie.overview ?? "暂无简介").font(.body).foregroundColor(theme.textPrimary.opacity(0.85)).lineSpacing(8).padding(.top, 10).padding(.bottom, 10)
+                            Text(fusedOverview)
+                                .font(.body)
+                                .foregroundColor(theme.textPrimary.opacity(0.85))
+                                .lineSpacing(8)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.top, 10)
+                                .padding(.bottom, 10)
                             
                             // 3. 播放控制条
                             if let file = mainFile {
@@ -244,6 +268,7 @@ struct MovieDetailView: View {
                 self.localPoster = img
             }
             loadFileDetails()
+            loadDoubanMetadata()
         }
         // 🌟 监听海报下载完成，刷新毛玻璃背景
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PosterUpdated_\((movie.posterPath ?? "").replacingOccurrences(of: "/", with: ""))"))) { _ in
@@ -257,6 +282,7 @@ struct MovieDetailView: View {
         .onReceive(NotificationCenter.default.publisher(for: .libraryUpdated)) { notification in
             let preferredFileId = notification.userInfo?[LibraryUpdateUserInfoKey.preferredVideoFileId] as? String
             loadFileDetails(preservingCurrentSelection: true, preferredFileId: preferredFileId)
+            loadDoubanMetadata()
         }
         .onDisappear {
             loadFileDetailsTask?.cancel()
@@ -270,6 +296,43 @@ struct MovieDetailView: View {
             return "\(prefix) \(ep.displayName)"
         }
         return prefix
+    }
+
+    private var fusedTextMetadataParts: [String] {
+        var parts: [String] = []
+        let genres = Array(doubanMetadata?.genreList.prefix(3) ?? [])
+        if !genres.isEmpty { parts.append(genres.joined(separator: " / ")) }
+        let countries = Array(doubanMetadata?.countryList.prefix(2) ?? [])
+        if !countries.isEmpty { parts.append(countries.joined(separator: " / ")) }
+        return parts
+    }
+
+    private var preferredYear: String? {
+        if let year = doubanMetadata?.year, !year.isEmpty { return year }
+        if let date = movie.releaseDate, date.count >= 4 { return String(date.prefix(4)) }
+        return nil
+    }
+
+    private var fusedOverview: String {
+        if let overview = movie.overview?.trimmingCharacters(in: .whitespacesAndNewlines), !overview.isEmpty {
+            return overview
+        }
+        if let summary = doubanMetadata?.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty {
+            return summary
+        }
+        return "暂无简介"
+    }
+
+    private func loadDoubanMetadata() {
+        guard let movieId = movie.id else { return }
+        Task {
+            let metadata = try? await AppDatabase.shared.dbQueue.read { db in
+                try DoubanMetadata.fetchOne(db, key: movieId)
+            }
+            await MainActor.run {
+                self.doubanMetadata = metadata?.isInvalidPlaceholder == true ? nil : metadata
+            }
+        }
     }
 
     private func seasonSortPriority(_ season: Int) -> Int {

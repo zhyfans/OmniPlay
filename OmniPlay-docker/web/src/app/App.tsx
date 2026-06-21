@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   Circle,
   CircleStop,
+  Download,
   FolderOpen,
   FolderPlus,
   LogOut,
@@ -19,6 +20,7 @@ import {
   Save,
   Search,
   Settings,
+  ExternalLink,
   SlidersHorizontal,
   SkipBack,
   SkipForward,
@@ -34,6 +36,7 @@ import {
   AuthStatus,
   BackgroundTaskSnapshot,
   BackgroundTaskStatus,
+  bindLibraryItemDouban,
   browseLocalDirectories,
   CacheUsageSummary,
   CacheSettings,
@@ -42,6 +45,7 @@ import {
   cancelPlaybackCache,
   cleanupAssetCache,
   cleanupHlsCache,
+  cleanupSubtitleCache,
   EpisodeDetail,
   getBackgroundTasks,
   getAppSettings,
@@ -75,6 +79,7 @@ import {
   RuntimeSelfCheckSnapshot,
   posterUrl,
   preparePlaybackCache,
+  prewarmHlsCache,
   registerAdmin,
   removeMediaSource,
   searchLibraryItemMetadata,
@@ -94,15 +99,20 @@ import {
   VideoFileSummary,
 } from "../shared/api/client";
 
+const APP_VERSION = "1.6";
+const APP_UPDATE_URL = "https://github.com/nandieling/OmniPlay";
+
 type MetadataSearchState = {
   item: LibraryItemSummary;
   detail: LibraryItemDetail | null;
   query: string;
   year: string;
+  doubanSubject: string;
   candidates: TmdbMetadataMatch[];
   isLoadingDetail: boolean;
   isSearching: boolean;
   isApplying: boolean;
+  isBindingDouban: boolean;
   error: string;
 };
 
@@ -136,6 +146,18 @@ const defaultAutomationSettings: AppSettingsSnapshot["automation"] = {
   scheduledLibraryRefreshIntervalHours: 24,
 };
 
+const defaultCacheSettings: CacheSettings = {
+  hlsRetentionHours: 24,
+  hlsMaxGb: 30,
+  hlsCachePath: "",
+  imageCleanupScope: "orphans-and-untracked",
+  webDavRetentionHours: 72,
+  webDavMaxGb: 20,
+  subtitleCachePath: "",
+  subtitleMaxGb: 20,
+  subtitleCacheStrategy: "optimized",
+};
+
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
@@ -150,6 +172,10 @@ export function App() {
   const [isSavingSource, setIsSavingSource] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isHlsSelectionMode, setIsHlsSelectionMode] = useState(false);
+  const [selectedHlsItemIds, setSelectedHlsItemIds] = useState<string[]>([]);
+  const [selectedHlsVideoFileIds, setSelectedHlsVideoFileIds] = useState<string[]>([]);
+  const [hlsCacheNotice, setHlsCacheNotice] = useState("");
   const [searchText, setSearchText] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isSortOpen, setIsSortOpen] = useState(false);
@@ -168,13 +194,17 @@ export function App() {
   const [isDetailLoading, setIsDetailLoading] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [errorText, setErrorText] = useState("");
+  const [tmdbConnectionAlert, setTmdbConnectionAlert] = useState("");
   const scanWasRunningRef = useRef(false);
   const scrapeWasRunningRef = useRef(false);
   const scrapeLoadedUpdatedItemsRef = useRef(0);
+  const scrapeLoadedCurrentItemRef = useRef("");
   const cacheCleanupWasRunningRef = useRef(false);
   const sourceCleanupWasRunningRef = useRef(false);
+  const seenCompletedHlsTasksRef = useRef<Set<string>>(new Set());
   const selectedDetailRef = useRef<LibraryItemDetail | null>(null);
   const libraryScrollYRef = useRef(0);
+  const tmdbLastAlertedErrorRef = useRef("");
 
   const loadData = useCallback(async () => {
     setErrorText("");
@@ -189,6 +219,25 @@ export function App() {
     setCacheStatus(nextCacheStatus);
     setSettings(nextSettings);
   }, []);
+
+  const refreshLibraryAfterMetadataChange = useCallback(
+    async (updatedItemId?: string) => {
+      const [nextItems, nextCacheStatus] = await Promise.all([
+        getLibraryItems(),
+        getCacheStatus(),
+      ]);
+      setItems(nextItems);
+      setCacheStatus(nextCacheStatus);
+
+      const detailId = selectedDetailRef.current?.id;
+      if (detailId && (!updatedItemId || updatedItemId === detailId)) {
+        const detail = await getLibraryItemDetail(detailId);
+        setSelectedDetail(detail);
+        selectedDetailRef.current = detail;
+      }
+    },
+    [],
+  );
 
   const applyScanStatus = useCallback(
     (nextStatus: LibraryScanStatus) => {
@@ -222,14 +271,34 @@ export function App() {
       }
 
       const updatedItems = nextStatus.progress?.updatedItemCount ?? 0;
-      if (nextStatus.isRunning && updatedItems > scrapeLoadedUpdatedItemsRef.current) {
+      const currentItemId = nextStatus.progress?.currentItemId ?? "";
+      const shouldRefreshForRunningScrape =
+        nextStatus.isRunning &&
+        ((updatedItems > scrapeLoadedUpdatedItemsRef.current) ||
+          (currentItemId && currentItemId !== scrapeLoadedCurrentItemRef.current));
+      if (shouldRefreshForRunningScrape) {
         scrapeLoadedUpdatedItemsRef.current = updatedItems;
-        void loadData().catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
+        scrapeLoadedCurrentItemRef.current = currentItemId;
+        void refreshLibraryAfterMetadataChange(currentItemId).catch((error: unknown) =>
+          setErrorText(error instanceof Error ? error.message : String(error)),
+        );
+      }
+
+      if (
+        !nextStatus.isRunning &&
+        isTmdbConnectionFailure(nextStatus.lastError) &&
+        nextStatus.lastError !== tmdbLastAlertedErrorRef.current
+      ) {
+        tmdbLastAlertedErrorRef.current = nextStatus.lastError ?? "";
+        setTmdbConnectionAlert(nextStatus.lastError ?? "");
       }
 
       if (scrapeWasRunningRef.current && !nextStatus.isRunning && !nextStatus.wasCanceled) {
         scrapeLoadedUpdatedItemsRef.current = 0;
-        void loadData().catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
+        scrapeLoadedCurrentItemRef.current = "";
+        void refreshLibraryAfterMetadataChange().catch((error: unknown) =>
+          setErrorText(error instanceof Error ? error.message : String(error)),
+        );
         const detailId = selectedDetailRef.current?.id;
         if (!detailId || (nextStatus.targetLibraryItemId && nextStatus.targetLibraryItemId !== detailId)) {
           scrapeWasRunningRef.current = nextStatus.isRunning;
@@ -243,25 +312,40 @@ export function App() {
 
       if (!nextStatus.isRunning) {
         scrapeLoadedUpdatedItemsRef.current = 0;
+        scrapeLoadedCurrentItemRef.current = "";
       }
 
       scrapeWasRunningRef.current = nextStatus.isRunning;
     },
-	    [loadData],
+    [refreshLibraryAfterMetadataChange],
 	  );
 
-  function refreshCacheStatusAfterCleanup(snapshot: BackgroundTaskSnapshot) {
-    const cleanupIsRunning =
+  function refreshCacheStatusAfterTasks(snapshot: BackgroundTaskSnapshot) {
+    const cacheTaskIsRunning =
       snapshot.activeTask?.kind === "asset-cache-cleanup" ||
       snapshot.activeTask?.kind === "hls-cache-cleanup" ||
-      snapshot.activeTask?.kind === "webdav-cache-cleanup";
-    if (cacheCleanupWasRunningRef.current && !cleanupIsRunning) {
+      snapshot.activeTask?.kind === "webdav-cache-cleanup" ||
+      snapshot.activeTask?.kind === "hls-cache-prewarm" ||
+      snapshot.activeTask?.kind === "library-scan" ||
+      snapshot.activeTask?.kind === "metadata-enrichment";
+    if (cacheCleanupWasRunningRef.current && !cacheTaskIsRunning) {
       void getCacheStatus()
         .then(setCacheStatus)
         .catch((error: unknown) => setErrorText(error instanceof Error ? error.message : String(error)));
     }
 
-    cacheCleanupWasRunningRef.current = cleanupIsRunning;
+    cacheCleanupWasRunningRef.current = cacheTaskIsRunning;
+
+    snapshot.tasks
+      .filter((task) => task.kind === "hls-cache-prewarm" && task.state === "completed")
+      .forEach((task) => {
+        if (seenCompletedHlsTasksRef.current.has(task.id)) {
+          return;
+        }
+
+        seenCompletedHlsTasksRef.current.add(task.id);
+        setHlsCacheNotice(task.resultText || "HLS 缓存完成");
+      });
 
     const sourceCleanupIsRunning = snapshot.activeTask?.kind === "media-source-cleanup";
     if (sourceCleanupWasRunningRef.current && !sourceCleanupIsRunning) {
@@ -293,6 +377,15 @@ export function App() {
   useEffect(() => {
     selectedDetailRef.current = selectedDetail;
   }, [selectedDetail]);
+
+  useEffect(() => {
+    if (!hlsCacheNotice) {
+      return;
+    }
+
+    const handle = window.setTimeout(() => setHlsCacheNotice(""), 5200);
+    return () => window.clearTimeout(handle);
+  }, [hlsCacheNotice]);
 
   useEffect(() => {
     if (!authStatus?.isAuthenticated) {
@@ -405,7 +498,7 @@ export function App() {
 	        const nextSnapshot = await getBackgroundTasks();
 	        if (!disposed) {
 	          setTaskSnapshot(nextSnapshot);
-	          refreshCacheStatusAfterCleanup(nextSnapshot);
+	          refreshCacheStatusAfterTasks(nextSnapshot);
 	        }
 	      } catch {
 	        // Task center status is supplementary; keep the library usable if it fails.
@@ -426,7 +519,7 @@ export function App() {
 	      try {
 	        const nextSnapshot = JSON.parse((event as MessageEvent<string>).data) as BackgroundTaskSnapshot;
 	        setTaskSnapshot(nextSnapshot);
-	        refreshCacheStatusAfterCleanup(nextSnapshot);
+	        refreshCacheStatusAfterTasks(nextSnapshot);
 	      } catch {
 	        // Ignore malformed task frames.
 	      }
@@ -459,10 +552,19 @@ export function App() {
       .filter((item) => !item.isWatched && item.maxProgressSeconds > 0 && item.maxDurationSeconds > 0)
       .slice(0, 12);
   }, [items]);
+  const activeTask = taskSnapshot?.activeTask ?? null;
+  const activeHlsCacheTask = activeTask?.kind === "hls-cache-prewarm" ? activeTask : null;
+  const activeCacheLogTask =
+    activeTask && (activeTask.kind === "hls-cache-prewarm" || activeTask.phase === "subtitle-cache")
+      ? activeTask
+      : null;
+  const selectedHlsCount = selectedHlsItemIds.length + selectedHlsVideoFileIds.length;
   const scanPercent = scanProgressPercent(scanStatus);
   const scrapePercent = scrapeProgressPercent(scrapeStatus);
   const topStatusText =
     errorText ||
+    (activeCacheLogTask ? formatBackgroundTask(activeCacheLogTask) : "") ||
+    (isHlsSelectionMode ? `选择 HLS 缓存目标：已选 ${selectedHlsCount} 个` : "") ||
     (scrapeStatus?.isRunning ? formatScrapeStatus(scrapeStatus) : "") ||
     (scanStatus?.isRunning ? formatScanStatus(scanStatus) : "") ||
     statusText;
@@ -567,6 +669,7 @@ export function App() {
   async function handleRefreshLibrary() {
     setIsScanning(true);
     setErrorText("");
+    setTmdbConnectionAlert("");
     setStatusText("正在扫描并刮削");
     try {
       applyScanStatus(await scanLibrary(buildRefreshRequest()));
@@ -598,7 +701,7 @@ export function App() {
   }
 
   async function handleCancelRefresh() {
-    if (isScanning) {
+    if (isScanning || activeTask?.kind === "library-scan") {
       await handleCancelScan();
       return;
     }
@@ -630,6 +733,52 @@ export function App() {
     }));
   }
 
+  function toggleHlsSelectionMode() {
+    setIsHlsSelectionMode((current) => {
+      const next = !current;
+      if (!next) {
+        setSelectedHlsItemIds([]);
+        setSelectedHlsVideoFileIds([]);
+      }
+
+      return next;
+    });
+  }
+
+  function toggleSelectedHlsItem(itemId: string) {
+    setSelectedHlsItemIds((current) =>
+      current.includes(itemId) ? current.filter((id) => id !== itemId) : [...current, itemId],
+    );
+  }
+
+  function toggleSelectedHlsVideoFile(fileId: string) {
+    setSelectedHlsVideoFileIds((current) =>
+      current.includes(fileId) ? current.filter((id) => id !== fileId) : [...current, fileId],
+    );
+  }
+
+  async function handleStartHlsCache() {
+    const libraryItemIds = selectedHlsItemIds;
+    const videoFileIds = selectedHlsVideoFileIds;
+    if (libraryItemIds.length === 0 && videoFileIds.length === 0) {
+      setStatusText("请选择要生成 HLS 缓存的影视或分集");
+      return;
+    }
+
+    setErrorText("");
+    setStatusText("正在提交 HLS 缓存任务");
+    try {
+      const task = await prewarmHlsCache({ libraryItemIds, videoFileIds });
+      pushBackgroundTask(task);
+      setIsHlsSelectionMode(false);
+      setSelectedHlsItemIds([]);
+      setSelectedHlsVideoFileIds([]);
+      setStatusText("HLS 缓存任务已提交");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function handleCleanupTranscodeCache() {
     setErrorText("");
     setStatusText("正在提交 HLS 缓存清理");
@@ -642,11 +791,39 @@ export function App() {
     }
   }
 
+  async function handleClearHlsCache() {
+    setErrorText("");
+    setStatusText("正在提交 HLS 缓存清除");
+    try {
+      const task = await cleanupHlsCache(undefined, undefined, true);
+      pushBackgroundTask(task);
+      setStatusText("HLS 缓存清除已提交");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleClearSubtitleCache() {
+    setErrorText("");
+    setStatusText("正在提交字幕缓存清除");
+    try {
+      const task = await cleanupSubtitleCache(undefined, true);
+      pushBackgroundTask(task);
+      setStatusText("字幕缓存清除已提交");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function handleSaveCacheSettings(
     hlsRetentionHours: number,
+    hlsMaxGb: number,
     imageCleanupScope: string,
     webDavRetentionHours: number,
     webDavMaxGb: number,
+    subtitleCachePath: string,
+    subtitleMaxGb: number,
+    subtitleCacheStrategy: string,
   ) {
     setErrorText("");
     setStatusText("正在保存缓存策略");
@@ -655,9 +832,14 @@ export function App() {
       const nextSettings = await updateAppSettings({
         cache: {
           hlsRetentionHours,
+          hlsMaxGb,
+          hlsCachePath: settings?.cache.hlsCachePath ?? "",
           imageCleanupScope,
           webDavRetentionHours,
           webDavMaxGb,
+          subtitleCachePath,
+          subtitleMaxGb,
+          subtitleCacheStrategy,
         },
       });
       setSettings(nextSettings);
@@ -706,10 +888,12 @@ export function App() {
       detail: null,
       query: item.title,
       year: item.releaseDate?.slice(0, 4) ?? "",
+      doubanSubject: "",
       candidates: [],
       isLoadingDetail: true,
       isSearching: false,
       isApplying: false,
+      isBindingDouban: false,
       error: "",
     });
 
@@ -786,6 +970,42 @@ export function App() {
       const message = error instanceof Error ? error.message : String(error);
       setMetadataSearch((current) =>
         current?.item.id === metadataSearch.item.id ? { ...current, isApplying: false, error: message } : current,
+      );
+    }
+  }
+
+  async function handleBindDoubanFromCard() {
+    if (!metadataSearch) {
+      return;
+    }
+
+    const subject = metadataSearch.doubanSubject.trim();
+    if (!subject) {
+      setMetadataSearch({ ...metadataSearch, error: "请填写豆瓣影视链接或 subject ID。" });
+      return;
+    }
+
+    setMetadataSearch({ ...metadataSearch, isBindingDouban: true, error: "" });
+    try {
+      const detail = await bindLibraryItemDouban(metadataSearch.item.id, subject);
+      syncOpenDetail(detail);
+      setMetadataSearch((current) =>
+        current?.item.id === metadataSearch.item.id
+          ? {
+              ...current,
+              detail,
+              doubanSubject: detail.douban?.subjectUrl ?? subject,
+              isBindingDouban: false,
+              error: "",
+            }
+          : current,
+      );
+      setStatusText("已绑定豆瓣链接");
+      await loadData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMetadataSearch((current) =>
+        current?.item.id === metadataSearch.item.id ? { ...current, isBindingDouban: false, error: message } : current,
       );
     }
   }
@@ -906,12 +1126,20 @@ export function App() {
           errorText={errorText}
           selectedSeasonId={selectedSeasonByDetailId[selectedDetail.id] ?? ""}
           showEpisodeDetails={normalizePlaybackSettings(settings?.playback).showEpisodeDetails}
+          hlsSelectionMode={isHlsSelectionMode}
+          isHlsTaskRunning={!!activeHlsCacheTask}
+          selectedHlsItemIds={selectedHlsItemIds}
+          selectedHlsVideoFileIds={selectedHlsVideoFileIds}
           onBack={() => {
             setPlayingFile(null);
             setSelectedDetail(null);
             restoreLibraryScroll();
           }}
           onEditMetadata={(episode) => handleOpenCustomMetadataEditFromDetail(selectedDetail, episode)}
+          onStartHlsCache={() => void handleStartHlsCache()}
+          onToggleHlsFile={toggleSelectedHlsVideoFile}
+          onToggleHlsItem={toggleSelectedHlsItem}
+          onToggleHlsSelectionMode={toggleHlsSelectionMode}
           onPlay={(file) => setPlayingFile(file)}
           onSeasonChange={(seasonId) =>
             setSelectedSeasonByDetailId((current) =>
@@ -927,6 +1155,18 @@ export function App() {
             episode={customMetadataEdit.episode}
             onClose={() => setCustomMetadataEdit(null)}
             onSave={(request) => void handleSaveCustomMetadata(request)}
+          />
+        ) : null}
+        {hlsCacheNotice ? <CacheCompleteNotice message={hlsCacheNotice} onClose={() => setHlsCacheNotice("")} /> : null}
+        {tmdbConnectionAlert ? (
+          <TmdbConnectionAlert
+            message={tmdbConnectionAlert}
+            onClose={() => setTmdbConnectionAlert("")}
+            onOpenSettings={() => {
+              setTmdbConnectionAlert("");
+              setSelectedDetail(null);
+              setIsSettingsOpen(true);
+            }}
           />
         ) : null}
       </>
@@ -992,8 +1232,11 @@ export function App() {
 
       {isSettingsOpen && settings ? (
         <SettingsPanel
+          cacheStatus={cacheStatus}
           isSaving={isSavingSettings}
           onClose={() => setIsSettingsOpen(false)}
+          onClearHlsCache={() => void handleClearHlsCache()}
+          onClearSubtitleCache={() => void handleClearSubtitleCache()}
           onSave={(tmdb, cache, playback, proxy, automation) =>
             void handleSaveAppSettings(tmdb, cache, playback, proxy, automation)
           }
@@ -1005,9 +1248,14 @@ export function App() {
         <MetadataSearchModal
           state={metadataSearch}
           onApply={(match) => void handleApplyMetadataSearchCandidate(match)}
+          onBindDouban={() => void handleBindDoubanFromCard()}
+          onChangeDoubanSubject={(doubanSubject) =>
+            setMetadataSearch((current) => (current ? { ...current, doubanSubject } : current))
+          }
           onChangeQuery={(query) => setMetadataSearch((current) => (current ? { ...current, query } : current))}
           onChangeYear={(year) => setMetadataSearch((current) => (current ? { ...current, year } : current))}
           onClose={() => setMetadataSearch(null)}
+          onOpenDoubanSearch={() => openDoubanSearch(metadataSearch.query || metadataSearch.item.title)}
           onSearch={() => void handleSearchMetadataFromCard()}
         />
       ) : null}
@@ -1023,6 +1271,18 @@ export function App() {
         />
       ) : null}
 
+      {tmdbConnectionAlert ? (
+        <TmdbConnectionAlert
+          message={tmdbConnectionAlert}
+          onClose={() => setTmdbConnectionAlert("")}
+          onOpenSettings={() => {
+            setTmdbConnectionAlert("");
+            setSelectedDetail(null);
+            setIsSettingsOpen(true);
+          }}
+        />
+      ) : null}
+
       <section className="continue">
         <h1>继续播放</h1>
         {continueItems.length > 0 ? (
@@ -1034,6 +1294,9 @@ export function App() {
                 onEdit={(target) => void handleOpenCustomMetadataEdit(target)}
                 onOpen={openDetail}
                 onSearchMetadata={(target) => void handleOpenMetadataSearch(target)}
+                hlsSelectionMode={isHlsSelectionMode}
+                hlsSelected={selectedHlsItemIds.includes(item.id)}
+                onToggleHlsSelection={toggleSelectedHlsItem}
                 onToggleWatched={(target) => void toggleLibraryItemWatched(target)}
                 showProgress
               />
@@ -1083,6 +1346,40 @@ export function App() {
             >
               {sortDirection === "desc" ? "↓" : "↑"}
             </button>
+            <button
+              aria-label="hls cache selection"
+              className={isHlsSelectionMode ? "headerTextButton active" : "headerTextButton"}
+              disabled={!!activeHlsCacheTask}
+              onClick={toggleHlsSelectionMode}
+              title="HLS 缓存"
+              type="button"
+            >
+              <Download size={16} />
+              <span>HLS</span>
+            </button>
+            {isHlsSelectionMode ? (
+              <>
+                <button
+                  aria-label="start hls cache"
+                  className="headerTextButton"
+                  disabled={selectedHlsCount === 0 || !!activeHlsCacheTask}
+                  onClick={() => void handleStartHlsCache()}
+                  title="开始缓存"
+                  type="button"
+                >
+                  <CheckCircle2 size={16} />
+                  <span>开始</span>
+                </button>
+                <button
+                  aria-label="cancel hls cache selection"
+                  onClick={toggleHlsSelectionMode}
+                  title="取消选择"
+                  type="button"
+                >
+                  <X size={18} />
+                </button>
+              </>
+            ) : null}
           </div>
         </div>
         {isSearchOpen ? (
@@ -1105,11 +1402,15 @@ export function App() {
               onEdit={(target) => void handleOpenCustomMetadataEdit(target)}
               onOpen={openDetail}
               onSearchMetadata={(target) => void handleOpenMetadataSearch(target)}
+              hlsSelectionMode={isHlsSelectionMode}
+              hlsSelected={selectedHlsItemIds.includes(item.id)}
+              onToggleHlsSelection={toggleSelectedHlsItem}
               onToggleWatched={(target) => void toggleLibraryItemWatched(target)}
             />
           ))}
         </div>
       </section>
+      {hlsCacheNotice ? <CacheCompleteNotice message={hlsCacheNotice} onClose={() => setHlsCacheNotice("")} /> : null}
     </main>
   );
 }
@@ -1338,6 +1639,20 @@ function formatScrapeStatus(status: LibraryMetadataEnrichmentStatus): string {
   }
 
   return "";
+}
+
+function isTmdbConnectionFailure(message?: string | null): boolean {
+  return !!message && message.includes("TMDB API 无法连接");
+}
+
+function openDoubanSearch(query: string) {
+  const normalized = query.trim();
+  if (!normalized) {
+    return;
+  }
+
+  const url = `https://search.douban.com/movie/subject_search?search_text=${encodeURIComponent(normalized)}`;
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 function scrapeProgressPercent(status: LibraryMetadataEnrichmentStatus | null): number | null {
@@ -1627,6 +1942,136 @@ function formatSourceScanStatus(scanStatus: LibraryScanStatus | null): string | 
   return "刷新中";
 }
 
+type CachePathPickerTarget = "hls" | "subtitles";
+
+function CacheDirectoryPickerModal({
+  initialPath,
+  label,
+  onClose,
+  onSelect,
+}: {
+  initialPath: string;
+  label: string;
+  onClose: () => void;
+  onSelect: (path: string) => void;
+}) {
+  const [browsePath, setBrowsePath] = useState(initialPath === "默认缓存目录" ? "" : initialPath);
+  const [browseResult, setBrowseResult] = useState<LocalDirectoryBrowseResult | null>(null);
+  const [browseError, setBrowseError] = useState("");
+  const [isBrowsing, setIsBrowsing] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    void loadDirectory(browsePath, () => disposed);
+
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  async function loadDirectory(path: string, isDisposed: () => boolean = () => false) {
+    setIsBrowsing(true);
+    setBrowseError("");
+    try {
+      const result = await browseLocalDirectories(path);
+      if (!isDisposed()) {
+        setBrowseResult(result);
+        setBrowsePath(result.currentPath);
+      }
+    } catch (error) {
+      if (!isDisposed()) {
+        setBrowseError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (!isDisposed()) {
+        setIsBrowsing(false);
+      }
+    }
+  }
+
+  const currentPath = browseResult?.currentPath ?? (browsePath || "/");
+  const directoryEntries = (browseResult?.entries ?? [])
+    .slice()
+    .sort((left, right) => {
+      if (left.isReadable !== right.isReadable) {
+        return left.isReadable ? -1 : 1;
+      }
+
+      return left.name.localeCompare(right.name, "zh-CN", { sensitivity: "base", numeric: true });
+    });
+
+  return (
+    <div className="settingsOverlay modalOverlay cachePathPickerOverlay" role="dialog" aria-label={label} aria-modal="true">
+      <button className="settingsBackdrop" aria-label="close cache path picker" onClick={onClose} type="button" />
+      <aside className="metadataDialog cachePathPickerDialog">
+        <header className="settingsHeader">
+          <div>
+            <h2>{label}</h2>
+            <span>选择 docker 容器可访问的目录</span>
+          </div>
+          <button aria-label="close cache path picker" onClick={onClose} type="button">
+            <X size={18} />
+          </button>
+        </header>
+        <section className="cachePathPickerBody">
+          <div className="directoryBrowser">
+            <div className="directoryPath">
+              <span className="currentDirectoryPath">{currentPath}</span>
+              <button disabled={isBrowsing || !currentPath} onClick={() => onSelect(currentPath)} type="button">
+                <CheckCircle2 size={15} />
+                <span>使用此目录</span>
+              </button>
+            </div>
+            {browseError ? <strong>{browseError}</strong> : null}
+            <div className="directoryList">
+              {browseResult?.parentPath ? (
+                <div className="directoryRow" key="parent">
+                  <button
+                    className="directoryOpenButton"
+                    disabled={isBrowsing}
+                    onClick={() => void loadDirectory(browseResult.parentPath ?? "")}
+                    type="button"
+                  >
+                    <ArrowLeft size={15} />
+                    <span>上级目录</span>
+                  </button>
+                </div>
+              ) : null}
+              {directoryEntries.map((entry) => (
+                <div className="directoryRow" key={entry.path} title={entry.path}>
+                  <button
+                    className="directoryOpenButton"
+                    disabled={isBrowsing || !entry.isReadable}
+                    onClick={() => void loadDirectory(entry.path)}
+                    type="button"
+                  >
+                    <FolderOpen size={15} />
+                    <span>{entry.name}</span>
+                  </button>
+                  {!entry.isReadable ? <em>不可访问</em> : null}
+                  <button
+                    aria-label={`选择 ${entry.name}`}
+                    className="starButton selected"
+                    disabled={isBrowsing || !entry.isReadable}
+                    onClick={() => onSelect(entry.path)}
+                    title="选择此目录"
+                    type="button"
+                  >
+                    <CheckCircle2 size={15} />
+                  </button>
+                </div>
+              ))}
+              {!browseResult || browseResult.entries.length > 0 || browseResult.parentPath ? null : (
+                <div className="sourceEmpty">没有子目录</div>
+              )}
+            </div>
+          </div>
+        </section>
+      </aside>
+    </div>
+  );
+}
+
 function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -1637,13 +2082,19 @@ function formatDateTime(value: string): string {
 }
 
 function SettingsPanel({
+  cacheStatus,
   isSaving,
   onClose,
+  onClearHlsCache,
+  onClearSubtitleCache,
   onSave,
   settings,
 }: {
+  cacheStatus: CacheUsageSummary | null;
   isSaving: boolean;
   onClose: () => void;
+  onClearHlsCache: () => void;
+  onClearSubtitleCache: () => void;
   onSave: (
     tmdb: AppSettingsSnapshot["tmdb"],
     cache: CacheSettings,
@@ -1658,7 +2109,7 @@ function SettingsPanel({
   const [tmdbTest, setTmdbTest] = useState<TmdbConnectionTestResult | null>(null);
   const [tmdbTestError, setTmdbTestError] = useState("");
   const [isTestingTmdb, setIsTestingTmdb] = useState(false);
-  const [cache, setCache] = useState(settings.cache);
+  const [cache, setCache] = useState(normalizeCacheSettings(settings.cache));
   const [playback, setPlayback] = useState(normalizePlaybackSettings(settings.playback));
   const [proxy, setProxy] = useState(settings.proxy);
   const [automation, setAutomation] = useState(normalizeAutomationSettings(settings.automation));
@@ -1672,13 +2123,15 @@ function SettingsPanel({
   const [selfCheckError, setSelfCheckError] = useState("");
   const [isCheckingRuntime, setIsCheckingRuntime] = useState(false);
   const [isSelfCheckExpanded, setIsSelfCheckExpanded] = useState(false);
+  const [cachePathPicker, setCachePathPicker] = useState<CachePathPickerTarget | null>(null);
+  const [cacheClearTarget, setCacheClearTarget] = useState<"hls" | "subtitles" | null>(null);
 
   useEffect(() => {
     setTmdb(settings.tmdb);
     setTmdbCredential(readTmdbCredential(settings.tmdb));
     setTmdbTest(null);
     setTmdbTestError("");
-    setCache(settings.cache);
+    setCache(normalizeCacheSettings(settings.cache));
     setPlayback(normalizePlaybackSettings(settings.playback));
     setProxy(settings.proxy);
     setAutomation(normalizeAutomationSettings(settings.automation));
@@ -1699,8 +2152,13 @@ function SettingsPanel({
       {
         ...cache,
         hlsRetentionHours: Math.min(720, Math.max(1, Math.round(cache.hlsRetentionHours || 24))),
+        hlsMaxGb: Math.min(1024, Math.max(1, Math.round(cache.hlsMaxGb || 30))),
+        hlsCachePath: cache.hlsCachePath?.trim() ?? "",
         webDavRetentionHours: Math.min(720, Math.max(1, Math.round(cache.webDavRetentionHours || 72))),
         webDavMaxGb: Math.min(1024, Math.max(1, Math.round(cache.webDavMaxGb || 20))),
+        subtitleCachePath: cache.subtitleCachePath?.trim() ?? "",
+        subtitleMaxGb: Math.min(1024, Math.max(1, Math.round(cache.subtitleMaxGb || 20))),
+        subtitleCacheStrategy: cache.subtitleCacheStrategy === "full" ? "full" : "optimized",
       },
       {
         ...playback,
@@ -1760,6 +2218,33 @@ function SettingsPanel({
     } finally {
       setIsTestingProxy(false);
     }
+  }
+
+  const hlsCacheBucket = cacheStatus?.buckets.find((bucket) => bucket.key === "transcode");
+  const subtitleCacheBucket = cacheStatus?.buckets.find((bucket) => bucket.key === "subtitles");
+  const hlsCacheDisplayPath = cache.hlsCachePath?.trim() || hlsCacheBucket?.path || "默认缓存目录";
+  const subtitleCacheDisplayPath = cache.subtitleCachePath?.trim() || subtitleCacheBucket?.path || "默认缓存目录";
+  const settingsHlsBytes = cacheStatus ? sumCacheBuckets(cacheStatus, ["transcode"]) : 0;
+  const settingsSubtitleBytes = cacheStatus ? sumCacheBuckets(cacheStatus, ["subtitles"]) : 0;
+
+  function handleSelectCachePath(path: string) {
+    if (cachePathPicker === "hls") {
+      setCache((current) => ({ ...current, hlsCachePath: path }));
+    } else if (cachePathPicker === "subtitles") {
+      setCache((current) => ({ ...current, subtitleCachePath: path }));
+    }
+
+    setCachePathPicker(null);
+  }
+
+  function handleConfirmCacheClear() {
+    if (cacheClearTarget === "hls") {
+      onClearHlsCache();
+    } else if (cacheClearTarget === "subtitles") {
+      onClearSubtitleCache();
+    }
+
+    setCacheClearTarget(null);
   }
 
   const runtimeSelfCheckSection = (
@@ -1840,8 +2325,9 @@ function SettingsPanel({
                 onChange={(event) => setTmdb({ ...tmdb, enableBuiltInPublicSource: event.target.checked })}
                 type="checkbox"
               />
-              <span>内置公开源</span>
+              <span>启用公共源</span>
             </label>
+            <p className="settingsHint">公开源码不内置个人 TMDB Key。请填写自定义 API，或通过环境变量提供。</p>
             <label className="settingsField">
               <span>自定义 API</span>
               <input
@@ -1882,7 +2368,7 @@ function SettingsPanel({
               <input
                 autoComplete="off"
                 onChange={(event) => setProxy({ ...proxy, url: event.target.value })}
-                placeholder="http://192.168.1.2:7890"
+                placeholder="http://192.168.1.2:7890 或 socks5://192.168.1.2:7890"
                 value={proxy.url}
               />
             </label>
@@ -1899,6 +2385,30 @@ function SettingsPanel({
 
           <section className="settingsSection">
             <h3>缓存</h3>
+            <div className="settingsCacheUsage">
+              <span>HLS {formatBytes(settingsHlsBytes)}</span>
+              <span>字幕 {formatBytes(settingsSubtitleBytes)}</span>
+            </div>
+            <div className="settingsActionRow">
+              <button
+                className="settingsDangerButton"
+                disabled={settingsHlsBytes <= 0}
+                onClick={() => setCacheClearTarget("hls")}
+                type="button"
+              >
+                <Trash2 size={15} />
+                <span>清除 HLS 缓存</span>
+              </button>
+              <button
+                className="settingsDangerButton"
+                disabled={settingsSubtitleBytes <= 0}
+                onClick={() => setCacheClearTarget("subtitles")}
+                type="button"
+              >
+                <Trash2 size={15} />
+                <span>清除字幕缓存</span>
+              </button>
+            </div>
             <label className="settingsField">
               <span>HLS 保留小时</span>
               <input
@@ -1910,6 +2420,29 @@ function SettingsPanel({
               />
             </label>
             <label className="settingsField">
+              <span>HLS 上限 GB</span>
+              <input
+                max={1024}
+                min={1}
+                onChange={(event) => setCache({ ...cache, hlsMaxGb: Number(event.target.value) })}
+                type="number"
+                value={cache.hlsMaxGb}
+              />
+            </label>
+            <div className="settingsPathField">
+              <span>HLS 缓存位置</span>
+              <div>
+                <strong title={hlsCacheDisplayPath}>{hlsCacheDisplayPath}</strong>
+                <button onClick={() => setCachePathPicker("hls")} type="button">
+                  <FolderOpen size={15} />
+                  <span>选择</span>
+                </button>
+                <button onClick={() => setCache({ ...cache, hlsCachePath: "" })} type="button">
+                  <span>默认</span>
+                </button>
+              </div>
+            </div>
+            <label className="settingsField">
               <span>图片清理范围</span>
               <select
                 onChange={(event) => setCache({ ...cache, imageCleanupScope: event.target.value })}
@@ -1919,6 +2452,42 @@ function SettingsPanel({
                 <option value="orphans-only">仅孤儿记录</option>
               </select>
             </label>
+            <div className="settingsPathField">
+              <span>字幕缓存位置</span>
+              <div>
+                <strong title={subtitleCacheDisplayPath}>{subtitleCacheDisplayPath}</strong>
+                <button onClick={() => setCachePathPicker("subtitles")} type="button">
+                  <FolderOpen size={15} />
+                  <span>选择</span>
+                </button>
+                <button onClick={() => setCache({ ...cache, subtitleCachePath: "" })} type="button">
+                  <span>默认</span>
+                </button>
+              </div>
+            </div>
+            <label className="settingsField">
+              <span>字幕缓存上限 GB</span>
+              <input
+                max={1024}
+                min={1}
+                onChange={(event) => setCache({ ...cache, subtitleMaxGb: Number(event.target.value) })}
+                type="number"
+                value={cache.subtitleMaxGb ?? 20}
+              />
+            </label>
+            <label className="settingsField">
+              <span>字幕缓存方案</span>
+              <select
+                onChange={(event) => setCache({ ...cache, subtitleCacheStrategy: event.target.value })}
+                value={cache.subtitleCacheStrategy ?? "optimized"}
+              >
+                <option value="optimized">优化缓存方案</option>
+                <option value="full">全量缓存</option>
+              </select>
+            </label>
+            <p className="settingsHint">
+              优化缓存只预处理更可能播放的下一集或未缓存字幕，适合日常后台维护；全量缓存会尽量遍历媒体库里所有可缓存字幕，耗时和磁盘占用更高，适合首次导入或集中预热。
+            </p>
           </section>
 
           <section className="settingsSection">
@@ -1992,8 +2561,53 @@ function SettingsPanel({
             </label>
           </section>
 
+          <section className="settingsSection">
+            <div className="settingsVersionRow">
+              <div>
+                <h3>版本</h3>
+                <span>当前版本 {APP_VERSION}</span>
+              </div>
+              <button
+                onClick={() => window.open(APP_UPDATE_URL, "_blank", "noopener,noreferrer")}
+                type="button"
+              >
+                <ExternalLink size={15} />
+                <span>检查更新</span>
+              </button>
+            </div>
+          </section>
+
         </form>
       </aside>
+      {cacheClearTarget ? (
+        <div className="settingsOverlay modalOverlay settingsConfirmOverlay" role="dialog" aria-modal="true" aria-label="确认清除缓存">
+          <button className="settingsBackdrop" aria-label="cancel cache cleanup" onClick={() => setCacheClearTarget(null)} type="button" />
+          <div className="settingsConfirmDialog">
+            <h3>确认清除{cacheClearTarget === "hls" ? " HLS" : "字幕"}缓存？</h3>
+            <p>
+              将删除当前可清理的{cacheClearTarget === "hls" ? " HLS 转码缓存" : "字幕缓存"}文件。
+              {cacheClearTarget === "hls" ? " 正在使用的播放会话不会被中断。" : ""}
+            </p>
+            <div>
+              <button onClick={() => setCacheClearTarget(null)} type="button">
+                取消
+              </button>
+              <button className="settingsDangerButton" onClick={handleConfirmCacheClear} type="button">
+                <Trash2 size={15} />
+                <span>确认清除</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {cachePathPicker ? (
+        <CacheDirectoryPickerModal
+          initialPath={cachePathPicker === "hls" ? hlsCacheDisplayPath : subtitleCacheDisplayPath}
+          label={cachePathPicker === "hls" ? "HLS 缓存位置" : "字幕缓存位置"}
+          onClose={() => setCachePathPicker(null)}
+          onSelect={handleSelectCachePath}
+        />
+      ) : null}
     </div>
   );
 }
@@ -2020,6 +2634,22 @@ function applyTmdbCredential(
   }
 
   return { ...settings, customApiKey: normalizedCredential, customAccessToken: "" };
+}
+
+function normalizeCacheSettings(settings?: Partial<CacheSettings> | null): CacheSettings {
+  return {
+    ...defaultCacheSettings,
+    ...settings,
+    hlsRetentionHours: settings?.hlsRetentionHours ?? 24,
+    hlsMaxGb: settings?.hlsMaxGb ?? 30,
+    hlsCachePath: settings?.hlsCachePath ?? "",
+    imageCleanupScope: settings?.imageCleanupScope ?? "orphans-and-untracked",
+    webDavRetentionHours: settings?.webDavRetentionHours ?? 72,
+    webDavMaxGb: settings?.webDavMaxGb ?? 20,
+    subtitleCachePath: settings?.subtitleCachePath ?? "",
+    subtitleMaxGb: settings?.subtitleMaxGb ?? 20,
+    subtitleCacheStrategy: settings?.subtitleCacheStrategy === "full" ? "full" : "optimized",
+  };
 }
 
 function looksLikeTmdbAccessToken(value: string): boolean {
@@ -2099,13 +2729,21 @@ function CacheMaintenance({
   onCleanupTranscode: () => void;
   onSaveSettings: (
     hlsRetentionHours: number,
+    hlsMaxGb: number,
     imageCleanupScope: string,
     webDavRetentionHours: number,
     webDavMaxGb: number,
+    subtitleCachePath: string,
+    subtitleMaxGb: number,
+    subtitleCacheStrategy: string,
   ) => void;
 }) {
   const [hlsRetentionHours, setHlsRetentionHours] = useState(24);
+  const [hlsMaxGb, setHlsMaxGb] = useState(30);
   const [imageCleanupScope, setImageCleanupScope] = useState("orphans-and-untracked");
+  const [subtitleCachePath, setSubtitleCachePath] = useState("");
+  const [subtitleMaxGb, setSubtitleMaxGb] = useState(20);
+  const [subtitleCacheStrategy, setSubtitleCacheStrategy] = useState("optimized");
 
   useEffect(() => {
     if (!cacheSettings) {
@@ -2113,10 +2751,18 @@ function CacheMaintenance({
     }
 
     setHlsRetentionHours(cacheSettings.hlsRetentionHours);
+    setHlsMaxGb(cacheSettings.hlsMaxGb);
     setImageCleanupScope(cacheSettings.imageCleanupScope);
+    setSubtitleCachePath(cacheSettings.subtitleCachePath ?? "");
+    setSubtitleMaxGb(cacheSettings.subtitleMaxGb ?? 20);
+    setSubtitleCacheStrategy(cacheSettings.subtitleCacheStrategy ?? "optimized");
   }, [
     cacheSettings?.hlsRetentionHours,
+    cacheSettings?.hlsMaxGb,
     cacheSettings?.imageCleanupScope,
+    cacheSettings?.subtitleCachePath,
+    cacheSettings?.subtitleMaxGb,
+    cacheSettings?.subtitleCacheStrategy,
   ]);
 
   if (!cacheStatus) {
@@ -2125,13 +2771,14 @@ function CacheMaintenance({
 
   const imageBytes = sumCacheBuckets(cacheStatus, ["posters", "thumbnails"]);
   const transcodeBytes = sumCacheBuckets(cacheStatus, ["transcode"]);
+  const subtitleBytes = sumCacheBuckets(cacheStatus, ["subtitles"]);
 
   return (
     <section className="cacheMaintenance" aria-label="cache maintenance">
       <div>
         <strong>{formatBytes(cacheStatus.totalBytes)}</strong>
         <span>
-          图片 {formatBytes(imageBytes)} · HLS {formatBytes(transcodeBytes)} · {cacheStatus.totalFileCount} 文件
+          图片 {formatBytes(imageBytes)} · HLS {formatBytes(transcodeBytes)} · 字幕 {formatBytes(subtitleBytes)} · {cacheStatus.totalFileCount} 文件
         </span>
       </div>
       <div className="cacheActions">
@@ -2143,6 +2790,14 @@ function CacheMaintenance({
           type="number"
           value={hlsRetentionHours}
         />
+        <input
+          aria-label="hls max gb"
+          min={1}
+          max={1024}
+          onChange={(event) => setHlsMaxGb(Number(event.target.value))}
+          type="number"
+          value={hlsMaxGb}
+        />
         <select
           aria-label="image cleanup scope"
           onChange={(event) => setImageCleanupScope(event.target.value)}
@@ -2151,13 +2806,33 @@ function CacheMaintenance({
           <option value="orphans-and-untracked">孤儿+残留</option>
           <option value="orphans-only">仅孤儿</option>
         </select>
+        <input
+          aria-label="subtitle max gb"
+          min={1}
+          max={1024}
+          onChange={(event) => setSubtitleMaxGb(Number(event.target.value))}
+          type="number"
+          value={subtitleMaxGb}
+        />
+        <select
+          aria-label="subtitle cache strategy"
+          onChange={(event) => setSubtitleCacheStrategy(event.target.value)}
+          value={subtitleCacheStrategy}
+        >
+          <option value="optimized">优化字幕</option>
+          <option value="full">全量字幕</option>
+        </select>
         <button
           disabled={disabled || isSaving || !cacheSettings}
           onClick={() => onSaveSettings(
             hlsRetentionHours,
+            hlsMaxGb,
             imageCleanupScope,
             cacheSettings?.webDavRetentionHours ?? 72,
             cacheSettings?.webDavMaxGb ?? 20,
+            subtitleCachePath,
+            subtitleMaxGb,
+            subtitleCacheStrategy,
           )}
         >
           <span>{isSaving ? "保存中" : "保存"}</span>
@@ -2231,6 +2906,62 @@ function TaskCenter({
   );
 }
 
+function CacheCompleteNotice({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div className="cacheCompleteNotice" role="status" aria-live="polite">
+      <div>
+        <CheckCircle2 size={22} />
+        <strong>缓存完成</strong>
+        <span>{message}</span>
+        <button aria-label="close cache notice" onClick={onClose} type="button">
+          <X size={16} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TmdbConnectionAlert({
+  message,
+  onClose,
+  onOpenSettings,
+}: {
+  message: string;
+  onClose: () => void;
+  onOpenSettings: () => void;
+}) {
+  return (
+    <div className="settingsOverlay modalOverlay" role="alertdialog" aria-label="tmdb connection alert" aria-modal="true">
+      <button className="settingsBackdrop" aria-label="close tmdb alert" onClick={onClose} type="button" />
+      <section className="metadataDialog tmdbConnectionDialog">
+        <header className="settingsHeader">
+          <div>
+            <h2>TMDB API 无法连接</h2>
+          </div>
+          <button aria-label="close tmdb alert" onClick={onClose} type="button">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="metadataDialogBody">
+          <p className="tmdbConnectionMessage">
+            检测到有待刮削的影视，但 TMDB 暂时无法连接。请开启代理，或在设置中添加自定义 TMDB API 后重新刮削。
+          </p>
+          <p className="tmdbConnectionDetail">{formatUserVisibleError(message)}</p>
+        </div>
+        <footer className="settingsFooter">
+          <button onClick={onClose} type="button">
+            关闭
+          </button>
+          <button onClick={onOpenSettings} type="button">
+            <Settings size={15} />
+            <span>打开设置</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function formatBackgroundTask(task: BackgroundTaskSnapshot["tasks"][number]): string {
   if (task.isCancellationRequested) {
     return "正在取消";
@@ -2258,16 +2989,22 @@ function formatBackgroundTask(task: BackgroundTaskSnapshot["tasks"][number]): st
 function MetadataSearchModal({
   state,
   onApply,
+  onBindDouban,
+  onChangeDoubanSubject,
   onChangeQuery,
   onChangeYear,
   onClose,
+  onOpenDoubanSearch,
   onSearch,
 }: {
   state: MetadataSearchState;
   onApply: (match: TmdbMetadataMatch) => void;
+  onBindDouban: () => void;
+  onChangeDoubanSubject: (subject: string) => void;
   onChangeQuery: (query: string) => void;
   onChangeYear: (year: string) => void;
   onClose: () => void;
+  onOpenDoubanSearch: () => void;
   onSearch: () => void;
 }) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -2281,7 +3018,7 @@ function MetadataSearchModal({
       <section className="metadataDialog">
         <header className="settingsHeader">
           <div>
-            <h2>重新匹配 TMDB</h2>
+            <h2>手动匹配</h2>
             <span>{state.item.title}</span>
           </div>
           <button aria-label="close metadata search" onClick={onClose} type="button">
@@ -2314,6 +3051,41 @@ function MetadataSearchModal({
               <span>{state.isSearching ? "搜索中" : "搜索"}</span>
             </button>
           </form>
+
+          <div className="metadataSearchForm doubanBindForm">
+            <input
+              aria-label="Douban subject"
+              onChange={(event) => onChangeDoubanSubject(event.target.value)}
+              placeholder="豆瓣链接或 subject ID"
+              value={state.doubanSubject}
+            />
+            <button
+              disabled={state.isSearching || state.isApplying || state.isBindingDouban}
+              onClick={onOpenDoubanSearch}
+              type="button"
+            >
+              <ExternalLink size={15} />
+              <span>浏览器搜索豆瓣</span>
+            </button>
+            <button
+              disabled={state.isSearching || state.isApplying || state.isBindingDouban || !state.doubanSubject.trim()}
+              onClick={onBindDouban}
+              type="button"
+            >
+              <span>{state.isBindingDouban ? "绑定中" : "绑定链接"}</span>
+            </button>
+          </div>
+          <p className="doubanBindHint">找到正确豆瓣条目后复制 subject 链接回来绑定；Docker 版会尝试抓取豆瓣评分，遇到 403 时只保存链接。</p>
+          {state.detail?.douban ? (
+            <div className="doubanBindingStatus">
+              <span>当前绑定</span>
+              <a href={state.detail.douban.subjectUrl} rel="noreferrer" target="_blank">
+                {state.detail.douban.subjectUrl}
+              </a>
+              {state.detail.douban.rating ? <strong>豆瓣 {state.detail.douban.rating.toFixed(1)}</strong> : null}
+              {!state.detail.douban.rating ? <em>未抓到豆瓣评分，可能是豆瓣返回 403 或验证页面。</em> : null}
+            </div>
+          ) : null}
 
           {state.error ? <strong className="metadataDialogError">{state.error}</strong> : null}
           {!state.error && state.candidates.length === 0 && !state.isSearching ? (
@@ -2371,8 +3143,11 @@ function CustomMetadataEditModal({
 }) {
   const [title, setTitle] = useState(detail.title);
   const [releaseDate, setReleaseDate] = useState(detail.releaseDate ?? "");
-  const [voteAverage, setVoteAverage] = useState(
+  const [tmdbVoteAverage, setTmdbVoteAverage] = useState(
     typeof detail.voteAverage === "number" && Number.isFinite(detail.voteAverage) ? detail.voteAverage.toFixed(1) : "",
+  );
+  const [doubanRating, setDoubanRating] = useState(
+    typeof detail.doubanRating === "number" && Number.isFinite(detail.doubanRating) ? detail.doubanRating.toFixed(1) : "",
   );
   const [overview, setOverview] = useState(detail.overview ?? "");
   const [episodeSubtitle, setEpisodeSubtitle] = useState(extractEpisodeSubtitle(episode?.title));
@@ -2401,10 +3176,17 @@ function CustomMetadataEditModal({
       return;
     }
 
-    const trimmedVote = voteAverage.trim();
-    const parsedVote = trimmedVote ? Number(trimmedVote) : null;
-    if (parsedVote !== null && (!Number.isFinite(parsedVote) || parsedVote < 0 || parsedVote > 10)) {
-      setLocalError("评分需要在 0 到 10 之间。");
+    const trimmedTMDBVote = tmdbVoteAverage.trim();
+    const parsedTMDBVote = trimmedTMDBVote ? Number(trimmedTMDBVote) : null;
+    if (parsedTMDBVote !== null && (!Number.isFinite(parsedTMDBVote) || parsedTMDBVote < 0 || parsedTMDBVote > 10)) {
+      setLocalError("TMDB评分需要在 0 到 10 之间。");
+      return;
+    }
+
+    const trimmedDoubanRating = doubanRating.trim();
+    const parsedDoubanRating = trimmedDoubanRating ? Number(trimmedDoubanRating) : null;
+    if (parsedDoubanRating !== null && (!Number.isFinite(parsedDoubanRating) || parsedDoubanRating < 0 || parsedDoubanRating > 10)) {
+      setLocalError("豆瓣评分需要在 0 到 10 之间。");
       return;
     }
 
@@ -2412,7 +3194,8 @@ function CustomMetadataEditModal({
       title: trimmedTitle,
       releaseDate: releaseDate.trim() || null,
       overview: overview.trim() || null,
-      voteAverage: parsedVote,
+      voteAverage: parsedTMDBVote,
+      doubanRating: parsedDoubanRating,
       posterFile,
       episodeId: episode?.id ?? null,
       episodeSubtitle: episode ? episodeSubtitle.trim() : null,
@@ -2461,13 +3244,23 @@ function CustomMetadataEditModal({
               />
             </label>
             <label className="settingsField">
-              <span>评分</span>
+              <span>TMDB评分</span>
               <input
                 disabled={isSaving}
                 inputMode="decimal"
-                onChange={(event) => setVoteAverage(event.target.value)}
+                onChange={(event) => setTmdbVoteAverage(event.target.value)}
                 placeholder="0.0 - 10.0"
-                value={voteAverage}
+                value={tmdbVoteAverage}
+              />
+            </label>
+            <label className="settingsField">
+              <span>豆瓣评分</span>
+              <input
+                disabled={isSaving}
+                inputMode="decimal"
+                onChange={(event) => setDoubanRating(event.target.value)}
+                placeholder="0.0 - 10.0"
+                value={doubanRating}
               />
             </label>
           </section>
@@ -2555,23 +3348,31 @@ function extractEpisodeSubtitle(title?: string | null): string {
 }
 
 function PosterCard({
+  hlsSelected = false,
+  hlsSelectionMode = false,
   item,
   onEdit,
   onOpen,
   onSearchMetadata,
+  onToggleHlsSelection,
   onToggleWatched,
   showProgress = false,
 }: {
+  hlsSelected?: boolean;
+  hlsSelectionMode?: boolean;
   item: LibraryItemSummary;
   onEdit?: (item: LibraryItemSummary) => void;
   onOpen?: (item: LibraryItemSummary) => void;
   onSearchMetadata?: (item: LibraryItemSummary) => void;
+  onToggleHlsSelection?: (itemId: string) => void;
   onToggleWatched?: (item: LibraryItemSummary) => void;
   showProgress?: boolean;
 }) {
   const year = item.releaseDate?.slice(0, 4) ?? "";
-  const rating =
+  const tmdbRating =
     typeof item.voteAverage === "number" && Number.isFinite(item.voteAverage) ? item.voteAverage.toFixed(1) : null;
+  const doubanRating =
+    typeof item.doubanRating === "number" && Number.isFinite(item.doubanRating) ? item.doubanRating.toFixed(1) : null;
   const progressPercent = playbackProgressPercent(item);
 
   function handleCardAction(event: MouseEvent<HTMLButtonElement>, action?: (target: LibraryItemSummary) => void) {
@@ -2580,11 +3381,44 @@ function PosterCard({
     action?.(item);
   }
 
+  function handleOpenOrSelect() {
+    if (hlsSelectionMode) {
+      onToggleHlsSelection?.(item.id);
+      return;
+    }
+
+    onOpen?.(item);
+  }
+
   return (
-    <article className="posterCard" onClick={() => onOpen?.(item)}>
+    <article className={hlsSelected ? "posterCard selectedForHls" : "posterCard"} onClick={handleOpenOrSelect}>
       <div className="posterArt">
         {item.posterAssetId ? <img alt="" src={posterUrl(item.posterAssetId)} /> : null}
-        {rating ? <span>{rating}</span> : null}
+        {tmdbRating || doubanRating ? (
+          <div className="posterRatingStack">
+            {tmdbRating ? (
+              <span className="posterRating tmdbRating">{tmdbRating}</span>
+            ) : null}
+            {doubanRating ? (
+              <span className="posterRating doubanRating">{doubanRating}</span>
+            ) : null}
+          </div>
+        ) : null}
+        {hlsSelectionMode ? (
+          <button
+            aria-label={hlsSelected ? `取消 HLS 缓存 ${item.title}` : `选择 HLS 缓存 ${item.title}`}
+            className={hlsSelected ? "hlsSelectBadge selected" : "hlsSelectBadge"}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onToggleHlsSelection?.(item.id);
+            }}
+            title={hlsSelected ? "取消缓存选择" : "选择缓存"}
+            type="button"
+          >
+            {hlsSelected ? <CheckCircle2 size={16} /> : <Download size={15} />}
+          </button>
+        ) : null}
         <div className="posterArtActions">
           <button
             aria-label={`搜索刮削 ${item.title}`}
@@ -2641,27 +3475,70 @@ function playbackProgressPercent(item: LibraryItemSummary): number {
   return Math.round((Math.min(item.maxProgressSeconds, item.maxDurationSeconds) / item.maxDurationSeconds) * 100);
 }
 
+function parseDoubanMetadataList(value?: string | null): string[] {
+  if (!value?.trim()) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean);
+    }
+  } catch {
+    // Fall back to delimiter parsing for older cached values.
+  }
+
+  return value
+    .split(/[\/,，、|]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function DetailView({
   detail,
   errorText,
+  hlsSelectionMode,
+  isHlsTaskRunning,
   selectedSeasonId,
+  selectedHlsItemIds,
+  selectedHlsVideoFileIds,
   showEpisodeDetails,
   onBack,
   onEditMetadata,
+  onStartHlsCache,
+  onToggleHlsFile,
+  onToggleHlsItem,
+  onToggleHlsSelectionMode,
   onPlay,
   onSeasonChange,
 }: {
   detail: LibraryItemDetail;
   errorText: string;
+  hlsSelectionMode: boolean;
+  isHlsTaskRunning: boolean;
   selectedSeasonId: string;
+  selectedHlsItemIds: string[];
+  selectedHlsVideoFileIds: string[];
   showEpisodeDetails: boolean;
   onBack: () => void;
   onEditMetadata: (episode: EpisodeDetail) => void;
+  onStartHlsCache: () => void;
+  onToggleHlsFile: (fileId: string) => void;
+  onToggleHlsItem: (itemId: string) => void;
+  onToggleHlsSelectionMode: () => void;
   onPlay: (file: VideoFileSummary) => void;
   onSeasonChange: (seasonId: string) => void;
 }) {
   const poster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
   const year = detail.releaseDate?.slice(0, 4);
+  const overview = detail.overview || detail.douban?.summary || "暂无简介";
+  const fusedTextMetadataParts = [
+    ...parseDoubanMetadataList(detail.douban?.genres).slice(0, 3),
+    ...parseDoubanMetadataList(detail.douban?.countries).slice(0, 2),
+  ];
   const playableEpisodes = detail.seasons.flatMap((season) => season.episodes).filter((episode) => episode.videoFile);
   const mainEpisode =
     detail.itemKind === "tv"
@@ -2692,6 +3569,8 @@ function DetailView({
     ? selectedSeasonId
     : detail.seasons[0]?.id ?? "";
   const selectedSeason = detail.seasons.find((season) => season.id === resolvedSelectedSeasonId) ?? null;
+  const selectedHlsCount = selectedHlsItemIds.length + selectedHlsVideoFileIds.length;
+  const detailPosterSelected = selectedHlsItemIds.includes(detail.id);
 
   useEffect(() => {
     if (resolvedSelectedSeasonId !== selectedSeasonId) {
@@ -2706,19 +3585,84 @@ function DetailView({
         <button aria-label="back" onClick={onBack}>
           <ArrowLeft size={19} />
         </button>
+        <div className="detailTopbarActions">
+          <button
+            aria-label="hls cache selection"
+            className={hlsSelectionMode ? "topbarTextButton active" : "topbarTextButton"}
+            disabled={isHlsTaskRunning}
+            onClick={onToggleHlsSelectionMode}
+            title="HLS 缓存"
+            type="button"
+          >
+            <Download size={16} />
+            <span>HLS</span>
+          </button>
+          {hlsSelectionMode ? (
+            <>
+              <button
+                aria-label="start hls cache"
+                className="topbarTextButton"
+                disabled={selectedHlsCount === 0 || isHlsTaskRunning}
+                onClick={onStartHlsCache}
+                title="开始缓存"
+                type="button"
+              >
+                <CheckCircle2 size={16} />
+                <span>开始</span>
+              </button>
+              <button aria-label="cancel hls cache selection" onClick={onToggleHlsSelectionMode} title="取消选择" type="button">
+                <X size={18} />
+              </button>
+            </>
+          ) : null}
+        </div>
       </header>
 
       <section className="detailHero">
-        <div className="detailPoster">
+        <button
+          aria-label={detailPosterSelected ? `取消 HLS 缓存 ${detail.title}` : `选择 HLS 缓存 ${detail.title}`}
+          className={[
+            "detailPoster",
+            hlsSelectionMode ? "selectableForHls" : "",
+            detailPosterSelected ? "selectedForHls" : "",
+          ].filter(Boolean).join(" ")}
+          onClick={() => {
+            if (hlsSelectionMode) {
+              onToggleHlsItem(detail.id);
+            }
+          }}
+          tabIndex={hlsSelectionMode ? 0 : -1}
+          title={hlsSelectionMode ? "选择当前影视缓存" : undefined}
+          type="button"
+        >
           {poster ? <img alt="" src={poster} /> : null}
-        </div>
+          {hlsSelectionMode ? (
+            <span className={detailPosterSelected ? "hlsSelectBadge selected" : "hlsSelectBadge"}>
+              {detailPosterSelected ? <CheckCircle2 size={16} /> : <Download size={15} />}
+            </span>
+          ) : null}
+        </button>
         <div className="detailMeta">
           <h1>{detail.title}</h1>
           <div className="detailFacts">
             {year ? <span>{year}</span> : null}
-            {detail.voteAverage ? <span>评分 {detail.voteAverage.toFixed(1)}</span> : null}
+            {detail.voteAverage ? (
+              <span className="detailRating tmdbRating">
+                <Star size={18} fill="currentColor" />
+                {detail.voteAverage.toFixed(1)}
+              </span>
+            ) : null}
+            {detail.doubanRating ? (
+              <span className="detailRating doubanRating">
+                <Star size={18} fill="currentColor" />
+                {detail.doubanRating.toFixed(1)}
+              </span>
+            ) : null}
+            {fusedTextMetadataParts.map((part) => (
+              <span key={part}>{part}</span>
+            ))}
           </div>
-          <p>{detail.overview || "暂无简介"}</p>
+          <p>{overview}</p>
           {errorText ? <strong className="detailError">{errorText}</strong> : null}
           {mainFile ? (
             <div className="detailActions">
@@ -2770,6 +3714,9 @@ function DetailView({
                 key={episode.id}
                 onEditMetadata={onEditMetadata}
                 poster={poster}
+                hlsSelected={!!episode.videoFile && selectedHlsVideoFileIds.includes(episode.videoFile.id)}
+                hlsSelectionMode={hlsSelectionMode}
+                onToggleHlsFile={onToggleHlsFile}
                 showDetails={showEpisodeDetails}
               />
             ))}
@@ -2782,12 +3729,18 @@ function DetailView({
 
 function EpisodeCard({
   episode,
+  hlsSelected,
+  hlsSelectionMode,
   onEditMetadata,
+  onToggleHlsFile,
   poster,
   showDetails,
 }: {
   episode: EpisodeDetail;
+  hlsSelected: boolean;
+  hlsSelectionMode: boolean;
   onEditMetadata: (episode: EpisodeDetail) => void;
+  onToggleHlsFile: (fileId: string) => void;
   poster: string | null;
   showDetails: boolean;
 }) {
@@ -2800,7 +3753,7 @@ function EpisodeCard({
 
   return (
     <article
-      className={["episodeCard", showDetails ? "" : "simpleEpisode"]
+      className={["episodeCard", showDetails ? "" : "simpleEpisode", hlsSelected ? "selectedForHls" : ""]
         .filter(Boolean)
         .join(" ")}
     >
@@ -2825,6 +3778,21 @@ function EpisodeCard({
         >
           <Pencil size={15} />
         </button>
+        {hlsSelectionMode && file ? (
+          <button
+            aria-label={hlsSelected ? `取消 HLS 缓存 ${title}` : `选择 HLS 缓存 ${title}`}
+            className={hlsSelected ? "episodeHlsSelect selected" : "episodeHlsSelect"}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onToggleHlsFile(file.id);
+            }}
+            title={hlsSelected ? "取消缓存选择" : "选择缓存"}
+            type="button"
+          >
+            {hlsSelected ? <CheckCircle2 size={15} /> : <Download size={14} />}
+          </button>
+        ) : null}
       </div>
       <div className="episodeBody">
         <h3>{title}</h3>

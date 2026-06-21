@@ -1,4 +1,5 @@
 using System.Net;
+using System.Globalization;
 using OmniPlay.Core.Models;
 
 namespace OmniPlay.Infrastructure.Network;
@@ -9,6 +10,7 @@ public static class ProxyHttpMessageHandlerFactory
     {
         Uri.UriSchemeHttp,
         Uri.UriSchemeHttps,
+        "socks",
         "socks4",
         "socks4a",
         "socks5"
@@ -30,13 +32,13 @@ public static class ProxyHttpMessageHandlerFactory
         };
 
         if (ShouldUseProxy(settings, requestUri, forceProxy) &&
-            TryCreateProxyUri(settings, out var proxyUri) &&
-            proxyUri is not null)
+            ResolveEffectiveProxyUri(settings) is { } proxyUri)
         {
-            var proxy = new WebProxy(proxyUri);
-            if (!string.IsNullOrWhiteSpace(settings.Username) || !string.IsNullOrWhiteSpace(settings.Password))
+            var proxy = new FixedWebProxy(proxyUri);
+            var credentials = ResolveCredentials(settings, proxyUri);
+            if (credentials is not null)
             {
-                proxy.Credentials = new NetworkCredential(settings.Username.Trim(), settings.Password.Trim());
+                proxy.Credentials = credentials;
             }
 
             handler.Proxy = proxy;
@@ -56,18 +58,18 @@ public static class ProxyHttpMessageHandlerFactory
         bool forceProxy = false)
     {
         if (!ShouldUseProxy(settings, requestUri, forceProxy) ||
-            !TryCreateProxyUri(settings, out var proxyUri) ||
-            proxyUri is null)
+            ResolveEffectiveProxyUri(settings) is not { } proxyUri)
         {
             return "direct";
         }
 
+        var credentials = ResolveCredentials(settings, proxyUri);
         return string.Join(
             '|',
             "proxy",
             proxyUri.AbsoluteUri,
-            settings.Username.Trim(),
-            settings.Password.Trim(),
+            credentials?.UserName ?? string.Empty,
+            credentials?.Password ?? string.Empty,
             settings.BypassList.Trim());
     }
 
@@ -90,8 +92,36 @@ public static class ProxyHttpMessageHandlerFactory
             return false;
         }
 
-        proxyUri = uri;
+        proxyUri = NormalizeProxyUriScheme(uri);
         return true;
+    }
+
+    public static IReadOnlyList<Uri> ResolveProxyUriCandidates(ProxySettings settings)
+    {
+        if (!TryCreateProxyUri(settings, out var proxyUri) || proxyUri is null)
+        {
+            return [];
+        }
+
+        List<Uri> candidates = [];
+        if (IsRunningInContainer() && IsLoopbackProxyHost(proxyUri.Host) && !IsDockerHostNetworkEnabled())
+        {
+            if (CanResolveHost("host.docker.internal"))
+            {
+                candidates.Add(ReplaceHost(proxyUri, "host.docker.internal"));
+            }
+
+            if (TryReadDockerDefaultGateway(out var gatewayHost))
+            {
+                candidates.Add(ReplaceHost(proxyUri, gatewayHost));
+            }
+        }
+
+        candidates.Add(proxyUri);
+        return candidates
+            .GroupBy(static uri => uri.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
+            .Select(static group => group.First())
+            .ToArray();
     }
 
     public static string DisplayProxyUrl(ProxySettings settings)
@@ -118,6 +148,130 @@ public static class ProxyHttpMessageHandlerFactory
         }
 
         return forceProxy || !ShouldBypassProxy(settings, requestUri);
+    }
+
+    private static Uri? ResolveEffectiveProxyUri(ProxySettings settings)
+    {
+        return ResolveProxyUriCandidates(settings).FirstOrDefault();
+    }
+
+    private static Uri NormalizeProxyUriScheme(Uri uri)
+    {
+        if (!string.Equals(uri.Scheme, "socks", StringComparison.OrdinalIgnoreCase))
+        {
+            return uri;
+        }
+
+        var builder = new UriBuilder(uri)
+        {
+            Scheme = "socks5"
+        };
+        return builder.Uri;
+    }
+
+    private static NetworkCredential? ResolveCredentials(ProxySettings settings, Uri proxyUri)
+    {
+        if (!string.IsNullOrWhiteSpace(settings.Username) || !string.IsNullOrWhiteSpace(settings.Password))
+        {
+            return new NetworkCredential(settings.Username.Trim(), settings.Password.Trim());
+        }
+
+        if (string.IsNullOrWhiteSpace(proxyUri.UserInfo))
+        {
+            return null;
+        }
+
+        var parts = proxyUri.UserInfo.Split(':', 2);
+        var username = Uri.UnescapeDataString(parts[0]);
+        var password = parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : string.Empty;
+        return string.IsNullOrWhiteSpace(username) && string.IsNullOrWhiteSpace(password)
+            ? null
+            : new NetworkCredential(username, password);
+    }
+
+    private static Uri ReplaceHost(Uri uri, string host)
+    {
+        var builder = new UriBuilder(uri)
+        {
+            Host = host
+        };
+        return builder.Uri;
+    }
+
+    private static bool IsLoopbackProxyHost(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return IPAddress.TryParse(host.Trim('[', ']'), out var address) && IPAddress.IsLoopback(address);
+    }
+
+    private static bool IsRunningInContainer()
+    {
+        return string.Equals(Environment.GetEnvironmentVariable("DOTNET_RUNNING_IN_CONTAINER"), "true", StringComparison.OrdinalIgnoreCase)
+               || File.Exists("/.dockerenv")
+               || File.Exists("/run/.containerenv");
+    }
+
+    private static bool IsDockerHostNetworkEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("OMNIPLAY_DOCKER_HOST_NETWORK");
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool CanResolveHost(string host)
+    {
+        try
+        {
+            return Dns.GetHostAddresses(host).Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadDockerDefaultGateway(out string gatewayHost)
+    {
+        gatewayHost = string.Empty;
+        const string routePath = "/proc/net/route";
+        if (!File.Exists(routePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            foreach (var line in File.ReadLines(routePath).Skip(1))
+            {
+                var parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (parts.Length < 3 || !string.Equals(parts[1], "00000000", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (!uint.TryParse(parts[2], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rawGateway))
+                {
+                    continue;
+                }
+
+                var bytes = BitConverter.GetBytes(rawGateway);
+                gatewayHost = new IPAddress(bytes).ToString();
+                return !string.IsNullOrWhiteSpace(gatewayHost);
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return false;
     }
 
     private static bool ShouldBypassProxy(ProxySettings settings, Uri? requestUri)
@@ -258,5 +412,27 @@ public static class ProxyHttpMessageHandlerFactory
         return address.IsIPv6LinkLocal ||
                address.IsIPv6SiteLocal ||
                addressBytes.Length > 0 && (addressBytes[0] & 0xfe) == 0xfc;
+    }
+
+    private sealed class FixedWebProxy : IWebProxy
+    {
+        private readonly Uri proxyUri;
+
+        public FixedWebProxy(Uri proxyUri)
+        {
+            this.proxyUri = proxyUri;
+        }
+
+        public ICredentials? Credentials { get; set; }
+
+        public Uri GetProxy(Uri destination)
+        {
+            return proxyUri;
+        }
+
+        public bool IsBypassed(Uri host)
+        {
+            return false;
+        }
     }
 }

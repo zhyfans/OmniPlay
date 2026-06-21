@@ -38,9 +38,10 @@ COPY --from=server-build /app/publish/ ./
 COPY docker/entrypoint.sh /usr/local/bin/omniplay-entrypoint
 RUN chmod +x /usr/local/bin/omniplay-entrypoint
 
-ENV ASPNETCORE_URLS=http://0.0.0.0:45721
-ENV OMNIPLAY_URLS=http://0.0.0.0:45721
+ENV ASPNETCORE_URLS=http://0.0.0.0:45722
+ENV OMNIPLAY_URLS=http://0.0.0.0:45722
 ENV OMNIPLAY_APP_ROOT=/var/lib/omniplay
+ENV OMNIPLAY_CACHE_ROOT=/var/cache/omniplay
 ENV OMNIPLAY_LOCAL_SHARE_ROOTS=/media
 ENV OMNIPLAY_FFMPEG_PATH=/usr/bin/ffmpeg
 ENV OMNIPLAY_FFPROBE_PATH=/usr/bin/ffprobe
@@ -48,6 +49,6 @@ ENV OMNIPLAY_VAAPI_DEVICE=/dev/dri/renderD128
 ENV OMNIPLAY_ENABLE_QSV=1
 ENV DOTNET_EnableDiagnostics=0
 
-VOLUME ["/var/lib/omniplay", "/media"]
-EXPOSE 45721
+VOLUME ["/var/lib/omniplay", "/var/cache/omniplay", "/media"]
+EXPOSE 45722
 ENTRYPOINT ["/usr/local/bin/omniplay-entrypoint"]

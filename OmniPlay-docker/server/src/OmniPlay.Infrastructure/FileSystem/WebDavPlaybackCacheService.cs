@@ -117,6 +117,26 @@ public sealed class WebDavPlaybackCacheService : IPlaybackCacheService
         return await GetStatusAsync(videoFileId, cancellationToken);
     }
 
+    public async Task<string?> GetCompletedCachedPathAsync(
+        string videoFileId,
+        CancellationToken cancellationToken = default)
+    {
+        var row = await ReadRowAsync(videoFileId, cancellationToken);
+        if (row is null || !IsWebDav(row))
+        {
+            return null;
+        }
+
+        var cachePath = ResolveWebDavCachePath(row);
+        if (!IsCacheUsable(cachePath, row.FileSizeBytes))
+        {
+            return null;
+        }
+
+        TouchLastAccessTime(cachePath);
+        return cachePath;
+    }
+
     public async Task<string?> EnsureCachedAsync(
         string videoFileId,
         CancellationToken cancellationToken = default)

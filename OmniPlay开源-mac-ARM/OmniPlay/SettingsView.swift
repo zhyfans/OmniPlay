@@ -185,24 +185,56 @@ struct SettingsView: View {
                     Toggle("启用公共源 TMDB", isOn: $tmdbUsePublicSource)
                         .help("默认开启。关闭后只有填写自定义 TMDB API 时才能继续刮削和获取剧照。")
 
-                    Text("公共源使用应用内共享额度，默认会按更保守的请求频率访问，并在触发 TMDB 限流时自动退避。建议填写自己的 TMDB API Key / v4 令牌，以获得更稳定、更快的刮削。")
+                    Text("公开源码不内置个人 TMDB Key。请填写自己的 TMDB API Key / v4 令牌，以启用稳定的刮削。")
                         .font(.caption)
                         .foregroundColor(theme.textSecondary)
 
-                    HStack {
-                        TextField("API Key / v4 令牌", text: $tmdbApiKey)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($isTMDBApiFocused)
+                    HStack(alignment: .center, spacing: 8) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(Color(nsColor: .textBackgroundColor))
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.8)
+                            SingleLineAPITextField(
+                                text: $tmdbApiKey,
+                                placeholder: "API Key / v4 令牌",
+                                isFocused: Binding(
+                                    get: { isTMDBApiFocused },
+                                    set: { isTMDBApiFocused = $0 }
+                                )
+                            )
+                            .padding(.horizontal, 8)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(width: 410, height: 28)
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                         
                         Button(action: validateTMDBApi) {
                             if isValidatingAPI {
-                                ProgressView().controlSize(.small).frame(width: 40)
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .frame(width: 44, height: 28)
                             } else {
                                 Text("验证")
+                                    .frame(width: 44, height: 28)
                             }
                         }
+                        .buttonStyle(.plain)
+                        .frame(width: 64, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(Color(nsColor: .controlBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.8)
+                        )
+                        .foregroundColor(trimmedTMDBApiKey.isEmpty || isValidatingAPI ? theme.textSecondary.opacity(0.55) : theme.textPrimary)
+                        .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                         .disabled(trimmedTMDBApiKey.isEmpty || isValidatingAPI)
+                        Spacer(minLength: 0)
                     }
+                    .frame(height: 28)
 
                     Text("填写自定义 API 后会优先使用你的密钥；“验证”只检查这里填写的自定义密钥。")
                         .font(.caption)
@@ -213,7 +245,7 @@ struct SettingsView: View {
                         .foregroundColor(theme.accent)
 
                     if trimmedTMDBApiKey.isEmpty, tmdbUsePublicSource {
-                        Text("当前正在使用公共源 TMDB。共享额度可能波动，长期使用更建议配置自定义 API。")
+                        Text("当前未填写自定义 TMDB API；公开源码版本不会内置个人 Key。")
                             .font(.caption)
                             .foregroundColor(.orange)
                     } else if trimmedTMDBApiKey.isEmpty {
@@ -450,6 +482,103 @@ struct SettingsView: View {
     private func openExternalURL(_ value: String) {
         guard let url = URL(string: value) else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+private struct SingleLineAPITextField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    @Binding var isFocused: Bool
+
+    func makeNSView(context: Context) -> NSTextField {
+        let textField = FocusableTextField()
+        textField.cell = VerticallyCenteredTextFieldCell(textCell: "")
+        textField.delegate = context.coordinator
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.isEnabled = true
+        textField.refusesFirstResponder = false
+        textField.isBordered = false
+        textField.isBezeled = false
+        textField.drawsBackground = false
+        textField.focusRingType = .none
+        textField.font = .systemFont(ofSize: 13)
+        textField.placeholderString = placeholder
+        textField.lineBreakMode = .byClipping
+        if let cell = textField.cell {
+            cell.wraps = false
+            cell.isScrollable = true
+            cell.usesSingleLineMode = true
+            cell.lineBreakMode = .byClipping
+        }
+        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return textField
+    }
+
+    func updateNSView(_ nsView: NSTextField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+        if nsView.placeholderString != placeholder {
+            nsView.placeholderString = placeholder
+        }
+        if isFocused, nsView.window?.firstResponder !== nsView.currentEditor() {
+            nsView.window?.makeFirstResponder(nsView)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isFocused: $isFocused)
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        @Binding private var text: String
+        @Binding private var isFocused: Bool
+
+        init(text: Binding<String>, isFocused: Binding<Bool>) {
+            _text = text
+            _isFocused = isFocused
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let textField = notification.object as? NSTextField else { return }
+            text = textField.stringValue
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            isFocused = true
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            isFocused = false
+        }
+    }
+}
+
+private final class FocusableTextField: NSTextField {
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+}
+
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func titleRect(forBounds rect: NSRect) -> NSRect {
+        centeredRect(super.titleRect(forBounds: rect))
+    }
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        centeredRect(super.drawingRect(forBounds: rect))
+    }
+
+    private func centeredRect(_ rect: NSRect) -> NSRect {
+        guard let font else { return rect }
+        let textHeight = ceil(font.ascender - font.descender)
+        let y = rect.origin.y + max(0, (rect.height - textHeight) / 2) - 1
+        return NSRect(x: rect.origin.x, y: y, width: rect.width, height: textHeight)
     }
 }
 

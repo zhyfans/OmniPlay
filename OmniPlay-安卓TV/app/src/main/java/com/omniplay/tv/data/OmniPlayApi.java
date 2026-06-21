@@ -25,6 +25,8 @@ public final class OmniPlayApi {
     private static final String KEY_SERVER_URL = "server_url";
     private static final String KEY_COOKIE = "session_cookie";
     private static final String KEY_LIBRARY_ITEMS_CACHE = "library_items_cache";
+    private static final String KEY_LOGIN_USERNAME = "login_username";
+    private static final String KEY_LOGIN_PASSWORD = "login_password";
 
     private final SharedPreferences preferences;
     private String serverUrl;
@@ -48,6 +50,14 @@ public final class OmniPlayApi {
         return sessionCookie == null ? "" : sessionCookie;
     }
 
+    public String savedUsername() {
+        return preferences.getString(KEY_LOGIN_USERNAME, "");
+    }
+
+    public String savedPassword() {
+        return preferences.getString(KEY_LOGIN_PASSWORD, "");
+    }
+
     public void setServerUrl(String value) {
         serverUrl = normalizeServerUrl(value);
         preferences.edit().putString(KEY_SERVER_URL, serverUrl).apply();
@@ -65,7 +75,11 @@ public final class OmniPlayApi {
         body.put("username", trimOuterWhitespace(username));
         body.put("password", trimOuterWhitespace(password));
         Models.AuthStatus status = Models.AuthStatus.fromJson(new JSONObject(request("POST", "/api/auth/login", body.toString())));
-        preferences.edit().putString(KEY_COOKIE, sessionCookie).apply();
+        preferences.edit()
+                .putString(KEY_COOKIE, sessionCookie)
+                .putString(KEY_LOGIN_USERNAME, trimOuterWhitespace(username))
+                .putString(KEY_LOGIN_PASSWORD, trimOuterWhitespace(password))
+                .apply();
         return status;
     }
 
@@ -117,6 +131,34 @@ public final class OmniPlayApi {
         return Models.subtitleTracksFromJson(new JSONArray(request("GET", "/api/playback/files/" + encode(videoFileId) + "/subtitles", null)));
     }
 
+    public Models.PlaybackFileStreams getPlaybackStreams(String videoFileId) throws IOException, JSONException {
+        return Models.PlaybackFileStreams.fromJson(new JSONObject(request("GET", "/api/playback/files/" + encode(videoFileId) + "/streams", null)));
+    }
+
+    public Models.SubtitleCacheStatus getSubtitleCacheStatus(String videoFileId) throws IOException, JSONException {
+        return Models.SubtitleCacheStatus.fromJson(new JSONObject(request("GET", "/api/playback/files/" + encode(videoFileId) + "/subtitle-cache/status", null)));
+    }
+
+    public Models.PlaybackDecision getPlaybackDecision(String videoFileId) throws IOException, JSONException {
+        return getPlaybackDecision(videoFileId, true);
+    }
+
+    public Models.PlaybackDecision getPlaybackDecision(String videoFileId, boolean hardware) throws IOException, JSONException {
+        Models.PlaybackDecision decision = Models.PlaybackDecision.fromJson(new JSONObject(request(
+                "GET",
+                "/api/playback/decision/" + encode(videoFileId) + "?quality=auto&subtitleMode=off&hardware=" + (hardware ? "true" : "false"),
+                null)));
+        return decision == null ? null : new Models.PlaybackDecision(
+                decision.fileId,
+                decision.mode,
+                absolutePlaybackUrl(decision.streamUrl),
+                absolutePlaybackUrl(decision.manifestUrl),
+                decision.sessionId,
+                decision.isReady,
+                decision.reason,
+                decision.durationSeconds);
+    }
+
     public void updatePlaybackProgress(String videoFileId, double positionSeconds, double durationSeconds) throws IOException, JSONException {
         JSONObject body = new JSONObject();
         body.put("videoFileId", videoFileId);
@@ -163,6 +205,14 @@ public final class OmniPlayApi {
         return token == null || token.isEmpty() ? json.optString("ticket") : token;
     }
 
+    public void stopHlsSession(String sessionId) throws IOException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+
+        request("POST", "/api/playback/hls/" + encode(sessionId) + "/stop", "{}");
+    }
+
     public String subtitleUrl(Models.SubtitleTrack track) {
         if (track == null || track.webVttUrl == null || track.webVttUrl.isEmpty()) {
             return "";
@@ -181,6 +231,10 @@ public final class OmniPlayApi {
 
     public String embeddedSubtitleUrl(String videoFileId, int subtitleOrdinal, String ticket) {
         return withTicket(absoluteUrl("/api/playback/files/" + encode(videoFileId) + "/embedded-subtitles/" + subtitleOrdinal + ".vtt"), ticket);
+    }
+
+    public String embeddedPgsSubtitleUrl(String videoFileId, int subtitleOrdinal, String ticket) {
+        return withTicket(absoluteUrl("/api/playback/files/" + encode(videoFileId) + "/embedded-subtitles/" + subtitleOrdinal + ".sup"), ticket);
     }
 
     private String request(String method, String path, String body) throws IOException {
@@ -238,6 +292,16 @@ public final class OmniPlayApi {
     private String absoluteUrl(String path) {
         String normalizedPath = path.startsWith("/") ? path : "/" + path;
         return serverUrl() + normalizedPath;
+    }
+
+    private String absolutePlaybackUrl(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            return value;
+        }
+        return absoluteUrl(value);
     }
 
     private static String withTicket(String url, String ticket) {

@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using Microsoft.Data.Sqlite;
 using OmniPlay.Core.Interfaces;
 using OmniPlay.Core.Models;
+using OmniPlay.Core.Runtime;
 using OmniPlay.Infrastructure.Data;
 using OmniPlay.Infrastructure.FileSystem;
 using OmniPlay.Infrastructure.Library;
@@ -16,27 +17,35 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
     private readonly IHlsSessionService hlsSessionService;
     private readonly HttpClient httpClient;
     private readonly Uri listenUri;
+    private readonly IAppSettingsRepository? appSettingsRepository;
 
     public RuntimeSelfCheckService(
         IStoragePaths storagePaths,
         SqliteDatabase database,
         IHlsSessionService hlsSessionService,
         HttpClient httpClient,
-        Uri listenUri)
+        Uri listenUri,
+        IAppSettingsRepository? appSettingsRepository = null)
     {
         this.storagePaths = storagePaths;
         this.database = database;
         this.hlsSessionService = hlsSessionService;
         this.httpClient = httpClient;
         this.listenUri = listenUri;
+        this.appSettingsRepository = appSettingsRepository;
     }
 
     public async Task<RuntimeSelfCheckSnapshot> CheckAsync(CancellationToken cancellationToken = default)
     {
         List<RuntimeSelfCheckItem> items = [];
+        var cacheSettings = await ResolveCacheSettingsAsync(cancellationToken);
         items.Add(CheckListenPort());
         items.Add(await CheckDirectoryWriteAsync("cache-write", "缓存目录写入", storagePaths.CacheDirectory, cancellationToken));
-        items.Add(await CheckDirectoryWriteAsync("transcode-write", "转码目录写入", storagePaths.TranscodeDirectory, cancellationToken));
+        items.Add(await CheckDirectoryWriteAsync(
+            "transcode-write",
+            "HLS 缓存目录写入",
+            HlsCachePathResolver.ResolveRoot(storagePaths, cacheSettings),
+            cancellationToken));
         items.Add(await CheckSqliteWriteAsync(cancellationToken));
 
         var capabilities = await hlsSessionService.GetCapabilitiesAsync(cancellationToken);
@@ -51,6 +60,23 @@ public sealed class RuntimeSelfCheckService : IRuntimeSelfCheckService
             ResolveAggregateStatus(items),
             DateTimeOffset.UtcNow,
             items);
+    }
+
+    private async Task<CacheSettings> ResolveCacheSettingsAsync(CancellationToken cancellationToken)
+    {
+        if (appSettingsRepository is null)
+        {
+            return new CacheSettings();
+        }
+
+        try
+        {
+            return (await appSettingsRepository.GetAsync(cancellationToken)).Cache;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new CacheSettings();
+        }
     }
 
     private RuntimeSelfCheckItem CheckListenPort()

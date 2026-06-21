@@ -9,6 +9,16 @@ public interface IHlsSessionService
         HlsPlaybackProfile profile,
         CancellationToken cancellationToken = default);
 
+    Task<HlsPlaybackSession> EnsureCompletedSessionAsync(
+        PlayableVideoFile file,
+        HlsPlaybackProfile profile,
+        IProgress<BackgroundTaskProgress>? progress = null,
+        CancellationToken cancellationToken = default);
+
+    HlsPlaybackSession? GetCompletedSession(
+        PlayableVideoFile file,
+        HlsPlaybackProfile profile);
+
     HlsPlaybackAsset? GetAsset(string sessionId, string assetName);
 
     Task<FfmpegTranscodeCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default);
@@ -17,5 +27,5 @@ public interface IHlsSessionService
 
     bool StopSession(string sessionId);
 
-    HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge);
+    HlsCacheCleanupSummary CleanupCache(TimeSpan maxAge, long? maxBytes = null);
 }

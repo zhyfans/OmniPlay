@@ -216,7 +216,7 @@ dotnet .\src\OmniPlay.Desktop\bin\Debug\net10.0\OmniPlay.Desktop.dll `
 
 应用启动并加载已有媒体库后，也会自动尝试回填缺失的 TMDB 元数据与海报，不必先删库重扫。
 
-默认直接使用仓库当前内置的 TMDB API key。也可以通过环境变量覆盖：
+公开仓库不内置个人 TMDB API key。请在设置页填写自己的 TMDB API Key / v4 Read Access Token，或通过环境变量提供：
 
 ```powershell
 $env:OMNIPLAY_TMDB_API_KEY='your-api-key'

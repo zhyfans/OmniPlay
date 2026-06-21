@@ -209,11 +209,12 @@ struct PosterWallView: View {
     @State private var webDAVIsTestingConnection: Bool = false
     @State private var webDAVLastPreflight: WebDAVPreflightResult? = nil
     @State private var isShowingMediaServerSheet = false
-    @State private var mediaServerProtocol: MediaSourceProtocol = .plex
+    @State private var mediaServerProtocol: MediaSourceProtocol = .omniplayDocker
     @State private var mediaServerName = ""
     @State private var mediaServerBaseURL = ""
     @State private var mediaServerToken = ""
     @State private var mediaServerUserId = ""
+    @State private var mediaServerPassword = ""
     @State private var mediaServerMessage: String? = nil
     @State private var mediaServerIsPreScanning = false
     @State private var isShowingWebDAVPreScanLoginSheet = false
@@ -253,6 +254,7 @@ struct PosterWallView: View {
     @State private var selectedSortOption: MovieSortOption = .year
     @State private var isAscending: Bool = false
     @State private var pendingLibraryReloadTask: Task<Void, Never>? = nil
+    @State private var dockerAutoSyncTask: Task<Void, Never>? = nil
     @State private var activeScanningSourceID: Int64? = nil
     @State private var removedSourceIDsDuringRun: Set<Int64> = []
     @State private var recentWebDAVHistory: [RecentWebDAVHistoryItem] = PosterWallView.loadRecentWebDAVHistory()
@@ -260,7 +262,6 @@ struct PosterWallView: View {
     @State private var sourcePendingRemoval: MediaSource? = nil
     @State private var isLoadingLibraryData = false
     @State private var needsLibraryReloadAfterCurrentLoad = false
-    @State private var hasPerformedStartupTMDBCheck = false
     @State private var isShowingTMDBConnectionAlert = false
     @State private var tmdbConnectionMessage = ""
     @State private var isHomeCacheModeActive = false
@@ -302,12 +303,12 @@ struct PosterWallView: View {
                             Text("媒体库空空如也，快去添加文件夹吧！").font(.title2).foregroundColor(.secondary)
                         }.padding(.top, 150).frame(maxWidth: .infinity)
                     } else {
-                        VStack(alignment: .leading, spacing: 30) {
+                        VStack(alignment: .leading, spacing: 24) {
                             if !continueWatchingMovies.isEmpty {
                                 Text("继续播放")
                                     .font(.title2).fontWeight(.bold)
                                     .foregroundColor(theme.textPrimary)
-                                    .padding(.horizontal, 25).padding(.top, 20)
+                                    .padding(.horizontal, 25).padding(.top, 8)
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 20) {
                                         ForEach(continueWatchingMovies, id: \.id) { movie in
@@ -351,7 +352,7 @@ struct PosterWallView: View {
                                     Image(systemName: isAscending ? "arrow.up" : "arrow.down").font(.system(size: 14, weight: .bold)).foregroundColor(.secondary)
                                 }.buttonStyle(.plain)
                                 Spacer()
-                            }.padding(.horizontal, 25).padding(.top, 15)
+                            }.padding(.horizontal, 25).padding(.top, continueWatchingMovies.isEmpty ? 6 : 4)
                             
                             LazyVGrid(columns: columns, spacing: 30) {
                                 ForEach(displayedMovies, id: \.id) { movie in
@@ -473,29 +474,28 @@ struct PosterWallView: View {
                 removeSourceSheet()
             }
             .alert("TMDB API 无法连接", isPresented: $isShowingTMDBConnectionAlert) {
-                Button("不添加直接扫描") {
-                    triggerScanAndScrape(skipTMDBScrape: true)
-                }
-                Button("关闭", role: .cancel) {
+                Button("本次不刮削", role: .cancel) { }
+                Button("添加 API / 设置代理", role: .cancel) {
                     settingsFocusTMDBApi = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         showSettings = true
                     }
                 }
             } message: {
-                Text("建议添加自己的 TMDB API 后再刮削海报与影视信息。\n\(tmdbConnectionMessage)")
+                Text("检测到有待刮削的影视，但 TMDB 暂时无法连接。请添加自定义 TMDB API，或开启代理后在设置中重新检测。\n\(tmdbConnectionMessage)")
             }
             // 🌟 彻底删除了那个恶心的 SMB/WebDAV Sheet 弹窗！
         }
         .onAppear {
             loadData()
+            startDockerAutoSyncIfNeeded()
             MacAppUpdateChecker.checkAtStartupIfNeeded()
             if ProcessInfo.processInfo.environment["UITEST_OPEN_WEBDAV_SHEET"] == "1" {
                 prepareManualWebDAVBrowserLogin()
                 isShowingWebDAVPreScanLoginSheet = true
             }
             if autoScanOnStartup && ProcessInfo.processInfo.environment["UITEST_MODE"] != "1" {
-                scheduleStartupTMDBPreflight()
+                triggerScanAndScrape()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .libraryUpdated)) { _ in
@@ -522,6 +522,8 @@ struct PosterWallView: View {
         }
         .onDisappear {
             pendingLibraryReloadTask?.cancel()
+            dockerAutoSyncTask?.cancel()
+            dockerAutoSyncTask = nil
         }
     }
     
@@ -637,10 +639,9 @@ struct PosterWallView: View {
                 .accessibilityIdentifier("menu.addLocalFolder")
                 
                 Button(action: {
-                    isShowingManageSources = false
-                    isShowingManualRemoteSourceSheet = true
+                    openManualRemoteSourceChooser()
                 }) {
-                    Label("WebDAV/媒体服务器", systemImage: "network.badge.shield.half.filled")
+                    Label("局域网媒体源", systemImage: "network.badge.shield.half.filled")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
@@ -652,7 +653,7 @@ struct PosterWallView: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("预扫描 WebDAV / 媒体服务器")
+                    Text("预扫描局域网媒体源")
                         .font(.subheadline.weight(.semibold))
                         .foregroundColor(.secondary)
                     Spacer()
@@ -674,7 +675,7 @@ struct PosterWallView: View {
                 }
 
                 if discoveredNetworkDevices.isEmpty {
-                    Text("扫描到 WebDAV、Plex、Emby 或 Jellyfin 后，点击设备进入登录。")
+                    Text("扫描到 OmniPlay Docker、WebDAV、Plex、Emby 或 Jellyfin 后，点击设备进入登录。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -721,6 +722,7 @@ struct PosterWallView: View {
         case .plex: return "Plex"
         case .emby: return "Emby"
         case .jellyfin: return "Jellyfin"
+        case .omniplayDocker: return "OmniPlay Docker"
         case .direct: return "直连"
         case .local, .none: return "本地目录"
         }
@@ -729,13 +731,15 @@ struct PosterWallView: View {
     private func sourceIconName(_ source: MediaSource) -> String {
         switch source.protocolKind {
         case .webdav: return "network"
-        case .plex, .emby, .jellyfin: return "server.rack"
+        case .plex, .emby, .jellyfin, .omniplayDocker: return "server.rack"
         default: return "folder.fill"
         }
     }
 
     private func mediaServerProtocolLabel(_ value: MediaSourceProtocol) -> String {
         switch value {
+        case .omniplayDocker: return "OmniPlay Docker"
+        case .webdav: return "WebDAV"
         case .plex: return "Plex"
         case .emby: return "Emby"
         case .jellyfin: return "Jellyfin"
@@ -743,8 +747,29 @@ struct PosterWallView: View {
         }
     }
 
+    private func defaultMediaServerName(for protocolKind: MediaSourceProtocol) -> String {
+        switch protocolKind {
+        case .omniplayDocker:
+            return "OmniPlay Docker"
+        case .webdav:
+            return "WebDAV"
+        case .plex:
+            return "Plex"
+        case .emby:
+            return "Emby"
+        case .jellyfin:
+            return "Jellyfin"
+        default:
+            return ""
+        }
+    }
+
     private var mediaServerAddressPlaceholder: String {
         switch mediaServerProtocol {
+        case .omniplayDocker:
+            return "Docker 地址，例如 http://192.168.0.100:45722"
+        case .webdav:
+            return "WebDAV 地址，例如 https://nas:5006/dav"
         case .plex:
             return "Plex 地址，例如 http://127.0.0.1:32400"
         case .emby:
@@ -762,6 +787,10 @@ struct PosterWallView: View {
 
     private func defaultMediaServerBaseURL(for protocolKind: MediaSourceProtocol) -> String {
         switch protocolKind {
+        case .omniplayDocker:
+            return "http://192.168.0.100:45722"
+        case .webdav:
+            return ""
         case .plex:
             return "http://127.0.0.1:32400"
         case .emby, .jellyfin:
@@ -776,10 +805,15 @@ struct PosterWallView: View {
         return trimmed == defaultMediaServerBaseURL(for: .plex)
             || trimmed == defaultMediaServerBaseURL(for: .emby)
             || trimmed == defaultMediaServerBaseURL(for: .jellyfin)
+            || trimmed == defaultMediaServerBaseURL(for: .omniplayDocker)
     }
 
     private func mediaServerConnectionHint(for protocolKind: MediaSourceProtocol) -> String {
         switch protocolKind {
+        case .omniplayDocker:
+            return "Docker 服务默认地址为 http://192.168.0.100:45722。登录后会同步服务端媒体库，播放仍由 mac 本地硬解。"
+        case .webdav:
+            return "WebDAV 会先进入共享文件夹列表；可给多个目标文件夹点星标，关闭列表时统一挂载并扫描刮削。"
         case .plex:
             return "Plex 默认地址为 http://127.0.0.1:32400，点击“登录 Plex”会自动获取访问令牌。"
         case .emby, .jellyfin:
@@ -790,27 +824,134 @@ struct PosterWallView: View {
     }
 
     private func mediaServerMissingTokenMessage(for protocolKind: MediaSourceProtocol) -> String {
-        protocolKind == .plex
-            ? "Plex 需要访问令牌（X-Plex-Token）才能读取媒体库。"
-            : "\(mediaServerProtocolLabel(protocolKind)) 需要 API Key 或访问令牌才能读取媒体列表和生成播放地址。"
+        if protocolKind == .webdav {
+            return "WebDAV 可直接保存进入文件夹列表。"
+        }
+        if protocolKind == .plex {
+            return "Plex 需要访问令牌（X-Plex-Token）才能读取媒体库。"
+        }
+        if protocolKind == .omniplayDocker {
+            return "OmniPlay Docker 需要用户名和密码才能同步媒体库。"
+        }
+        return "\(mediaServerProtocolLabel(protocolKind)) 需要 API Key 或访问令牌才能读取媒体列表和生成播放地址。"
     }
 
-    private func mediaServerProtocolDidChange(_ newValue: MediaSourceProtocol) {
+    private func mediaServerProtocolDidChange(_ newValue: MediaSourceProtocol, resetIdentity: Bool = false) {
+        if resetIdentity {
+            mediaServerName = defaultMediaServerName(for: newValue)
+            mediaServerBaseURL = defaultMediaServerBaseURL(for: newValue)
+        }
         let currentBaseURL = mediaServerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if currentBaseURL.isEmpty || isDefaultMediaServerBaseURL(currentBaseURL) {
             mediaServerBaseURL = defaultMediaServerBaseURL(for: newValue)
         }
-        if newValue == .plex {
+        if newValue == .plex || newValue == .omniplayDocker || newValue == .webdav {
             mediaServerUserId = ""
+        }
+        if newValue != .omniplayDocker && newValue != .webdav {
+            mediaServerPassword = ""
+        }
+        if newValue == .webdav {
+            mediaServerToken = ""
         }
         mediaServerMessage = mediaServerConnectionHint(for: newValue)
     }
 
+    private var remoteSourceSaveButtonTitle: String {
+        if mediaServerIsPreScanning {
+            return mediaServerProtocol == .omniplayDocker ? "同步中..." : "读取中..."
+        }
+        switch mediaServerProtocol {
+        case .omniplayDocker:
+            return "保存并同步"
+        case .webdav:
+            return "继续"
+        default:
+            return "保存"
+        }
+    }
+
+    private func dismissRemoteSourceForm() {
+        isShowingManualRemoteSourceSheet = false
+        isShowingMediaServerSheet = false
+    }
+
+    private func saveRemoteSourceForm() {
+        if mediaServerProtocol == .webdav {
+            openWebDAVLoginFromRemoteSourceForm()
+        } else {
+            saveMediaServerSource()
+        }
+    }
+
+    private func openWebDAVLoginFromRemoteSourceForm() {
+        let draftName = mediaServerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftBaseURL = mediaServerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftUsername = mediaServerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftPassword = mediaServerPassword
+
+        dismissRemoteSourceForm()
+        prepareManualWebDAVBrowserLogin()
+        if !draftName.isEmpty {
+            webDAVBrowserName = draftName
+        }
+        if !draftBaseURL.isEmpty {
+            webDAVBrowserBaseURL = draftBaseURL
+        }
+        if !draftUsername.isEmpty {
+            webDAVBrowserUsername = draftUsername
+        }
+        if !draftPassword.isEmpty {
+            webDAVBrowserPassword = draftPassword
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            isShowingWebDAVPreScanLoginSheet = true
+        }
+    }
+
+    private func closeRemoteSourceSheets() {
+        isShowingManualRemoteSourceSheet = false
+        isShowingMediaServerSheet = false
+        isShowingWebDAVPreScanLoginSheet = false
+        isShowingWebDAVFolderBrowserSheet = false
+    }
+
+    private func openManualRemoteSourceChooser() {
+        isShowingManageSources = false
+        closeRemoteSourceSheets()
+        resetOmniPlayDockerForm()
+        DispatchQueue.main.async {
+            isShowingManualRemoteSourceSheet = true
+        }
+    }
+
+    private func openOmniPlayDockerSourceSheet() {
+        closeRemoteSourceSheets()
+        resetOmniPlayDockerForm()
+        DispatchQueue.main.async {
+            isShowingMediaServerSheet = true
+        }
+    }
+
+    private func openMediaServerProviderSourceSheet() {
+        closeRemoteSourceSheets()
+        resetMediaServerForm()
+        DispatchQueue.main.async {
+            isShowingMediaServerSheet = true
+        }
+    }
+
     private func mediaServerSourceSheet() -> some View {
+        manualRemoteSourceSheet()
+    }
+
+    private func mediaServerProviderSourceSheet() -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("添加媒体服务器")
+            Text("添加局域网媒体源")
                 .font(.title3.bold())
             Picker("类型", selection: $mediaServerProtocol) {
+                Text("OmniPlay Docker").tag(MediaSourceProtocol.omniplayDocker)
+                Text("WebDAV").tag(MediaSourceProtocol.webdav)
                 Text("Plex").tag(MediaSourceProtocol.plex)
                 Text("Emby").tag(MediaSourceProtocol.emby)
                 Text("Jellyfin").tag(MediaSourceProtocol.jellyfin)
@@ -820,7 +961,12 @@ struct PosterWallView: View {
                 .textFieldStyle(.roundedBorder)
             TextField(mediaServerAddressPlaceholder, text: $mediaServerBaseURL)
                 .textFieldStyle(.roundedBorder)
-            if mediaServerProtocol != .plex {
+            if mediaServerProtocol == .webdav {
+                TextField("用户名（可选）", text: $mediaServerUserId)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("密码（可选）", text: $mediaServerPassword)
+                    .textFieldStyle(.roundedBorder)
+            } else if mediaServerProtocol != .plex && mediaServerProtocol != .omniplayDocker {
                 TextField("用户名 / 用户 ID（可选）", text: $mediaServerUserId)
                     .textFieldStyle(.roundedBorder)
             }
@@ -830,8 +976,15 @@ struct PosterWallView: View {
                 }
                 .disabled(mediaServerIsPreScanning)
             }
-            SecureField(mediaServerTokenPlaceholder, text: $mediaServerToken)
-                .textFieldStyle(.roundedBorder)
+            if mediaServerProtocol == .omniplayDocker {
+                TextField("用户名", text: $mediaServerUserId)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("密码", text: $mediaServerPassword)
+                    .textFieldStyle(.roundedBorder)
+            } else if mediaServerProtocol != .webdav {
+                SecureField(mediaServerTokenPlaceholder, text: $mediaServerToken)
+                    .textFieldStyle(.roundedBorder)
+            }
             if let mediaServerMessage {
                 Text(mediaServerMessage)
                     .font(.caption)
@@ -840,17 +993,54 @@ struct PosterWallView: View {
             }
             HStack {
                 Spacer()
-                Button("取消") { isShowingMediaServerSheet = false }
-                Button(mediaServerIsPreScanning ? "读取中..." : "保存") { saveMediaServerSource() }
+                Button("取消") { dismissRemoteSourceForm() }
+                Button(remoteSourceSaveButtonTitle) { saveRemoteSourceForm() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(mediaServerIsPreScanning)
             }
         }
         .padding(20)
         .frame(width: 520)
-        .onChange(of: mediaServerProtocol) { _, newValue in
-            mediaServerProtocolDidChange(newValue)
+        .onChange(of: mediaServerProtocol) { oldValue, newValue in
+            mediaServerProtocolDidChange(newValue, resetIdentity: oldValue != newValue)
         }
+    }
+
+    private func omniPlayDockerSourceSheet() -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("添加 OmniPlay Docker")
+                .font(.title3.bold())
+            Text("填写 Docker 版服务地址和登录账号，保存后会立即同步 Docker 端电影、剧集和已扫描元数据。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextField("显示名称（可选）", text: $mediaServerName)
+                .textFieldStyle(.roundedBorder)
+            TextField(mediaServerAddressPlaceholder, text: $mediaServerBaseURL)
+                .textFieldStyle(.roundedBorder)
+            TextField("用户名", text: $mediaServerUserId)
+                .textFieldStyle(.roundedBorder)
+            SecureField("密码", text: $mediaServerPassword)
+                .textFieldStyle(.roundedBorder)
+
+            if let mediaServerMessage {
+                Text(mediaServerMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("取消") { isShowingMediaServerSheet = false }
+                Button(mediaServerIsPreScanning ? "同步中..." : "保存并同步") { saveMediaServerSource() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(mediaServerIsPreScanning)
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
     }
 
     private func renameSourceSheet() -> some View {
@@ -882,42 +1072,7 @@ struct PosterWallView: View {
     }
 
     private func manualRemoteSourceSheet() -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("WebDAV/媒体服务器")
-                .font(.title3.bold())
-            Text("选择要手动连接的远程媒体源类型。")
-                .font(.caption)
-                .foregroundColor(.secondary)
-
-            Button {
-                isShowingManualRemoteSourceSheet = false
-                prepareManualWebDAVBrowserLogin()
-                isShowingWebDAVPreScanLoginSheet = true
-            } label: {
-                Label("WebDAV", systemImage: "network")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-
-            Button {
-                isShowingManualRemoteSourceSheet = false
-                resetMediaServerForm()
-                isShowingMediaServerSheet = true
-            } label: {
-                Label("Plex/Emby/Jellyfin", systemImage: "server.rack")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-
-            HStack {
-                Spacer()
-                Button("取消") {
-                    isShowingManualRemoteSourceSheet = false
-                }
-            }
-        }
-        .padding(20)
-        .frame(width: 420)
+        mediaServerProviderSourceSheet()
     }
 
     private func removeSourceSheet() -> some View {
@@ -1136,6 +1291,7 @@ struct PosterWallView: View {
         case .plex: return "Plex"
         case .emby: return "Emby"
         case .jellyfin: return "Jellyfin"
+        case .omniplayDocker: return "OmniPlay Docker"
         default: return "媒体源"
         }
     }
@@ -1804,6 +1960,9 @@ struct PosterWallView: View {
             let libraryId = MediaServerAuthConfig.decode(authConfig)?.libraryId?.trimmingCharacters(in: .whitespacesAndNewlines)
             return "\(protocolKind.rawValue):\(normalizedURL):\(libraryId?.isEmpty == false ? libraryId! : "all")"
         }
+        if protocolKind == .omniplayDocker {
+            return "\(protocolKind.rawValue):\(normalizedURL)"
+        }
         return "\(protocolKind.rawValue):\(normalizedURL)"
     }
 
@@ -1814,7 +1973,7 @@ struct PosterWallView: View {
     private func mountedRemoteBrowserKeys(from sources: [MediaSource]) -> Set<String> {
         Set(sources.compactMap { source in
             guard let protocolKind = source.protocolKind else { return nil }
-            guard protocolKind == .webdav || protocolKind == .plex || protocolKind == .emby || protocolKind == .jellyfin else { return nil }
+            guard protocolKind == .webdav || protocolKind == .plex || protocolKind == .emby || protocolKind == .jellyfin || protocolKind == .omniplayDocker else { return nil }
             return remoteBrowserKey(protocolKind: protocolKind, baseURL: source.baseUrl, authConfig: source.authConfig)
         })
     }
@@ -1833,10 +1992,10 @@ struct PosterWallView: View {
                 webDAVName = device.name.isEmpty ? "WebDAV \(device.ipAddress)" : device.name
             }
             webDAVValidationMessage = nil
-        case .plex, .emby, .jellyfin:
+        case .plex, .emby, .jellyfin, .omniplayDocker:
             prepareMediaServerLogin(for: device)
             isShowingAddWebDAVSheet = false
-            isShowingMediaServerSheet = true
+            isShowingManualRemoteSourceSheet = true
         case .smb:
             break
         }
@@ -1845,12 +2004,17 @@ struct PosterWallView: View {
     private func openDiscoveredDeviceFromManageSheet(_ device: DiscoveredDevice) {
         lanScanner.stopScanning()
         isShowingManageSources = false
+        closeRemoteSourceSheets()
         if device.type.isMediaServer {
             prepareMediaServerLogin(for: device)
-            isShowingMediaServerSheet = true
+            DispatchQueue.main.async {
+                isShowingManualRemoteSourceSheet = true
+            }
         } else if device.type.isWebDAV {
             prepareWebDAVBrowserLogin(for: device)
-            isShowingWebDAVPreScanLoginSheet = true
+            DispatchQueue.main.async {
+                isShowingWebDAVPreScanLoginSheet = true
+            }
         }
     }
 
@@ -1862,13 +2026,20 @@ struct PosterWallView: View {
             mediaServerProtocol = .emby
         case .jellyfin:
             mediaServerProtocol = .jellyfin
+        case .omniplayDocker:
+            mediaServerProtocol = .omniplayDocker
         default:
             mediaServerProtocol = .plex
         }
-        mediaServerName = device.name.isEmpty ? "\(mediaServerProtocolLabel(mediaServerProtocol)) \(device.ipAddress)" : device.name
+        if mediaServerProtocol == .omniplayDocker {
+            mediaServerName = "OmniPlay Docker"
+        } else {
+            mediaServerName = device.name.isEmpty ? "\(mediaServerProtocolLabel(mediaServerProtocol)) \(device.ipAddress)" : device.name
+        }
         mediaServerBaseURL = discoveredDeviceURLString(for: device)
         mediaServerToken = ""
         mediaServerUserId = ""
+        mediaServerPassword = ""
         mediaServerIsPreScanning = false
         mediaServerMessage = mediaServerConnectionHint(for: mediaServerProtocol)
     }
@@ -1891,8 +2062,20 @@ struct PosterWallView: View {
         mediaServerBaseURL = defaultMediaServerBaseURL(for: .plex)
         mediaServerToken = ""
         mediaServerUserId = ""
+        mediaServerPassword = ""
         mediaServerIsPreScanning = false
         mediaServerMessage = mediaServerConnectionHint(for: .plex)
+    }
+
+    private func resetOmniPlayDockerForm() {
+        mediaServerProtocol = .omniplayDocker
+        mediaServerName = ""
+        mediaServerBaseURL = defaultMediaServerBaseURL(for: .omniplayDocker)
+        mediaServerToken = ""
+        mediaServerUserId = ""
+        mediaServerPassword = ""
+        mediaServerIsPreScanning = false
+        mediaServerMessage = mediaServerConnectionHint(for: .omniplayDocker)
     }
 
     private func authorizePlex() {
@@ -1926,15 +2109,14 @@ struct PosterWallView: View {
     }
 
     private func currentMediaServerDraft() -> MediaServerSourceDraft? {
-        let normalizedURL = mediaServerProtocol.normalizedBaseURL(mediaServerBaseURL)
-        guard mediaServerProtocol.isValidBaseURL(normalizedURL) else {
-            mediaServerMessage = "服务器地址无效，请输入 http(s):// 开头且包含主机名的地址。"
+        guard mediaServerProtocol != .webdav else {
+            openWebDAVLoginFromRemoteSourceForm()
             return nil
         }
 
-        let token = mediaServerToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            mediaServerMessage = mediaServerMissingTokenMessage(for: mediaServerProtocol)
+        let normalizedURL = mediaServerProtocol.normalizedBaseURL(mediaServerBaseURL)
+        guard mediaServerProtocol.isValidBaseURL(normalizedURL) else {
+            mediaServerMessage = "服务器地址无效，请输入 http(s):// 开头且包含主机名的地址。"
             return nil
         }
 
@@ -1944,6 +2126,28 @@ struct PosterWallView: View {
             let host = URL(string: normalizedURL)?.host ?? "媒体服务器"
             return "\(mediaServerProtocolLabel(mediaServerProtocol)) · \(host)"
         }()
+        if mediaServerProtocol == .omniplayDocker {
+            let username = mediaServerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let password = mediaServerPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !username.isEmpty, !password.isEmpty else {
+                mediaServerMessage = mediaServerMissingTokenMessage(for: mediaServerProtocol)
+                return nil
+            }
+            return MediaServerSourceDraft(
+                protocolKind: mediaServerProtocol,
+                normalizedURL: normalizedURL,
+                token: password,
+                userId: username,
+                finalName: finalName,
+                authConfig: nil
+            )
+        }
+
+        let token = mediaServerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            mediaServerMessage = mediaServerMissingTokenMessage(for: mediaServerProtocol)
+            return nil
+        }
         let userId = mediaServerProtocol == .plex ? "" : mediaServerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
         let authConfig = MediaServerAuthConfig.encode(token: token, userId: userId)
         return MediaServerSourceDraft(
@@ -1984,6 +2188,11 @@ struct PosterWallView: View {
     private func saveMediaServerSource() {
         guard let draft = currentMediaServerDraft() else { return }
 
+        if draft.protocolKind == .omniplayDocker {
+            saveOmniPlayDockerSource(draft: draft)
+            return
+        }
+
         Task {
             do {
                 await MainActor.run {
@@ -2021,6 +2230,64 @@ struct PosterWallView: View {
                 await MainActor.run {
                     mediaServerIsPreScanning = false
                     mediaServerMessage = "媒体服务器预扫描失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func saveOmniPlayDockerSource(draft: MediaServerSourceDraft) {
+        Task {
+            do {
+                await MainActor.run {
+                    mediaServerIsPreScanning = true
+                    mediaServerMessage = "正在登录 OmniPlay Docker..."
+                }
+                let client = try OmniPlayDockerClient(baseURLString: draft.normalizedURL)
+                try await client.login(username: draft.userId, password: draft.token)
+                let authConfig = OmniPlayDockerAuthConfig.encode(username: draft.userId, sessionCookie: client.sessionCookie)
+                let sourceId = try await AppDatabase.shared.dbQueue.write { db -> Int64 in
+                    if var existing = try MediaSource
+                        .filter(Column("protocolType") == MediaSourceProtocol.omniplayDocker.rawValue)
+                        .filter(Column("baseUrl") == draft.normalizedURL)
+                        .fetchOne(db) {
+                        existing.name = draft.finalName
+                        existing.authConfig = authConfig
+                        existing.isEnabled = true
+                        existing.disabledAt = nil
+                        try existing.update(db)
+                        return existing.id ?? 0
+                    }
+
+                    let source = MediaSource(
+                        id: nil,
+                        name: draft.finalName,
+                        protocolType: MediaSourceProtocol.omniplayDocker.rawValue,
+                        baseUrl: draft.normalizedURL,
+                        authConfig: authConfig,
+                        isEnabled: true,
+                        disabledAt: nil
+                    )
+                    try source.insert(db)
+                    return db.lastInsertedRowID
+                }
+
+                let source = try await AppDatabase.shared.dbQueue.read { db in
+                    try MediaSource.fetchOne(db, key: sourceId)
+                }
+                if let source {
+                    _ = await libraryManager.syncOmniPlayDockerSourceWithResult(source)
+                }
+
+                await MainActor.run {
+                    mediaServerIsPreScanning = false
+                    mediaServerMessage = "Docker 同步完成"
+                    dismissRemoteSourceForm()
+                    loadData()
+                }
+            } catch {
+                await MainActor.run {
+                    mediaServerIsPreScanning = false
+                    mediaServerMessage = "Docker 连接失败：\(error.localizedDescription)"
                 }
             }
         }
@@ -2214,6 +2481,29 @@ struct PosterWallView: View {
         }
     }
 
+    private func startDockerAutoSyncIfNeeded() {
+        guard dockerAutoSyncTask == nil else { return }
+        dockerAutoSyncTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            while !Task.isCancelled {
+                await syncEnabledOmniPlayDockerSourcesInBackground()
+                try? await Task.sleep(nanoseconds: 10 * 60 * 1_000_000_000)
+            }
+        }
+    }
+
+    private func syncEnabledOmniPlayDockerSourcesInBackground() async {
+        guard !isProcessing else { return }
+        let sources = (try? await AppDatabase.shared.dbQueue.read { db in
+            try MediaSource.fetchEnabledScannableSources(in: db).filter { $0.protocolKind == .omniplayDocker }
+        }) ?? []
+        guard !sources.isEmpty else { return }
+        for source in sources {
+            if Task.isCancelled { return }
+            _ = await libraryManager.syncOmniPlayDockerSourceWithResult(source)
+        }
+    }
+
     private func cancelCurrentScanRunForSource(_ sourceID: Int64) {
         removedSourceIDsDuringRun.insert(sourceID)
         ThumbnailManager.shared.cancelTasks(forSourceID: sourceID)
@@ -2350,26 +2640,6 @@ struct PosterWallView: View {
         }
     }
 
-    private func scheduleStartupTMDBPreflight() {
-        guard !hasPerformedStartupTMDBCheck else { return }
-        hasPerformedStartupTMDBCheck = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            guard !isProcessing else { return }
-            Task {
-                let result = await TMDBService.shared.checkConnection()
-                await MainActor.run {
-                    guard !isProcessing else { return }
-                    if result.isConnected {
-                        triggerScanAndScrape()
-                    } else {
-                        tmdbConnectionMessage = result.message
-                        isShowingTMDBConnectionAlert = true
-                    }
-                }
-            }
-        }
-    }
-
     private func triggerScanAndScrape(sourceID: Int64? = nil, sourceIDs: [Int64]? = nil, skipTMDBScrape: Bool = false) {
         guard !isProcessing else { return }
         currentScanTask?.cancel()
@@ -2432,34 +2702,18 @@ struct PosterWallView: View {
                         }
                     }
                     let result: MediaSourceScanResult
-                    if skipTMDBScrape {
+                    if source.protocolKind == .omniplayDocker {
+                        result = await libraryManager.syncOmniPlayDockerSourceWithResult(source)
+                    } else if skipTMDBScrape {
                         result = await libraryManager.scanLocalSourceWithResult(
                             source,
-                            deferUnidentifiedGroups: true
+                            deferUnidentifiedGroups: false
                         )
                     } else {
                         result = await libraryManager.scanLocalSourceWithResult(
                             source,
-                            deferUnidentifiedGroups: true
-                        ) { placeholderMovieID in
-                            guard let sid = source.id, !Task.isCancelled else { return }
-                            let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
-                            guard isCurrentRun else { return }
-                            await MainActor.run {
-                                withAnimation {
-                                    self.processingMessage = "刮削元数据和海报：\(source.name)"
-                                }
-                            }
-                            try? await libraryManager.processUnmatchedFiles(
-                                sourceID: sid,
-                                placeholderMovieID: placeholderMovieID,
-                                exposeFailures: false
-                            )
-                            await MainActor.run {
-                                guard self.currentScanRunID == runID else { return }
-                                loadData()
-                            }
-                        }
+                            deferUnidentifiedGroups: false
+                        )
                     }
                     let isCurrentRun = await MainActor.run { self.currentScanRunID == runID }
                     guard isCurrentRun else { return }
@@ -2478,7 +2732,7 @@ struct PosterWallView: View {
                             await MainActor.run { finishScanRun(runID: runID, reloadData: true) }
                             return
                         }
-                        if skipTMDBScrape {
+                        if skipTMDBScrape && source.protocolKind != .omniplayDocker {
                             await MainActor.run {
                                 guard self.currentScanRunID == runID else { return }
                                 withAnimation {
@@ -2492,17 +2746,6 @@ struct PosterWallView: View {
                             }
                             continue
                         }
-                        await MainActor.run {
-                            guard self.currentScanRunID == runID else { return }
-                            withAnimation {
-                                self.processingMessage = "检查未完成刮削：\(source.name)"
-                            }
-                        }
-                        try? await libraryManager.processUnmatchedFiles(sourceID: sid)
-                        await MainActor.run {
-                            guard self.currentScanRunID == runID else { return }
-                            loadData()
-                        }
                     }
                 }
                 
@@ -2512,7 +2755,7 @@ struct PosterWallView: View {
                 }
                 await MainActor.run {
                     guard self.currentScanRunID == runID else { return }
-                    withAnimation { self.processingMessage = "显示未识别视频..." }
+                    withAnimation { self.processingMessage = "更新首页..." }
                 }
                 let unidentifiedInsertedCount = await libraryManager.insertDeferredUnidentifiedMedia(from: sourceResults)
                 if unidentifiedInsertedCount > 0 {
@@ -2520,6 +2763,10 @@ struct PosterWallView: View {
                         guard self.currentScanRunID == runID else { return }
                         loadData()
                     }
+                }
+                await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
+                    loadData()
                 }
                 if skipTMDBScrape {
                     await MainActor.run {
@@ -2533,6 +2780,57 @@ struct PosterWallView: View {
                         finishScanRun(runID: runID, reloadData: true)
                     }
                     return
+                }
+                let successfulSources = sourceResults.compactMap { result -> (id: Int64, name: String)? in
+                    guard result.isSuccess,
+                          let sid = result.sourceId,
+                          !removedSourceIDsDuringRun.contains(sid) else {
+                        return nil
+                    }
+                    return (sid, result.sourceName)
+                }
+                let successfulSourceIDs = successfulSources.map(\.id)
+                let hasPendingScrape = (try? await libraryManager.hasPendingMetadataScrape(sourceIDs: successfulSourceIDs)) ?? false
+                if !hasPendingScrape {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        withAnimation { self.processingMessage = "没有需要 TMDB 刮削的内容" }
+                    }
+                    await MainActor.run {
+                        finishScanRun(runID: runID, reloadData: true)
+                    }
+                    return
+                }
+                await MainActor.run {
+                    guard self.currentScanRunID == runID else { return }
+                    withAnimation { self.processingMessage = "检测 TMDB 连通性..." }
+                }
+                let tmdbConnection = await TMDBService.shared.checkConnection()
+                if !tmdbConnection.isConnected {
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        tmdbConnectionMessage = tmdbConnection.message
+                        finishScanRun(runID: runID, reloadData: true)
+                        isShowingTMDBConnectionAlert = true
+                    }
+                    return
+                }
+                for (index, source) in successfulSources.enumerated() {
+                    if Task.isCancelled {
+                        await MainActor.run { finishScanRun(runID: runID, reloadData: true) }
+                        return
+                    }
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        withAnimation {
+                            self.processingMessage = "刮削元数据和海报 (\(index + 1)/\(successfulSources.count))：\(source.name)"
+                        }
+                    }
+                    try? await libraryManager.processUnmatchedFiles(sourceID: source.id)
+                    await MainActor.run {
+                        guard self.currentScanRunID == runID else { return }
+                        loadData()
+                    }
                 }
                 if Task.isCancelled {
                     await MainActor.run { finishScanRun(runID: runID, reloadData: true) }

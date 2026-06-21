@@ -77,6 +77,29 @@ class AppDatabase {
                 t.add(column: "fileSize", .integer).notNull().defaults(to: 0)
             }
         }
+
+        // v6: 豆瓣只作为手动绑定的辅助元数据源，独立缓存，避免影响 TMDB 主刮削。
+        migrator.registerMigration("v6") { db in
+            try db.create(table: "doubanMetadata") { t in
+                t.primaryKey("movieId", .integer).references("movie", onDelete: .cascade)
+                t.column("subjectId", .text).notNull()
+                t.column("subjectURL", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("originalTitle", .text)
+                t.column("year", .text)
+                t.column("rating", .double)
+                t.column("ratingCount", .integer)
+                t.column("summary", .text)
+                t.column("genres", .text)
+                t.column("countries", .text)
+                t.column("directors", .text)
+                t.column("casts", .text)
+                t.column("posterURL", .text)
+                t.column("fetchedAt", .double).notNull()
+                t.column("nextRefreshAt", .double).notNull()
+                t.column("lastError", .text)
+            }
+        }
         
         try migrator.migrate(dbQueue)
     }

@@ -183,7 +183,7 @@ struct SettingsView: View {
                     Toggle("启用公共源 TMDB", isOn: $tmdbUsePublicSource)
                         .help("默认开启。关闭后只有填写自定义 TMDB API 时才能继续刮削和获取剧照。")
 
-                    Text("公共源使用应用内共享额度，默认会按更保守的请求频率访问，并在触发 TMDB 限流时自动退避。建议填写自己的 TMDB API Key / v4 令牌，以获得更稳定、更快的刮削。")
+                    Text("公开源码不内置个人 TMDB Key。请填写自己的 TMDB API Key / v4 令牌，以启用稳定的刮削。")
                         .font(.caption)
                         .foregroundColor(theme.textSecondary)
 
@@ -211,7 +211,7 @@ struct SettingsView: View {
                         .foregroundColor(theme.accent)
 
                     if trimmedTMDBApiKey.isEmpty, tmdbUsePublicSource {
-                        Text("当前正在使用公共源 TMDB。共享额度可能波动，长期使用更建议配置自定义 API。")
+                        Text("当前未填写自定义 TMDB API；公开源码版本不会内置个人 Key。")
                             .font(.caption)
                             .foregroundColor(.orange)
                     } else if trimmedTMDBApiKey.isEmpty {

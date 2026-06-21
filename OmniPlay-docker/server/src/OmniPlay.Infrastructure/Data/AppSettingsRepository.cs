@@ -151,13 +151,22 @@ public sealed class AppSettingsRepository : IAppSettingsRepository
         return settings with
         {
             HlsRetentionHours = Math.Clamp(settings.HlsRetentionHours, 1, 24 * 30),
+            HlsMaxGb = settings.HlsMaxGb <= 0
+                ? 30
+                : Math.Clamp(settings.HlsMaxGb, 1, 1024),
+            HlsCachePath = Environment.ExpandEnvironmentVariables(settings.HlsCachePath.Trim()),
             ImageCleanupScope = scope,
             WebDavRetentionHours = settings.WebDavRetentionHours <= 0
                 ? 72
                 : Math.Clamp(settings.WebDavRetentionHours, 1, 24 * 30),
             WebDavMaxGb = settings.WebDavMaxGb <= 0
                 ? 20
-                : Math.Clamp(settings.WebDavMaxGb, 1, 1024)
+                : Math.Clamp(settings.WebDavMaxGb, 1, 1024),
+            SubtitleCachePath = Environment.ExpandEnvironmentVariables(settings.SubtitleCachePath.Trim()),
+            SubtitleMaxGb = settings.SubtitleMaxGb <= 0
+                ? 20
+                : Math.Clamp(settings.SubtitleMaxGb, 1, 1024),
+            SubtitleCacheStrategy = SubtitleCacheStrategies.Normalize(settings.SubtitleCacheStrategy)
         };
     }
 
@@ -166,9 +175,9 @@ public sealed class AppSettingsRepository : IAppSettingsRepository
         return settings with
         {
             Url = NormalizeProxyUrl(settings.Url),
-            Username = settings.Username.Trim(),
-            Password = settings.Password.Trim(),
-            BypassList = NormalizeBypassList(settings.BypassList)
+            Username = string.Empty,
+            Password = string.Empty,
+            BypassList = string.Empty
         };
     }
 
@@ -201,7 +210,10 @@ public sealed class AppSettingsRepository : IAppSettingsRepository
             return trimmed;
         }
 
-        var builder = new UriBuilder(uri.Scheme, uri.Host);
+        var scheme = string.Equals(uri.Scheme, "socks", StringComparison.OrdinalIgnoreCase)
+            ? "socks5"
+            : uri.Scheme;
+        var builder = new UriBuilder(scheme, uri.Host);
         if (!uri.IsDefaultPort)
         {
             builder.Port = uri.Port;
@@ -210,18 +222,11 @@ public sealed class AppSettingsRepository : IAppSettingsRepository
         return builder.Uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
     }
 
-    private static string NormalizeBypassList(string value)
-    {
-        return string.Join(
-            ',',
-            value.Split([',', ';', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Where(static item => !string.IsNullOrWhiteSpace(item)));
-    }
-
     private static bool IsSupportedProxyScheme(string scheme)
     {
         return string.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
                || string.Equals(scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(scheme, "socks", StringComparison.OrdinalIgnoreCase)
                || string.Equals(scheme, "socks4", StringComparison.OrdinalIgnoreCase)
                || string.Equals(scheme, "socks4a", StringComparison.OrdinalIgnoreCase)
                || string.Equals(scheme, "socks5", StringComparison.OrdinalIgnoreCase);

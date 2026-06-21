@@ -12,7 +12,12 @@ public sealed class LibraryMetadataEnrichmentJobServiceTests
     {
         var enricher = new ControlledEnricher();
         var statusStore = new InMemoryMetadataEnrichmentStatusStore();
-        var service = new LibraryMetadataEnrichmentJobService(new InMemoryBackgroundTaskCenter(), enricher, statusStore);
+        var service = new LibraryMetadataEnrichmentJobService(
+            new InMemoryBackgroundTaskCenter(),
+            enricher,
+            statusStore,
+            new FakeAppSettingsRepository(),
+            new AlwaysReachableTmdbClient());
 
         Assert.True(service.TryStartMissing(out var started));
         Assert.True(started.IsRunning);
@@ -34,7 +39,12 @@ public sealed class LibraryMetadataEnrichmentJobServiceTests
     {
         var enricher = new ControlledEnricher();
         var statusStore = new InMemoryMetadataEnrichmentStatusStore();
-        var service = new LibraryMetadataEnrichmentJobService(new InMemoryBackgroundTaskCenter(), enricher, statusStore);
+        var service = new LibraryMetadataEnrichmentJobService(
+            new InMemoryBackgroundTaskCenter(),
+            enricher,
+            statusStore,
+            new FakeAppSettingsRepository(),
+            new AlwaysReachableTmdbClient());
 
         Assert.True(service.TryStartItem("item-1", out var started));
         Assert.Equal("item-1", started.TargetLibraryItemId);
@@ -52,7 +62,12 @@ public sealed class LibraryMetadataEnrichmentJobServiceTests
     {
         var enricher = new ControlledEnricher();
         var statusStore = new InMemoryMetadataEnrichmentStatusStore();
-        var service = new LibraryMetadataEnrichmentJobService(new InMemoryBackgroundTaskCenter(), enricher, statusStore);
+        var service = new LibraryMetadataEnrichmentJobService(
+            new InMemoryBackgroundTaskCenter(),
+            enricher,
+            statusStore,
+            new FakeAppSettingsRepository(),
+            new AlwaysReachableTmdbClient());
 
         Assert.True(service.TryStartMissing(out _));
         await enricher.WaitUntilStartedAsync();
@@ -154,6 +169,98 @@ public sealed class LibraryMetadataEnrichmentJobServiceTests
                 CurrentTitle: "测试条目",
                 DateTimeOffset.UtcNow));
             started.SetResult();
+        }
+    }
+
+    private sealed class FakeAppSettingsRepository : IAppSettingsRepository
+    {
+        public Task<AppSettingsSnapshot> GetAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new AppSettingsSnapshot(
+                "OmniPlay",
+                "test",
+                new TmdbSettings(),
+                new CacheSettings(),
+                new PlaybackSettings(),
+                new ProxySettings(),
+                new AutomationSettings()));
+        }
+
+        public Task<AppSettingsSnapshot> UpdateAsync(
+            AppSettingsUpdateRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            return GetAsync(cancellationToken);
+        }
+    }
+
+    private sealed class AlwaysReachableTmdbClient : ITmdbMetadataClient
+    {
+        public Task<TmdbConnectionTestResult> TestConnectionAsync(
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new TmdbConnectionTestResult(true, "测试", 200, "TMDB 连接正常。"));
+        }
+
+        public Task<TmdbMetadataMatch?> SearchAsync(
+            string mediaType,
+            string title,
+            string? year,
+            TmdbSettings settings,
+            string? secondaryQuery = null,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbMetadataMatch?>(null);
+        }
+
+        public Task<IReadOnlyList<TmdbMetadataMatch>> SearchCandidatesAsync(
+            string mediaType,
+            string title,
+            string? year,
+            TmdbSettings settings,
+            string? secondaryQuery = null,
+            int limit = 8,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<TmdbMetadataMatch>>([]);
+        }
+
+        public Task<TmdbMetadataMatch?> GetDetailsAsync(
+            string mediaType,
+            int tmdbId,
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbMetadataMatch?>(null);
+        }
+
+        public Task<TmdbSeasonDetail?> GetSeasonAsync(
+            int tvTmdbId,
+            int seasonNumber,
+            TmdbSettings settings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<TmdbSeasonDetail?>(null);
+        }
+
+        public Task<string?> DownloadPosterAsync(
+            string posterPath,
+            string mediaType,
+            int tmdbId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
+        }
+
+        public Task<string?> DownloadStillAsync(
+            string stillPath,
+            int tvTmdbId,
+            int seasonNumber,
+            int episodeNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
         }
     }
 }

@@ -65,7 +65,7 @@ struct TMDBConnectionCheckResult {
 class TMDBService {
     static let shared = TMDBService()
     static let publicSourceDefaultsKey = "tmdbUsePublicSource"
-    static let sharedPublicAPIKey = "d05a3f7e939f5034054090b376de6f8c"
+    static let sharedPublicAPIKey = ""
     
     private let baseURL = "https://api.themoviedb.org/3"
     private var tvSeasonCountCache: [Int: Int] = [:]
@@ -101,7 +101,7 @@ class TMDBService {
         if !userKey.isEmpty {
             return userKey.count > 50 ? .customBearerToken(userKey) : .customAPIKey(userKey)
         }
-        return isPublicSourceEnabled(in: defaults) ? .publicAPIKey(sharedPublicAPIKey) : .none
+        return isPublicSourceEnabled(in: defaults) && !sharedPublicAPIKey.isEmpty ? .publicAPIKey(sharedPublicAPIKey) : .none
     }
 
     func currentCredentialSource() -> TMDBCredentialSource {

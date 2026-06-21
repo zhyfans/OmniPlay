@@ -2,17 +2,32 @@ plugins {
     id "com.android.application"
 }
 
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withInputStream { localProperties.load(it) }
+}
+
 android {
     namespace "com.omniplay.tv"
     compileSdk 35
     ndkVersion "27.3.13750724"
 
+    signingConfigs {
+        release {
+            storeFile rootProject.file(localProperties.getProperty("release.storeFile", ""))
+            storePassword localProperties.getProperty("release.storePassword", "")
+            keyAlias localProperties.getProperty("release.keyAlias", "")
+            keyPassword localProperties.getProperty("release.keyPassword", "")
+        }
+    }
+
     defaultConfig {
         applicationId "com.omniplay.tv"
         minSdk 26
         targetSdk 35
-        versionCode 15
-        versionName "1.5"
+        versionCode 18
+        versionName "1.6"
 
         externalNativeBuild {
             cmake {
@@ -22,6 +37,13 @@ android {
 
         ndk {
             abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
         }
     }
 
