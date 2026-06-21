@@ -1093,6 +1093,25 @@ export function App() {
     }
   }
 
+  async function handlePlayFromDetail(file: VideoFileSummary, options?: { refreshMain?: boolean }) {
+    if (!selectedDetail) {
+      setPlayingFile(file);
+      return;
+    }
+
+    try {
+      const freshDetail = await getLibraryItemDetail(selectedDetail.id);
+      setSelectedDetail(freshDetail);
+      selectedDetailRef.current = freshDetail;
+      const freshFile = options?.refreshMain
+        ? resolveMainPlaybackFile(freshDetail)
+        : findVideoFileById(freshDetail, file.id);
+      setPlayingFile(freshFile ?? file);
+    } catch {
+      setPlayingFile(file);
+    }
+  }
+
   if (isAuthLoading || !authStatus?.isAuthenticated) {
     return (
       <AuthGate
@@ -1140,7 +1159,7 @@ export function App() {
           onToggleHlsFile={toggleSelectedHlsVideoFile}
           onToggleHlsItem={toggleSelectedHlsItem}
           onToggleHlsSelectionMode={toggleHlsSelectionMode}
-          onPlay={(file) => setPlayingFile(file)}
+          onPlay={(file, options) => void handlePlayFromDetail(file, options)}
           onSeasonChange={(seasonId) =>
             setSelectedSeasonByDetailId((current) =>
               current[selectedDetail.id] === seasonId ? current : { ...current, [selectedDetail.id]: seasonId },
@@ -3530,7 +3549,7 @@ function DetailView({
   onToggleHlsFile: (fileId: string) => void;
   onToggleHlsItem: (itemId: string) => void;
   onToggleHlsSelectionMode: () => void;
-  onPlay: (file: VideoFileSummary) => void;
+  onPlay: (file: VideoFileSummary, options?: { refreshMain?: boolean }) => void;
   onSeasonChange: (seasonId: string) => void;
 }) {
   const poster = detail.posterAssetId ? posterUrl(detail.posterAssetId) : null;
@@ -3667,7 +3686,7 @@ function DetailView({
           {errorText ? <strong className="detailError">{errorText}</strong> : null}
           {mainFile ? (
             <div className="detailActions">
-              <button aria-label="play" onClick={() => onPlay(mainFile)}>
+              <button aria-label="play" onClick={() => onPlay(mainFile, { refreshMain: true })}>
                 <Play size={18} />
                 <span>{playButtonText}</span>
               </button>
@@ -3958,6 +3977,38 @@ function resolveMovieMainFile(files: VideoFileSummary[]): VideoFileSummary | nul
     files.find((file) => !isEffectivelyWatched(file)) ??
     files[0] ??
     null;
+}
+
+function resolveMainPlaybackFile(detail: LibraryItemDetail): VideoFileSummary | null {
+  if (detail.itemKind === "movie") {
+    return resolveMovieMainFile(moviePlaybackFiles(detail));
+  }
+
+  const episodeFiles = detail.seasons
+    .flatMap((season) => season.episodes)
+    .map((episode) => episode.videoFile)
+    .filter((file): file is VideoFileSummary => !!file);
+  return episodeFiles.find((file) => hasUnfinishedProgress(file)) ??
+    episodeFiles.find((file) => !isEffectivelyWatched(file)) ??
+    episodeFiles[0] ??
+    null;
+}
+
+function findVideoFileById(detail: LibraryItemDetail, fileId: string): VideoFileSummary | null {
+  const movieFile = detail.videoFiles.find((file) => file.id === fileId);
+  if (movieFile) {
+    return movieFile;
+  }
+
+  for (const season of detail.seasons) {
+    for (const episode of season.episodes) {
+      if (episode.videoFile?.id === fileId) {
+        return episode.videoFile;
+      }
+    }
+  }
+
+  return null;
 }
 
 function isEffectivelyWatched(file: VideoFileSummary | null | undefined): boolean {

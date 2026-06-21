@@ -670,12 +670,12 @@ public sealed class LibraryRepository : ILibraryRepository
             VALUES ($id, $userId, $videoFileId, $positionSeconds, $durationSeconds, $isWatched, $updatedAt)
             ON CONFLICT(id) DO UPDATE SET
                 position_seconds = CASE
-                    WHEN excluded.position_seconds <= 1 AND playback_progress.position_seconds > 5 THEN playback_progress.position_seconds
+                    WHEN excluded.position_seconds <= 5 AND playback_progress.position_seconds > 5 THEN playback_progress.position_seconds
                     ELSE excluded.position_seconds
                 END,
                 duration_seconds = MAX(playback_progress.duration_seconds, excluded.duration_seconds),
                 is_watched = CASE
-                    WHEN excluded.position_seconds <= 1 AND playback_progress.position_seconds > 5 THEN playback_progress.is_watched
+                    WHEN excluded.position_seconds <= 5 AND playback_progress.position_seconds > 5 THEN playback_progress.is_watched
                     ELSE excluded.is_watched
                 END,
                 updated_at = excluded.updated_at;
