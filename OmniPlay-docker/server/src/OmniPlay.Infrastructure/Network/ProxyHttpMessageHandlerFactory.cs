@@ -104,11 +104,19 @@ public static class ProxyHttpMessageHandlerFactory
         }
 
         List<Uri> candidates = [];
-        if (IsRunningInContainer() && IsLoopbackProxyHost(proxyUri.Host) && !IsDockerHostNetworkEnabled())
+        var shouldRewriteContainerLoopback = IsRunningInContainer()
+            && IsLoopbackProxyHost(proxyUri.Host)
+            && !IsDockerHostNetworkEnabled();
+        if (shouldRewriteContainerLoopback)
         {
             if (CanResolveHost("host.docker.internal"))
             {
                 candidates.Add(ReplaceHost(proxyUri, "host.docker.internal"));
+            }
+
+            if (TryReadConfiguredDockerHostGateway(out var configuredGatewayHost))
+            {
+                candidates.Add(ReplaceHost(proxyUri, configuredGatewayHost));
             }
 
             if (TryReadDockerDefaultGateway(out var gatewayHost))
@@ -117,7 +125,11 @@ public static class ProxyHttpMessageHandlerFactory
             }
         }
 
-        candidates.Add(proxyUri);
+        if (!shouldRewriteContainerLoopback)
+        {
+            candidates.Add(proxyUri);
+        }
+
         return candidates
             .GroupBy(static uri => uri.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
             .Select(static group => group.First())
@@ -272,6 +284,12 @@ public static class ProxyHttpMessageHandlerFactory
         }
 
         return false;
+    }
+
+    private static bool TryReadConfiguredDockerHostGateway(out string gatewayHost)
+    {
+        gatewayHost = Environment.GetEnvironmentVariable("OMNIPLAY_DOCKER_HOST_GATEWAY")?.Trim() ?? string.Empty;
+        return !string.IsNullOrWhiteSpace(gatewayHost);
     }
 
     private static bool ShouldBypassProxy(ProxySettings settings, Uri? requestUri)

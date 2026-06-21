@@ -7,8 +7,7 @@ services:
     container_name: omniplay
     restart: unless-stopped
 
-    ports:
-      - "45722:45722"
+    network_mode: host
 
     environment:
       TZ: Asia/Shanghai
@@ -20,6 +19,7 @@ services:
       OMNIPLAY_FFMPEG_PATH: /usr/bin/ffmpeg
       OMNIPLAY_FFPROBE_PATH: /usr/bin/ffprobe
       OMNIPLAY_ENABLE_QSV: "0"
+      OMNIPLAY_DOCKER_HOST_NETWORK: "1"
 
     volumes:
       - ./data:/var/lib/omniplay

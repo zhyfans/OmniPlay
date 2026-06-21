@@ -2368,10 +2368,11 @@ function SettingsPanel({
               <input
                 autoComplete="off"
                 onChange={(event) => setProxy({ ...proxy, url: event.target.value })}
-                placeholder="http://192.168.1.2:7890 或 socks5://192.168.1.2:7890"
+                placeholder="http://localhost:20171 或 http://192.168.1.2:7890"
                 value={proxy.url}
               />
             </label>
+            <p className="settingsHint">默认 host 网络可直接填宿主机 localhost。bridge 网络请填写宿主机 LAN IP，并确认代理监听 0.0.0.0/LAN。</p>
             {proxyTest ? (
               <div className={`tmdbTestResult ${proxyTest.isReachable ? "ok" : "error"}`}>
                 <strong>{proxyTest.isReachable ? "可用" : "失败"}</strong>

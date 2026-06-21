@@ -17,6 +17,8 @@ http://NAS_IP:45722
 
 首次打开后注册管理员账号。
 
+默认 `compose.yml` 使用 host 网络。这样容器内访问 `127.0.0.1/localhost` 就是宿主机，适合直接使用 NAS/宿主机本机代理，例如 `http://localhost:20171`。
+
 ## 目录挂载
 
 `compose.yml` 默认挂载：
@@ -37,6 +39,17 @@ volumes:
 然后在 OmniPlay Web UI 中添加容器内路径，例如 `/media/video`。
 
 不要把自己的 TMDB API Key、代理地址、账号密码写进 `compose.yml` 后提交。需要固定运行配置时，建议在本机创建未纳入 Git 的 `.env` 文件，或只在 Docker 管理界面里填写。
+
+如果必须改成 bridge 网络，请删除 `network_mode: host`，恢复端口映射：
+
+```yaml
+ports:
+  - "45722:45722"
+environment:
+  OMNIPLAY_DOCKER_HOST_NETWORK: "0"
+```
+
+bridge 网络下容器内的 `localhost` 不是宿主机。代理地址请填写宿主机 LAN IP，或确保 Docker 可通过 `host.docker.internal` / 默认网关访问宿主机代理，并且代理监听 `0.0.0.0` 或 LAN 地址。
 
 ## 构建镜像
 
