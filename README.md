@@ -1,6 +1,6 @@
 # 觅影 OmniPlay
 
-觅影 OmniPlay 是一款原生开发的海报墙播放器，支持mac、win双系统。mac采用swift开发，win采用C# + .net + Avalonia UI。底层播放器核心为 MPVKit-GPL / libmpv / FFmpeg 相关组件。 ios版正在开发中。
+觅影 OmniPlay 是一款原生开发的海报墙播放器，支持mac、win、docker、安卓TV系统。mac采用swift开发，win采用C# + .net + Avalonia UI。底层播放器核心为 MPVKit-GPL / libmpv / FFmpeg 相关组件。 
 
 ## 软件截图
 ![览影首页](https://img2.pixhost.to/images/7534/720265527_2.jpg)
@@ -13,11 +13,11 @@
 ### 海报墙媒体库
 
 - 支持海报墙和分集剧照
-- 采用TMDB刮削，增加了更宽松的刮削规则和自定义编辑功能。避免重命名和硬链接。
+- 采用TMDB自动刮削，豆瓣手动辅助刮削，增加了更宽松的刮削规则和自定义编辑功能。避免重命名和硬链接。
 
 ### 媒体源管理
 
-- 支持添加本地文件夹、WebDAV、SMB、plex、emby、jellyfin。mac版因为开发一直有bug，不支持SMB直连，请在访达中挂载SMB，再在软件中添加本地文件夹，间接连接SMB。可以将访达挂载的SMB添加到开机自启
+- 支持添加本地文件夹、omniplay docker\WebDAV、SMB、plex、emby、jellyfin。mac版因为开发一直有bug，不支持SMB直连，请在访达中挂载SMB，再在软件中添加本地文件夹，间接连接SMB。可以将访达挂载的SMB添加到开机自启
 - 不需要将电影、剧集分不同文件夹进行挂载，软件自动识别。
 
 ### 自动扫描与刮削
@@ -28,9 +28,38 @@
 - 支持一键将SMB、WebDAV下的影视离线至电脑，方便外出观影。
 
 ### 使用指南
-1. 由于软件设定不是扫描后就全部加载到首页，而是扫描刮削一个才显示一个，所以第一步先去设置里测试tmdb api连通性，建议去tmdb官网注册填写自己的api。如果测试不通，那么就需要挂代理。虽然改host按道理也行，但是我没有测试，建议直接挂代理。
-2. 点添加媒体源按钮添加挂载本地文件夹，通过SMB、Webdav连接局域网NAS，也可以连接jellyfin、emby、plex媒体服务器。但是建议SMB、Webdav直连。如果通过jellyfin、emby连接，软件的逻辑mkv等格式在觅影端解码，jellyfin、emby端只起传输作用。但是对BDMV、ISO格式，无法做到觅影端解码，只能jellyfin、emby端解码，再传输给觅影，播放效果没有通过jellyfin、emby连接好。
-3. 后面挂载文件夹后就是等待扫描刮削，然后观影。
+####  docker版安装
+1. 以群晖为例：先去右上角code下载源代码，将OmniPlay-docker文件夹复制到NAS。文件夹中有compose.yml文件，compose.hwaccel.yml为硬解版，compose.yml为非硬解版，按需求取用。由于镜像包较大，建议去Releases下载docker镜像包，加成tar格式，导入NAS docker中。
+2. 打开群晖container manager，点映像-操作-导入-选择tar镜像包。
+3. 点项目-新增，项目名称，点路径，选择导入的OmniPlay-docker文件夹。
+4. 修改compose.yml。 
+      - ./data:/var/lib/omniplay  ./data为docker数据目录，修改为自己的目录
+      - ./cache:/var/cache/omniplay 为缓存目录，有HLS缓存和字幕缓存，这两个缓存文件根据后续设置可能很大，建议放在剩余储存空间大的目录中。
+      - ./media:/media:ro  为影视文件目录。
+ 5. 点下一步，等安装完成。
+ #### docker版设置
+1. 浏览器输入http://NAS IP：45722打开docker容器页面，注册用户名和密码，注意后续mac和安卓TV端连接docker端也是这个用户密码。
+2. 点右上角设置，输入注册的TMDB api和代理地址，代理可以安装v2raya docker。保存检测TMDB和代理连通性。
+3. 也可以见点运行自检检测下配置有没有问题，比如GPU硬解是否启用。
+4. 后面要注意的设置是HLS缓存和字幕缓存上限。
+5. 右上角加号添加媒体目录，挂载进行扫描、刮削、字幕缓存。
+
+#### docker版说明
+1. docker版直接播放因为是在浏览器中播放，浏览器不支持MKV、蓝光格式，需要先转换为HLS。效率天然比客户端低，所以不建议直接播放。
+2. 由于不是每台电视的硬解能力都很强，特别是4K蓝光，实时烧录字幕可能出现画面卡顿或者没有字幕的情况。因此加入字幕预缓存为VTT文本格式功能。缺点是需要提前预缓存和占用一定空间。
+3. 目前ARM mac和安卓TV端都可以接入docker服务端，并且有播放进度同步功能。但是已知的bug是docker端播放会将进度归零，这个bug后续会尝试修复。
+#### 安卓TV
+1. 安装：下载apk安装
+2. 点预扫描或输入docker版地址，输入docker版注册的用户名和密码登录。
+#### 安卓TV说明
+1. 考虑到电视安装代理不方便，扫描刮削也不方便。TV版没有接入webdav、smb、plex、emby、jellyfin功能。需要先安装docker版再接入。
+2. 设置里有字幕兼容播放模式和高性能直出播放模式。前者的色彩管理和字幕兼容性更好，但是资源负载更高，如果芯片性能足够强，建议选这个模式。如果播放4K卡顿，建议切换高性能直出播放模式。不过高性能直出只针对4K或者DV/HDR，其它格式仍然是兼容模式。高性能直出需要提前进行字幕缓存，不然会出现没有字幕的情况。
+#### mac、win  
+
+1. 安装：下载安装包，安装。
+2. 开启代理，填入TMDB api，检测TMDB连通性。
+3. 添加媒体源，如果有ARM mac和安卓TV播放进度同步功能，建议接入omniplay docker版媒体源。x64 mac和win版尚未更新，暂无接入docker版功能。
+4. ARM mac版加了豆瓣手动刮削功能。没有自动匹配是因为豆瓣没有公开的api，自动匹配大概率会被字段，体验不佳。所以如果没有代理，也可以用豆瓣手动一个个匹配。缺点是海报画质可能没有TMDB好，以及没有分集剧照。手动匹配做了限制，以避免阻断。其实docker版也加了这个功能，但经测试每次都被阻断。不过mac版手动匹配的豆瓣评分等信息，会自动同步到docker版，进而自动同步到安卓TV端。
 
 ## 自行编译教程
 
